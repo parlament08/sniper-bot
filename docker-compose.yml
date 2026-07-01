@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  sniper_bot:
+    build: .
+    container_name: sniper_bot
+    restart: unless-stopped
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - TZ=Europe/Chisinau
