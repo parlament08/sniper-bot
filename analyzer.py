@@ -13,8 +13,6 @@ if not api_key:
 genai.configure(api_key=api_key)
 
 # Настройки Telegram (Замени на свои данные)
-#TELEGRAM_TOKEN = "8638283311:AAF8HuvyBSw-cCPt74dEJuRb5UTfzI9CH-I"
-#CHAT_ID = "390636100"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
