@@ -10,5 +10,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Копируем весь остальной код
 COPY . .
 
-# Запускаем нашего бота
-CMD ["python", "-u", "analyzer.py"]
+# Команды запуска теперь передаются через docker-compose.yml

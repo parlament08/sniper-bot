@@ -142,8 +142,8 @@ def market_scan(report_mode="HUNT"):
                 continue
 
             total_score = score_result.get('total_score', 0)
-            #is_high_score_setup = total_score >= 90
-            is_high_score_setup = total_score >= 0
+            is_high_score_setup = total_score >= 90
+            #is_high_score_setup = total_score >= 0
             decision = score_result.get('decision', 'Ignore') if in_kz else "Ignore"
 
             # Отправка А+ сетапа
@@ -189,7 +189,7 @@ def market_scan(report_mode="HUNT"):
             dashboard_lines.append(f"• <b>{coin}</b>: ОШИБКА АНАЛИЗА")
 
     # Отправка единого дашборда
-    if dashboard_lines:
+    if dashboard_lines and (report_mode == "FULL" or in_kz):
         header_text = "РЫНОЧНЫЙ БРИФИНГ" if report_mode == "FULL" else "СНАЙПЕР ОНЛАЙН"
         summary_header = [
             f"📡 <b>{header_text} | {current_time_str}</b>",
@@ -199,6 +199,8 @@ def market_scan(report_mode="HUNT"):
         ]
         full_message = "\n".join(summary_header + dashboard_lines)
         send_telegram_alert(full_message)
+    elif report_mode == "HUNT" and not in_kz:
+        logger.info(f"[{current_time_str}] Вне Kill Zone. Дашборд скрыт для экономии эфира.")
 
 if __name__ == "__main__":
     logger.info("🚀 Радар «СНАЙПЕР» онлайн. Версия 11.0 [Orchestrator Deterministic] запущена.")

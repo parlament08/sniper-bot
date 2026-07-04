@@ -4,3 +4,4 @@ numpy
 google-generativeai
 yfinance
 python-dotenv
+pyTelegramBotAPI

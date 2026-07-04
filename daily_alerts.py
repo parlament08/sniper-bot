@@ -1,140 +1,106 @@
 import os
-import time
-from datetime import datetime
 from dotenv import load_dotenv
-import requests
 import pandas as pd
 from services.market_data import fetch_candles
-import google.generativeai as genai
 from core.logger import logger
-from core.indicators import calculate_ema, calculate_rsi, calculate_macd
+from core.indicators import calculate_ema, calculate_atr
+from core.structure import find_swings, find_fvg
 
 # Загружаем переменные из .env файла в корне проекта
 load_dotenv()
 
-# Инициализация API Gemini
-api_key = os.environ.get("GEMINI_API_KEY")
-if not api_key:
-    raise ValueError("❌ Не найден GEMINI_API_KEY в .env файле!")
-
-genai.configure(api_key=api_key)
-model = genai.GenerativeModel(model_name='models/gemini-3.1-flash-lite')
-
-# Настройки Telegram
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-def send_telegram_alert(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
-    try:
-        requests.post(url, data=payload, timeout=5)
-    except Exception as e:
-        logger.error(f"Ошибка отправки в TG: {e}")
-
-# --- СПЕЦИАЛЬНАЯ ИНСТРУКЦИЯ ДЛЯ ГЕНЕРАЦИИ АЛЕРТОВ ---
-ALERTS_INSTRUCTION = """
-Ты — профессиональный SMC трейдер. Твоя задача — проанализировать график и разметить ближайшие Зоны Интереса (POI), чтобы трейдер мог поставить на них ручные алерты (будильники) в терминале Binance.
-
-ПРАВИЛА ПОИСКА ЗОН:
-1. Зона Long (Support POI): Ищи ближайший неперекрытый FVG (Имбаланс) ниже текущей цены ИЛИ очевидный пул ликвидности (sell-side liquidity), снятие которого даст отскок вверх.
-2. Зона Short (Resistance POI): Ищи ближайший неперекрытый FVG выше текущей цены ИЛИ очевидный пул ликвидности (buy-side liquidity), снятие которого даст реакцию вниз.
-3. Расчет Алертов: Алерт должен сработать ЗАРАНЕЕ — прямо перед тем, как цена коснется зоны. 
-   - Алерт 🔽 (Вниз) ставь на 0.3-0.5% выше Зоны Long.
-   - Алерт 🔼 (Вверх) ставь на 0.3-0.5% ниже Зоны Short.
-
-ОТВЕТ СТРОГО ПО ШАБЛОНУ (без лишних слов и приветствий, используй только этот текст, заменяя скобки на цифры):
-
-📉 <b>Зона Long (Поддержка):</b> [Ценовой диапазон, например: 61500 - 61700] ([Причина: FVG / OB / Liquidity Pool])
-📈 <b>Зона Short (Сопротивление):</b> [Ценовой диапазон, например: 63000 - 63300] ([Причина: FVG / OB / Liquidity Pool])
-🔔 <b>Алерты для Binance:</b> 🔽 <code>[Точная цена алерта вниз]</code> | 🔼 <code>[Точная цена алерта вверх]</code>
-"""
-
 def generate_coin_alert(coin):
     logger.info(f"Сканирую уровни SMC для {coin}...")
     
-    # ⚡️ 1. Глубокий прогрев индикаторов (500 свечей)
-    df_4h = fetch_candles(coin, '4h', limit=500)
-    df_15m = fetch_candles(coin, '15m', limit=500)
-    
-    if df_4h is None or df_15m is None or len(df_4h) < 100 or len(df_15m) < 100:
+    # 1. Загрузка и подготовка данных
+    df_4h = fetch_candles(coin, '4h', limit=200)
+    df_15m = fetch_candles(coin, '15m', limit=150)
+
+    if df_4h is None or df_15m is None or len(df_4h) < 50 or len(df_15m) < 50:
+        logger.warning(f"Недостаточно данных для {coin}")
         return None
-        
+
+    # Приведение типов
+    numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+    for col in numeric_cols:
+        df_4h[col] = df_4h[col].astype(float)
+        df_15m[col] = df_15m[col].astype(float)
+
+    # 2. Расчет индикаторов
     df_4h['ema99'] = calculate_ema(df_4h, 99)
-    df_15m['rsi6'] = calculate_rsi(df_15m, 6)
-    macd_line, macd_signal, macd_hist = calculate_macd(df_15m)
-    df_15m['macd_line'] = macd_line
-    df_15m['macd_signal'] = macd_signal
-    df_15m['macd_hist'] = macd_hist
+    df_15m['atr'] = calculate_atr(df_15m, 14)
     
-    # ⚡️ 2. Расчет исторической базы по закрытым свечам 4H (Индекс -2)
-    prev_candles_4h = df_4h.iloc[-22:-2]
-    peak_high_4h = float(prev_candles_4h['high'].max())
-    peak_low_4h = float(prev_candles_4h['low'].min())
-    
-    last_ema99_4h = float(df_4h['ema99'].iloc[-2]) if df_4h['ema99'].iloc[-2] is not None else 0
-    
-    # Текущая актуальная цена
-    last_close_15m = float(df_15m['close'].iloc[-1])
-    last_rsi6 = float(df_15m['rsi6'].iloc[-1]) if df_15m['rsi6'].iloc[-1] is not None else 50
-    
-    trend_emoji = "🟢 Бычий" if last_close_15m > last_ema99_4h else "🔴 Медвежий"
-    
-    prompt = f"{ALERTS_INSTRUCTION}\n\n" \
-             f"Анализируемый актив: {coin}\n" \
-             f"Текущая цена: {last_close_15m:.4f}\n" \
-             f"Глобальный тренд (4H): {trend_emoji} (Цена {'ВЫШЕ' if last_close_15m > last_ema99_4h else 'НИЖЕ'} EMA99: {last_ema99_4h:.4f})\n" \
-             f"Пиковые уровни ликвидности 4H: High {peak_high_4h:.4f} | Low {peak_low_4h:.4f}\n" \
-             f"Моментум 15m (RSI 6): {last_rsi6:.2f}\n\n" \
-             f"Последние 20 свечей (4H):\n{df_4h.tail(20).to_string()}\n\n" \
-             f"Последние 20 свечей (15m):\n{df_15m.tail(20).to_string()}"
-             
-    try:
-        response = model.generate_content(prompt).text
-        # Безопасное экранирование тегов
-        safe_response = response.replace("<", "&lt;").replace(">", "&gt;")
-        safe_response = safe_response.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
-        safe_response = safe_response.replace("&lt;code&gt;", "<code>").replace("&lt;/code&gt;", "</code>")
-        
-        return f"💎 <b>{coin}</b> | Тренд: {trend_emoji}\n{safe_response}"
-    except Exception as e:
-        logger.error(f"Ошибка генерации для {coin}: {e}")
+    df_4h.dropna(inplace=True)
+    df_15m.dropna(inplace=True)
+
+    if df_4h.empty or df_15m.empty:
+        logger.warning(f"Недостаточно данных для {coin} после расчета индикаторов.")
         return None
 
-def run_morning_alerts():
-    work_pairs = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'LINK', 'INJ', 'HYPE', 'LTC', 'DOT']
-    send_telegram_alert("🌅 <b>УТРЕННЯЯ SMC РАЗМЕТКА [08:30]</b>\nTraider, сканирую зоны интереса для расстановки ручных алертов с движком V10.1...")
+    # 3. Поиск структурных элементов (только по закрытым свечам)
+    df_15m_closed = df_15m.iloc[:-1].copy()
+    last_closed_candle = df_15m_closed.iloc[-1]
+    last_close = float(last_closed_candle['close'])
     
-    alerts_report = []
-    for coin in work_pairs:
-        report = generate_coin_alert(coin)
-        if report:
-            alerts_report.append(report)
-        time.sleep(2) 
-        
-    if alerts_report:
-        chunk_size = 2
-        for i in range(0, len(alerts_report), chunk_size):
-            chunk = "\n\n──────────────────\n\n".join(alerts_report[i:i + chunk_size])
-            send_telegram_alert(chunk)
-            time.sleep(1)
-            
-    send_telegram_alert("✅ <b>Разметка завершена.</b>\nВыставь алерты в Binance. Удачной охоты!")
+    # Определяем тренд по 4H EMA
+    last_ema99_4h = float(df_4h.iloc[-1]['ema99'])
+    
+    swing_highs, swing_lows = find_swings(df_15m_closed, left_bars=5, right_bars=5)
+    all_fvgs = find_fvg(df_15m_closed, atr_series=df_15m_closed['atr'], min_size_atr_ratio=0.5)
 
-if __name__ == "__main__":
-    logger.info("🚀 Генератор утренних алертов SMC (V10.1 Engine) запущен. Жду 08:30...")
-    run_morning_alerts()
-    
-    while True:
-        t_now = time.time()
-        local_struct = time.gmtime(t_now + 10800) 
-        
-        current_hour = local_struct.tm_hour
-        current_minute = local_struct.tm_min
-        
-        if current_hour == 8 and current_minute == 30:
-            logger.info("⏰ Время пришло (08:30). Запускаю генерацию алертов...")
-            run_morning_alerts()
-            time.sleep(61)
-        else:
-            time.sleep(30)
+    # 4. Поиск ближайших зон интереса (POI)
+    long_poi_zone, long_poi_reason = None, ""
+    bullish_fvgs_below = [f for f in all_fvgs if f['type'] == 'bullish' and f['top'] < last_close]
+    if bullish_fvgs_below:
+        closest_fvg = max(bullish_fvgs_below, key=lambda x: x['top'])
+        long_poi_zone = (closest_fvg['bottom'], closest_fvg['top'])
+        long_poi_reason = "FVG"
+    elif not swing_lows.empty:
+        relevant_lows = swing_lows[swing_lows['low'] < last_close]
+        if not relevant_lows.empty:
+            closest_low = relevant_lows.iloc[-1]
+            long_poi_zone = (closest_low['low'], closest_low['low'])
+            long_poi_reason = "Liquidity Pool"
+
+    short_poi_zone, short_poi_reason = None, ""
+    bearish_fvgs_above = [f for f in all_fvgs if f['type'] == 'bearish' and f['bottom'] > last_close]
+    if bearish_fvgs_above:
+        closest_fvg = min(bearish_fvgs_above, key=lambda x: x['bottom'])
+        short_poi_zone = (closest_fvg['bottom'], closest_fvg['top'])
+        short_poi_reason = "FVG"
+    elif not swing_highs.empty:
+        relevant_highs = swing_highs[swing_highs['high'] > last_close]
+        if not relevant_highs.empty:
+            closest_high = relevant_highs.iloc[-1]
+            short_poi_zone = (closest_high['high'], closest_high['high'])
+            short_poi_reason = "Liquidity Pool"
+            
+    # 5. Форматирование отчета
+    trend_emoji = "🟢 Бычий" if last_close > last_ema99_4h else "🔴 Медвежий"
+    header_line = f"💎 <b>{coin}</b> | Тренд: {trend_emoji}"
+
+    alert_down, alert_up = None, None
+
+    # Формируем строку для Long зоны
+    if long_poi_zone:
+        zone_str = f"{long_poi_zone[0]:.4f}" if long_poi_zone[0] == long_poi_zone[1] else f"{long_poi_zone[0]:.4f} - {long_poi_zone[1]:.4f}"
+        long_zone_line = f"📉 <b>Зона Long:</b> {zone_str} ({long_poi_reason})"
+        alert_down = long_poi_zone[1] * 1.003
+    else:
+        long_zone_line = "📉 <b>Зона Long:</b> Не найдена"
+
+    # Формируем строку для Short зоны
+    if short_poi_zone:
+        zone_str = f"{short_poi_zone[0]:.4f}" if short_poi_zone[0] == short_poi_zone[1] else f"{short_poi_zone[0]:.4f} - {short_poi_zone[1]:.4f}"
+        short_zone_line = f"📈 <b>Зона Short:</b> {zone_str} ({short_poi_reason})"
+        alert_up = short_poi_zone[0] * 0.997
+    else:
+        short_zone_line = "📈 <b>Зона Short:</b> Не найдена"
+
+    # Формируем строку для алертов
+    alert_down_str = f"<code>{alert_down:.4f}</code>" if alert_down else "Н/Д"
+    alert_up_str = f"<code>{alert_up:.4f}</code>" if alert_up else "Н/Д"
+    alerts_line = f"🔔 <b>Алерты:</b> 🔽 {alert_down_str} | 🔼 {alert_up_str}"
+
+    # Собираем все строки в одно сообщение
+    return "\n".join([header_line, long_zone_line, short_zone_line, alerts_line])
