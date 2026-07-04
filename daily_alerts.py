@@ -4,8 +4,10 @@ from datetime import datetime
 from dotenv import load_dotenv
 import requests
 import pandas as pd
-from market_data import fetch_candles
+from services.market_data import fetch_candles
 import google.generativeai as genai
+from core.logger import logger
+from core.indicators import calculate_ema, calculate_rsi, calculate_macd
 
 # Загружаем переменные из .env файла в корне проекта
 load_dotenv()
@@ -22,48 +24,13 @@ model = genai.GenerativeModel(model_name='models/gemini-3.1-flash-lite')
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# --- ИНТЕГРАЦИЯ МАТЕМАТИЧЕСКОГО ДВИЖКА ИЗ V10.1 ---
-
-def calculate_ema(df, period=99):
-    try:
-        close_prices = df['close'].astype(float)
-        return close_prices.ewm(span=period, adjust=False).mean()
-    except Exception as e:
-        return None
-
-def calculate_rsi(df, period=6):
-    try:
-        close_prices = df['close'].astype(float)
-        delta = close_prices.diff()
-        gain = delta.clip(lower=0)
-        loss = -delta.clip(upper=0)
-        ema_gain = gain.ewm(com=period - 1, adjust=False).mean()
-        ema_loss = loss.ewm(com=period - 1, adjust=False).mean()
-        rs = ema_gain / ema_loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-    except Exception as e:
-        return None
-
-def calculate_macd(df, fast=12, slow=26, signal=9):
-    try:
-        close_prices = df['close'].astype(float)
-        exp1 = close_prices.ewm(span=fast, adjust=False).mean()
-        exp2 = close_prices.ewm(span=slow, adjust=False).mean()
-        macd_line = exp1 - exp2
-        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-        histogram = macd_line - signal_line
-        return macd_line, signal_line, histogram
-    except Exception as e:
-        return None, None, None
-
 def send_telegram_alert(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
     try:
         requests.post(url, data=payload, timeout=5)
     except Exception as e:
-        print(f"❌ Ошибка отправки в TG: {e}")
+        logger.error(f"Ошибка отправки в TG: {e}")
 
 # --- СПЕЦИАЛЬНАЯ ИНСТРУКЦИЯ ДЛЯ ГЕНЕРАЦИИ АЛЕРТОВ ---
 ALERTS_INSTRUCTION = """
@@ -84,7 +51,7 @@ ALERTS_INSTRUCTION = """
 """
 
 def generate_coin_alert(coin):
-    print(f"🔎 Сканирую уровни SMC для {coin}...")
+    logger.info(f"Сканирую уровни SMC для {coin}...")
     
     # ⚡️ 1. Глубокий прогрев индикаторов (500 свечей)
     df_4h = fetch_candles(coin, '4h', limit=500)
@@ -131,7 +98,7 @@ def generate_coin_alert(coin):
         
         return f"💎 <b>{coin}</b> | Тренд: {trend_emoji}\n{safe_response}"
     except Exception as e:
-        print(f"❌ Ошибка генерации для {coin}: {e}")
+        logger.error(f"Ошибка генерации для {coin}: {e}")
         return None
 
 def run_morning_alerts():
@@ -155,7 +122,7 @@ def run_morning_alerts():
     send_telegram_alert("✅ <b>Разметка завершена.</b>\nВыставь алерты в Binance. Удачной охоты!")
 
 if __name__ == "__main__":
-    print("🚀 Генератор утренних алертов SMC (V10.1 Engine) запущен. Жду 08:30...")
+    logger.info("🚀 Генератор утренних алертов SMC (V10.1 Engine) запущен. Жду 08:30...")
     run_morning_alerts()
     
     while True:
@@ -166,7 +133,7 @@ if __name__ == "__main__":
         current_minute = local_struct.tm_min
         
         if current_hour == 8 and current_minute == 30:
-            print("⏰ Время пришло (08:30). Запускаю генерацию алертов...")
+            logger.info("⏰ Время пришло (08:30). Запускаю генерацию алертов...")
             run_morning_alerts()
             time.sleep(61)
         else:
