@@ -50,10 +50,10 @@ def generate_coin_alert(coin):
     swing_highs, swing_lows = find_swings(df_4h_closed, left_bars=5, right_bars=5)
     all_fvgs = find_fvg(df_4h_closed, atr_series=df_4h_closed['atr'], min_size_atr_ratio=0.5)
 
-    # 4. Поиск ближайших зон интереса (POI) относительно ЖИВОЙ ЦЕНЫ
+    # 4. Поиск ближайших зон интереса (POI) относительно ЖИВОЙ ЦЕНЫ с жесткой изоляцией
     long_poi_zone, long_poi_reason = None, ""
-    # Ищем бычьи FVG, у которых дно ниже текущей цены (чтобы не пропустить тот, в котором мы находимся)
-    bullish_fvgs_below = [f for f in all_fvgs if f['type'] == 'bullish' and f['bottom'] < current_live_price]
+    # ЖЕСТКОЕ ПРАВИЛО: Вся зона Long (даже ее верхняя граница) должна быть НИЖЕ текущей цены
+    bullish_fvgs_below = [f for f in all_fvgs if f['type'] == 'bullish' and f['top'] < current_live_price]
     if bullish_fvgs_below:
         closest_fvg = max(bullish_fvgs_below, key=lambda x: x['top'])
         long_poi_zone = (closest_fvg['bottom'], closest_fvg['top'])
@@ -66,8 +66,8 @@ def generate_coin_alert(coin):
             long_poi_reason = "Liquidity Pool"
 
     short_poi_zone, short_poi_reason = None, ""
-    # Ищем медвежьи FVG, у которых верхушка выше текущей цены (чтобы не пропустить тот, в котором мы находимся)
-    bearish_fvgs_above = [f for f in all_fvgs if f['type'] == 'bearish' and f['top'] > current_live_price]
+    # ЖЕСТКОЕ ПРАВИЛО: Вся зона Short (даже ее нижняя граница) должна быть ВЫШЕ текущей цены
+    bearish_fvgs_above = [f for f in all_fvgs if f['type'] == 'bearish' and f['bottom'] > current_live_price]
     if bearish_fvgs_above:
         closest_fvg = min(bearish_fvgs_above, key=lambda x: x['bottom'])
         short_poi_zone = (closest_fvg['bottom'], closest_fvg['top'])
@@ -79,7 +79,7 @@ def generate_coin_alert(coin):
             short_poi_zone = (closest_high['high'], closest_high['high'])
             short_poi_reason = "Liquidity Pool"
             
-    # 5. Форматирование отчета
+    # 5. Форматирование отчета и умные Алерты
     is_bullish = last_close > last_ema99_4h
     trend_emoji = "🟢" if is_bullish else "🔴"
 
@@ -87,13 +87,14 @@ def generate_coin_alert(coin):
     alert_down = "Н/Д"
     if long_poi_zone:
         long_bottom, long_top = long_poi_zone
-        long_zone_line = f"• 📈 <b>Зона Long (Discount):</b> {long_bottom:.2f} - {long_top:.2f} ({long_poi_reason})"
-        # 🔴 ИСПРАВЛЕНИЕ: Проверяем нахождение ЖИВОЙ цены внутри зоны
-        if long_bottom <= current_live_price <= long_top:
-            alert_down = "Цена уже внутри зоны Long!"
+        long_zone_line = f"• 📈 <b>Зона Long (Discount):</b> {long_bottom:.4f} - {long_top:.4f} ({long_poi_reason})"
+        
+        ideal_alert = long_top * 1.005 # Отступ +0.5%
+        if ideal_alert >= current_live_price:
+            safe_alert = (current_live_price + long_top) / 2
+            alert_down = f"{safe_alert:.4f}"
         else:
-            alert_price = long_top * 1.005 # Отступ +0.5%
-            alert_down = f"{alert_price:.2f}"
+            alert_down = f"{ideal_alert:.4f}"
     else:
         long_zone_line = "• 📈 <b>Зона Long (Discount):</b> Не найдена"
 
@@ -101,28 +102,29 @@ def generate_coin_alert(coin):
     alert_up = "Н/Д"
     if short_poi_zone:
         short_bottom, short_top = short_poi_zone
-        short_zone_line = f"• 📉 <b>Зона Short (Premium):</b> {short_bottom:.2f} - {short_top:.2f} ({short_poi_reason})"
-        # 🔴 ИСПРАВЛЕНИЕ: Проверяем нахождение ЖИВОЙ цены внутри зоны
-        if short_bottom <= current_live_price <= short_top:
-            alert_up = "Алерт не требуется, цена тестирует Short FVG!"
+        short_zone_line = f"• 📉 <b>Зона Short (Premium):</b> {short_bottom:.4f} - {short_top:.4f} ({short_poi_reason})"
+        
+        ideal_alert = short_bottom * 0.995 # Отступ -0.5%
+        if ideal_alert <= current_live_price:
+            safe_alert = (current_live_price + short_bottom) / 2
+            alert_up = f"{safe_alert:.4f}"
         else:
-            alert_price = short_bottom * 0.995 # Отступ -0.5%
-            alert_up = f"{alert_price:.2f}"
+            alert_up = f"{ideal_alert:.4f}"
     else:
         short_zone_line = "• 📉 <b>Зона Short (Premium):</b> Не найдена"
 
     # --- Final Template V.5.0 ---
     return f"""📡 <b>УТРЕННЯЯ РАЗВЕДКА [{coin}/USDT] (4H)</b>
-    • <b>Market Structure:</b> {trend_emoji} HTF Bias. Цена находится {'ВЫШЕ' if is_bullish else 'НИЖЕ'} SMMA(99).
-    • <b>Межрыночный фон:</b> [ОЖИДАНИЕ ИНТЕГРАЦИИ MACRO: Требуется подвязка DXY и S&P500]
+• <b>Market Structure:</b> {trend_emoji} HTF Bias. Текущая цена ({current_live_price:.4f}) находится {'ВЫШЕ' if is_bullish else 'НИЖЕ'} EMA(99).
+• <b>Межрыночный фон:</b> [ОЖИДАНИЕ ИНТЕГРАЦИИ MACRO: Требуется подвязка DXY и S&P500]
 
-    🎯 <b>ЗОНЫ ИНТЕРЕСА (POI) & АЛЕРТЫ</b>
-    {long_zone_line}
-    {short_zone_line}
-    • 🔔 <b>Алерты для Binance:</b>
-    🔽 {alert_down}
-    🔼 {alert_up}
+🎯 <b>ЗОНЫ ИНТЕРЕСА (POI) & АЛЕРТЫ</b>
+{long_zone_line}
+{short_zone_line}
+• 🔔 <b>Алерты для Binance:</b>
+🔽 {alert_down}
+🔼 {alert_up}
 
-    🔥 <b>ГОРЯЧИЕ ПРАВИЛА:</b>
-    • При срабатывании алерта переход на 15m. Нет подтверждения (CHoCH) на 15m? Сетап не сформирован. Ждем.
-    """
+🔥 <b>ГОРЯЧИЕ ПРАВИЛА:</b>
+• При срабатывании алерта переход на 15m. Нет подтверждения (CHoCH) на 15m? Сетап не сформирован. Ждем.
+"""
