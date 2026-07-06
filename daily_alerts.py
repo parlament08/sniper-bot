@@ -87,14 +87,26 @@ def generate_coin_alert(coin):
     alert_down = "Н/Д"
     if long_poi_zone:
         long_bottom, long_top = long_poi_zone
-        long_zone_line = f"• 📈 <b>Зона Long (Discount):</b> {long_bottom:.4f} - {long_top:.4f} ({long_poi_reason})"
+        
+        # ЭСТЕТИЧЕСКИЙ ФИКС: Уровень vs Диапазон
+        if long_bottom == long_top:
+            long_zone_line = f"• 📈 <b>Зона Long (Discount):</b> Уровень {long_bottom:.4f} ({long_poi_reason})"
+        else:
+            long_zone_line = f"• 📈 <b>Зона Long (Discount):</b> Диапазон {long_bottom:.4f} - {long_top:.4f} ({long_poi_reason})"
         
         ideal_alert = long_top * 1.005 # Отступ +0.5%
+        
         if ideal_alert >= current_live_price:
-            safe_alert = (current_live_price + long_top) / 2
-            alert_down = f"{safe_alert:.4f}"
+            proposed_alert = (current_live_price + long_top) / 2
         else:
-            alert_down = f"{ideal_alert:.4f}"
+            proposed_alert = ideal_alert
+            
+        # PROXIMITY FILTER: Проверка дистанции (0.1%)
+        distance_pct = abs(current_live_price - proposed_alert) / current_live_price
+        if distance_pct <= 0.001 or current_live_price <= long_top:
+            alert_down = "Цена уже в зоне алерта — переходи на 15m!"
+        else:
+            alert_down = f"{proposed_alert:.4f}"
     else:
         long_zone_line = "• 📈 <b>Зона Long (Discount):</b> Не найдена"
 
@@ -102,14 +114,26 @@ def generate_coin_alert(coin):
     alert_up = "Н/Д"
     if short_poi_zone:
         short_bottom, short_top = short_poi_zone
-        short_zone_line = f"• 📉 <b>Зона Short (Premium):</b> {short_bottom:.4f} - {short_top:.4f} ({short_poi_reason})"
+        
+        # ЭСТЕТИЧЕСКИЙ ФИКС: Уровень vs Диапазон
+        if short_bottom == short_top:
+            short_zone_line = f"• 📉 <b>Зона Short (Premium):</b> Уровень {short_bottom:.4f} ({short_poi_reason})"
+        else:
+            short_zone_line = f"• 📉 <b>Зона Short (Premium):</b> Диапазон {short_bottom:.4f} - {short_top:.4f} ({short_poi_reason})"
         
         ideal_alert = short_bottom * 0.995 # Отступ -0.5%
+        
         if ideal_alert <= current_live_price:
-            safe_alert = (current_live_price + short_bottom) / 2
-            alert_up = f"{safe_alert:.4f}"
+            proposed_alert = (current_live_price + short_bottom) / 2
         else:
-            alert_up = f"{ideal_alert:.4f}"
+            proposed_alert = ideal_alert
+            
+        # PROXIMITY FILTER: Проверка дистанции (0.1%)
+        distance_pct = abs(current_live_price - proposed_alert) / current_live_price
+        if distance_pct <= 0.001 or current_live_price >= short_bottom:
+            alert_up = "Цена уже в зоне алерта — переходи на 15m!"
+        else:
+            alert_up = f"{proposed_alert:.4f}"
     else:
         short_zone_line = "• 📉 <b>Зона Short (Premium):</b> Не найдена"
 

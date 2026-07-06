@@ -47,7 +47,6 @@ def send_telegram_alert(text):
         logger.error(f"Не удалось отправить пуш в Telegram: {e}")
 
 def prepare_and_analyze(coin, macro_str):
-    logger.info(f"Анализ {coin}...")
     df_4h = fetch_candles(coin, '4h', limit=200)
     df_15m = fetch_candles(coin, '15m', limit=150) # Увеличен лимит для прогрева индикаторов
 
@@ -55,16 +54,14 @@ def prepare_and_analyze(coin, macro_str):
         logger.warning(f"Недостаточно данных для {coin}.")
         return None, None
 
-    # 1. Приведение типов данных
     numeric_cols = ['open', 'high', 'low', 'close', 'volume']
     for col in numeric_cols:
         df_4h[col] = df_4h[col].astype(float)
         df_15m[col] = df_15m[col].astype(float)
 
-    # 2. Расчет индикаторов
     df_4h['ema99'] = calculate_ema(df_4h, 99)
     adx_df = calculate_adx(df_4h, 14)
-    if adx_df is not None: 
+    if adx_df is not None:
         df_4h = df_4h.join(adx_df)
 
     df_15m['atr'] = calculate_atr(df_15m, 14)
@@ -77,29 +74,48 @@ def prepare_and_analyze(coin, macro_str):
         logger.warning(f"Недостаточно данных для {coin} после расчета индикаторов.")
         return None, None
 
-    # Изолируем только закрытые исторические свечи (убираем текущую живую свечу)
     df_15m_closed = df_15m.iloc[:-1].copy()
     last_closed_15m = df_15m_closed.iloc[-1]
-    
-    # Trend (с 4H по закрытым)
+    window_15m = df_15m_closed.tail(20)
+
+    # ❗️ ВАЖНО: Тренд оценивается по 4H данным для глобального контекста
     trend_data = evaluate_trend(df_4h.iloc[:-1])
-    
-    # Structure (исключительно по закрытым 15M)
-    swing_highs, swing_lows = find_swings(df_15m_closed, left_bars=2, right_bars=2)
-    structure_data = detect_structure_break(last_closed_15m, swing_highs, swing_lows)
-    sfp_data = detect_sfp(last_closed_15m, swing_highs, swing_lows)
-    fvg_data = find_fvg(df_15m_closed, atr_series=df_15m_closed['atr'], min_size_atr_ratio=0.5)
-    
-    # Volume
+
+    # --- Анализ в окне памяти (20 свечей) ---
+    sfp_data_in_window = None
+    is_bullish_fvg_tested_in_window = False
+    is_bearish_fvg_tested_in_window = False
+
+    swing_highs_full, swing_lows_full = find_swings(df_15m_closed, left_bars=2, right_bars=2)
+    for index, candle in window_15m.iterrows():
+        swings_before_candle_h = swing_highs_full[swing_highs_full.index < index]
+        swings_before_candle_l = swing_lows_full[swing_lows_full.index < index]
+        sfp = detect_sfp(candle, swings_before_candle_h, swings_before_candle_l)
+        if sfp:
+            sfp_data_in_window = sfp
+            break
+
+    all_fvgs = find_fvg(df_15m_closed, atr_series=df_15m_closed['atr'], min_size_atr_ratio=0.5)
+    for fvg in all_fvgs:
+        fvg_bottom, fvg_top = fvg['bottom'], fvg['top']
+        if fvg['type'] == 'bullish' and any((window_15m['low'] <= fvg_top) & (window_15m['high'] >= fvg_bottom)):
+            is_bullish_fvg_tested_in_window = True
+        elif fvg['type'] == 'bearish' and any((window_15m['low'] <= fvg_top) & (window_15m['high'] >= fvg_bottom)):
+            is_bearish_fvg_tested_in_window = True
+        if is_bullish_fvg_tested_in_window and is_bearish_fvg_tested_in_window:
+            break
+
+    # --- Анализ триггера (последняя закрытая свеча) ---
+    structure_data = detect_structure_break(last_closed_15m, swing_highs_full, swing_lows_full)
     volume_data = {'rvol': last_closed_15m['rvol']}
-    
-    # Macro
-    macro_confirms = 'dxy' in macro_str.lower() and ('пада' in macro_str.lower() or 'медвеж' in macro_str.lower())
+
+    macro_confirms = 'dxy' in macro_str.lower() and ('пада' in macro_str.lower() or 'медвеж' in macro_str.lower() or 'bear' in macro_str.lower())
     macro_data = {'confirms': macro_confirms}
 
-    # 4. Запуск Score Engine (сравниваем лонг и шорт, берем лучший)
-    long_score = calculate_setup_score('long', trend_data, structure_data, sfp_data, fvg_data, volume_data, macro_data)
-    short_score = calculate_setup_score('short', trend_data, structure_data, sfp_data, fvg_data, volume_data, macro_data)
+    current_price = float(last_closed_15m['close'])
+
+    long_score = calculate_setup_score('long', current_price, trend_data, structure_data, sfp_data_in_window, is_bullish_fvg_tested_in_window, all_fvgs, volume_data, macro_data)
+    short_score = calculate_setup_score('short', current_price, trend_data, structure_data, sfp_data_in_window, is_bearish_fvg_tested_in_window, all_fvgs, volume_data, macro_data)
 
     if long_score['total_score'] >= short_score['total_score']:
         final_score_result = long_score
@@ -182,7 +198,23 @@ def market_scan(report_mode="HUNT"):
             trend_strength = trend_data.get('strength', 'Н/Д') if trend_data else "Н/Д"
             
             # Добавляем строку в дашборд
-            dashboard_lines.append(f"• <b>{coin}</b>: {total_score} баллов | {decision} | Тренд: {trend_strength}")
+            # if coin in ['BTC', 'ETH', 'SOL']:
+            if coin in COINS_LIST:
+                breakdown = score_result.get('breakdown', {})
+                
+                header = f"💎 <b>{coin}</b> | Score: <b>{total_score}/100</b> | {decision}"
+                trend_line = f"📊 Тренд: {breakdown.get('trend', '0')}"
+                structure_line = f"⚙️ Структура: {breakdown.get('structure', '0')}"
+                liquidity_line = f"💧 Ликвидность: {breakdown.get('liquidity', '0')}"
+                fvg_line = f"🎯 FVG: {breakdown.get('fvg', '0')}"
+                volume_line = f"📈 Объем: {breakdown.get('volume', '0')}"
+                macro_line = f"🌍 Макро: {breakdown.get('macro', '0')}"
+                separator = "──────────────────"
+                
+                detailed_report = "\n".join([header, trend_line, structure_line, liquidity_line, fvg_line, volume_line, macro_line, separator])
+                dashboard_lines.append(detailed_report)
+            else:
+                dashboard_lines.append(f"• <b>{coin}</b>: {total_score} баллов | {decision} | Тренд: {trend_strength}")
 
         except Exception as e:
             logger.error(f"Критическая ошибка при анализе {coin}: {e}", exc_info=True)
