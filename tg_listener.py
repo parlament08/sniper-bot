@@ -3,6 +3,7 @@ import time
 import telebot
 from dotenv import load_dotenv
 from daily_alerts import generate_coin_alert
+from analyzer import market_scan
 from core.logger import logger
 
 # Загружаем переменные из .env файла
@@ -47,6 +48,26 @@ def handle_alerts_command(message):
             bot.send_message(CHAT_ID, chunk, parse_mode="HTML")
             time.sleep(1)  # Задержка между отправкой сообщений в Telegram
         bot.send_message(CHAT_ID, "✅ <b>Разметка завершена.</b>", parse_mode="HTML")
+
+@bot.message_handler(commands=['scan'])
+def handle_scan_command(message):
+    """Обрабатывает команду /scan для ручного запуска полного сканирования рынка."""
+    # Проверка безопасности: отвечаем только авторизованному пользователю
+    if str(message.chat.id) != CHAT_ID:
+        logger.warning(f"Несанкционированный доступ от chat_id: {message.chat.id} для команды /scan")
+        bot.send_message(message.chat.id, "У вас нет доступа к этому боту.")
+        return
+
+    logger.info(f"Получена команда /scan от авторизованнго пользователя.")
+    bot.send_message(CHAT_ID, "⏳ Запускаю ручное сканирование рынка...", parse_mode="HTML")
+    
+    try:
+        # Вызываем market_scan в режиме полного брифинга.
+        # Эта функция сама отправит итоговый отчет в Telegram.
+        market_scan(report_mode="FULL")
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении ручного сканирования по команде /scan: {e}", exc_info=True)
+        bot.send_message(CHAT_ID, "❌ Произошла ошибка во время сканирования. Проверьте логи.", parse_mode="HTML")
 
 if __name__ == "__main__":
     logger.info("🚀 Telegram Listener запущен. Ожидаю команду /alerts...")
