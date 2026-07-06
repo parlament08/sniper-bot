@@ -60,6 +60,43 @@ def get_macro_context():
             
     return macro_data
 
+def check_macro_confirmation(trade_direction: str, macro_data: dict, is_altcoin: bool = True) -> bool:
+    """
+    Анализирует макро-данные (DXY, SPX) и доминацию Биткоина (BTC.D).
+    """
+    if not macro_data:
+        return False
+        
+    dxy_trend = macro_data.get("DXY", {}).get("trend", "")
+    spx_trend = macro_data.get("SPX", {}).get("trend", "")
+    btc_d_status = macro_data.get("BTC.D", {}).get("trend", "")
+    
+    # Базовая проверка TradFi (Глобальная ликвидность)
+    is_tradfi_bullish = "Bullish" in spx_trend and "Bearish" in dxy_trend
+    is_tradfi_bearish = "Bearish" in spx_trend and "Bullish" in dxy_trend
+    
+    if trade_direction == 'long':
+        # Для лонга: TradFi должен быть Risk-On
+        if not is_tradfi_bullish:
+            return False
+            
+        # Если торгуем альткоин, проверяем доминацию битка
+        if is_altcoin and "High Risk" in btc_d_status:
+            return False # Ликвидность уходит в биток, макро не подтверждает лонг альтов
+            
+        return True
+        
+    elif trade_direction == 'short':
+        # Для шорта: TradFi должен быть Risk-Off (падаем)
+        if not is_tradfi_bearish:
+            return False
+            
+        # При шорте альткоинов высокая доминация битка - это даже плюс (альта слабеет быстрее),
+        # поэтому здесь мы не блокируем шорт по BTC.D.
+        return True
+        
+    return False
+
 if __name__ == "__main__":
     context = get_macro_context()
     

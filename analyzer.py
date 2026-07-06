@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 from core.logger import logger
 from services.market_data import fetch_candles
-from services.macro_context import get_macro_context
+from services.macro_context import get_macro_context, check_macro_confirmation
 from core.structure import find_swings, find_fvg, detect_structure_break, detect_sfp
 from core.indicators import calculate_ema, calculate_atr, calculate_rvol, calculate_adx, evaluate_trend
 from core.risk import calculate_setup_score
@@ -46,7 +46,7 @@ def send_telegram_alert(text):
     except Exception as e:
         logger.error(f"Не удалось отправить пуш в Telegram: {e}")
 
-def prepare_and_analyze(coin, macro_str):
+def prepare_and_analyze(coin, macro_context):
     df_4h = fetch_candles(coin, '4h', limit=200)
     df_15m = fetch_candles(coin, '15m', limit=150) # Увеличен лимит для прогрева индикаторов
 
@@ -110,13 +110,14 @@ def prepare_and_analyze(coin, macro_str):
     structure_data = detect_structure_break(last_closed_15m, swing_highs_full, swing_lows_full)
     volume_data = {'rvol': last_closed_15m['rvol']}
 
-    macro_confirms = 'dxy' in macro_str.lower() and ('пада' in macro_str.lower() or 'медвеж' in macro_str.lower() or 'bear' in macro_str.lower())
-    macro_data = {'confirms': macro_confirms}
-
     current_price = float(last_closed_15m['close'])
 
-    long_score = calculate_setup_score('long', current_price, trend_data, structure_data, sfp_data_in_window, is_bullish_fvg_tested_in_window, all_fvgs, volume_data, macro_data)
-    short_score = calculate_setup_score('short', current_price, trend_data, structure_data, sfp_data_in_window, is_bearish_fvg_tested_in_window, all_fvgs, volume_data, macro_data)
+    is_altcoin = coin != "BTC"
+    long_macro_data = {'confirms': check_macro_confirmation('long', macro_context, is_altcoin=is_altcoin)}
+    short_macro_data = {'confirms': check_macro_confirmation('short', macro_context, is_altcoin=is_altcoin)}
+
+    long_score = calculate_setup_score('long', current_price, trend_data, structure_data, sfp_data_in_window, is_bullish_fvg_tested_in_window, all_fvgs, volume_data, long_macro_data)
+    short_score = calculate_setup_score('short', current_price, trend_data, structure_data, sfp_data_in_window, is_bearish_fvg_tested_in_window, all_fvgs, volume_data, short_macro_data)
 
     if long_score['total_score'] >= short_score['total_score']:
         final_score_result = long_score
@@ -153,7 +154,7 @@ def market_scan(report_mode="HUNT"):
 
     for coin in COINS_LIST:
         try:
-            score_result, analysis_data = prepare_and_analyze(coin, macro_str)
+            score_result, analysis_data = prepare_and_analyze(coin, macro)
             if not score_result or not analysis_data:
                 dashboard_lines.append(f"• <b>{coin}</b>: Н/Д (ошибка данных)")
                 continue
