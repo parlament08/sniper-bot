@@ -109,10 +109,18 @@ def calculate_setup_score(
         else:
             breakdown['fvg'] = '0 (Зона пробита после теста)'
 
-    # 5. Объем (+10 баллов)
-    if volume_data and volume_data.get('rvol', 0) > 1.5:
+    # 5. Объем (+10 баллов) - Память SFP + Текущий импульс
+    breakdown['volume'] = '0 (Нет подтверждения аномальным объемом)'
+    
+    # Сначала проверяем, был ли аномальный объем в момент сбора ликвидности (SFP)
+    if sfp_data_in_window and sfp_data_in_window.get('rvol', 0) > 1.5:
         score += 10
-        breakdown['volume'] = '+10 (Подтверждение объемом RVOL > 1.5)'
+        breakdown['volume'] = '+10 (Подтверждение объемом на свече SFP: RVOL > 1.5)'
+        
+    # Если SFP без объема или его нет, проверяем текущую импульсную свечу
+    elif volume_data and volume_data.get('rvol', 0) > 1.5:
+        score += 10
+        breakdown['volume'] = '+10 (Подтверждение локальным объемом: RVOL > 1.5)'
 
     # 6. Макро-контекст (+10 баллов) - Заглушка
     if macro_data and macro_data.get('confirms', False):

@@ -92,7 +92,8 @@ def prepare_and_analyze(coin, macro_str):
         swings_before_candle_l = swing_lows_full[swing_lows_full.index < index]
         sfp = detect_sfp(candle, swings_before_candle_h, swings_before_candle_l)
         if sfp:
-            sfp_data_in_window = sfp
+            sfp['rvol'] = candle.get('rvol', 0)
+            sfp_data_in_window = sfp # Сохраняем SFP с его объемом
             break
 
     all_fvgs = find_fvg(df_15m_closed, atr_series=df_15m_closed['atr'], min_size_atr_ratio=0.5)
