@@ -5,6 +5,7 @@ from services.market_data import fetch_candles
 from core.logger import logger
 from core.indicators import calculate_ema, calculate_atr
 from core.structure import find_swings, find_fvg
+from services.macro_context import get_macro_context
 
 # Загружаем переменные из .env файла в корне проекта
 load_dotenv()
@@ -47,37 +48,59 @@ def generate_coin_alert(coin):
     # Определяем тренд по 4H EMA
     last_ema99_4h = float(last_closed_candle['ema99'])
     
-    swing_highs, swing_lows = find_swings(df_4h_closed, left_bars=5, right_bars=5)
+    swing_highs, swing_lows = find_swings(df_4h_closed, left_bars=20, right_bars=20)
     all_fvgs = find_fvg(df_4h_closed, atr_series=df_4h_closed['atr'], min_size_atr_ratio=0.5)
 
     # 4. Поиск ближайших зон интереса (POI) относительно ЖИВОЙ ЦЕНЫ с жесткой изоляцией
     long_poi_zone, long_poi_reason = None, ""
     # ЖЕСТКОЕ ПРАВИЛО: Вся зона Long (даже ее верхняя граница) должна быть НИЖЕ текущей цены
     bullish_fvgs_below = [f for f in all_fvgs if f['type'] == 'bullish' and f['top'] < current_live_price]
-    if bullish_fvgs_below:
+    
+    # Приоритет: сначала ищем нетронутую макро-ликвидность (Unmitigated SSL)
+    if not swing_lows.empty:
+        relevant_lows = swing_lows[swing_lows['low'] < current_live_price]
+        
+        # Фильтрация нетронутых (unmitigated) минимумов
+        unmitigated_lows = []
+        for idx, row in relevant_lows.iterrows():
+            future_price_action = df_4h_closed.loc[idx:].iloc[1:]
+            if future_price_action.empty or future_price_action['low'].min() >= row['low']:
+                unmitigated_lows.append(row)
+
+        if unmitigated_lows:
+            closest_low_series = unmitigated_lows[-1] # Берем ближайший нетронутый
+            long_poi_zone = (closest_low_series['low'], closest_low_series['low'])
+            long_poi_reason = "Unmitigated SSL"
+    # Если структурного дна рядом нет, берем FVG
+    elif bullish_fvgs_below:
         closest_fvg = max(bullish_fvgs_below, key=lambda x: x['top'])
         long_poi_zone = (closest_fvg['bottom'], closest_fvg['top'])
         long_poi_reason = "FVG"
-    elif not swing_lows.empty:
-        relevant_lows = swing_lows[swing_lows['low'] < current_live_price]
-        if not relevant_lows.empty:
-            closest_low = relevant_lows.iloc[-1]
-            long_poi_zone = (closest_low['low'], closest_low['low'])
-            long_poi_reason = "Liquidity Pool"
 
     short_poi_zone, short_poi_reason = None, ""
     # ЖЕСТКОЕ ПРАВИЛО: Вся зона Short (даже ее нижняя граница) должна быть ВЫШЕ текущей цены
     bearish_fvgs_above = [f for f in all_fvgs if f['type'] == 'bearish' and f['bottom'] > current_live_price]
-    if bearish_fvgs_above:
+    
+    # Приоритет: сначала ищем нетронутую макро-ликвидность (Unmitigated BSL)
+    if not swing_highs.empty:
+        relevant_highs = swing_highs[swing_highs['high'] > current_live_price]
+
+        # Фильтрация нетронутых (unmitigated) максимумов
+        unmitigated_highs = []
+        for idx, row in relevant_highs.iterrows():
+            future_price_action = df_4h_closed.loc[idx:].iloc[1:]
+            if future_price_action.empty or future_price_action['high'].max() <= row['high']:
+                unmitigated_highs.append(row)
+
+        if unmitigated_highs:
+            closest_high_series = unmitigated_highs[-1] # Берем ближайший нетронутый
+            short_poi_zone = (closest_high_series['high'], closest_high_series['high'])
+            short_poi_reason = "Unmitigated BSL"
+    # Если структурной вершины рядом нет, берем FVG
+    elif bearish_fvgs_above:
         closest_fvg = min(bearish_fvgs_above, key=lambda x: x['bottom'])
         short_poi_zone = (closest_fvg['bottom'], closest_fvg['top'])
         short_poi_reason = "FVG"
-    elif not swing_highs.empty:
-        relevant_highs = swing_highs[swing_highs['high'] > current_live_price]
-        if not relevant_highs.empty:
-            closest_high = relevant_highs.iloc[-1]
-            short_poi_zone = (closest_high['high'], closest_high['high'])
-            short_poi_reason = "Liquidity Pool"
             
     # 5. Форматирование отчета и умные Алерты
     is_bullish = last_close > last_ema99_4h
@@ -137,10 +160,18 @@ def generate_coin_alert(coin):
     else:
         short_zone_line = "• 📉 <b>Зона Short (Premium):</b> Не найдена"
 
+    # Получаем макро-данные
+    macro = get_macro_context()
+    dxy_trend = macro.get('DXY', {}).get('trend', 'Н/Д')
+    spx_trend = macro.get('SPX', {}).get('trend', 'Н/Д')
+    btc_d = macro.get('BTC.D', {}).get('price', 'Н/Д')
+    
+    macro_string = f"DXY: {dxy_trend} | SPX: {spx_trend} | BTC.D: {btc_d}%"
+
     # --- Final Template V.5.0 ---
     return f"""📡 <b>УТРЕННЯЯ РАЗВЕДКА [{coin}/USDT] (4H)</b>
 • <b>Market Structure:</b> {trend_emoji} HTF Bias. Текущая цена ({current_live_price:.4f}) находится {'ВЫШЕ' if is_bullish else 'НИЖЕ'} EMA(99).
-• <b>Межрыночный фон:</b> [ОЖИДАНИЕ ИНТЕГРАЦИИ MACRO: Требуется подвязка DXY и S&P500]
+• <b>Межрыночный фон:</b> {macro_string}
 
 🎯 <b>ЗОНЫ ИНТЕРЕСА (POI) & АЛЕРТЫ</b>
 {long_zone_line}
