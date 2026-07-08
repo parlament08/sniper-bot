@@ -22,7 +22,8 @@ from core.structure import (
     find_swings,
 )
 from core.indicators import calculate_ema, calculate_atr, calculate_rvol, calculate_adx, evaluate_trend
-from core.risk import calculate_setup_score
+from core.premium_discount import evaluate_premium_discount
+from core.risk import calculate_setup_score, select_best_setup
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
@@ -56,6 +57,18 @@ def send_telegram_alert(text):
     except Exception as e:
         logger.error(f"Не удалось отправить пуш в Telegram: {e}")
 
+
+def _resolve_premium_discount(current_price, range_candidates):
+    for swing_highs, swing_lows in range_candidates:
+        if swing_highs.empty or swing_lows.empty:
+            continue
+        try:
+            return evaluate_premium_discount(current_price, swing_highs, swing_lows)
+        except ValueError:
+            continue
+    return None
+
+
 def prepare_and_analyze(coin, macro_context):
     df_4h = fetch_candles(coin, '4h', limit=200)
     df_15m = fetch_candles(coin, '15m', limit=150) # Увеличен лимит для прогрева индикаторов
@@ -84,12 +97,13 @@ def prepare_and_analyze(coin, macro_context):
         logger.warning(f"Недостаточно данных для {coin} после расчета индикаторов.")
         return None, None
 
+    df_4h_closed = df_4h.iloc[:-1].copy()
     df_15m_closed = df_15m.iloc[:-1].copy()
     last_closed_15m = df_15m_closed.iloc[-1]
     window_15m = df_15m_closed.tail(100)
     
     # ❗️ ВАЖНО: Тренд оценивается по 4H данным для глобального контекста
-    trend_data = evaluate_trend(df_4h.iloc[:-1])
+    trend_data = evaluate_trend(df_4h_closed)
 
     # --- Анализ в окне памяти (20 свечей) ---
     sfp_data_in_window = None
@@ -128,6 +142,7 @@ def prepare_and_analyze(coin, macro_context):
                 'fvg': '0',
                 'volume': '0',
                 'macro': '0',
+                'premium_discount': '0',
             },
         }, {
             'trend_data': trend_data,
@@ -214,6 +229,15 @@ def prepare_and_analyze(coin, macro_context):
     short_fvg_test_data = {'index': bearish_fvg_test_index} if bearish_fvg_test_index else None
 
     current_price = float(last_closed_15m['close'])
+    swing_highs_4h, swing_lows_4h = find_swings(df_4h_closed, left_bars=3, right_bars=2)
+    premium_discount_data = _resolve_premium_discount(
+        current_price,
+        (
+            (swing_highs_4h, swing_lows_4h),
+            (swing_highs_1h, swing_lows_1h),
+            (swing_highs_15m, swing_lows_15m),
+        ),
+    )
 
     is_altcoin = coin != "BTC"
     
@@ -225,20 +249,16 @@ def prepare_and_analyze(coin, macro_context):
     short_macro_data = {'score': short_macro_score, 'reason': short_macro_reason}
     
     # ✅ ВОТ ЭТИ ДВЕ СТРОКИ НУЖНО ВЕРНУТЬ (Вызов калькулятора баллов):
-    long_score = calculate_setup_score('long', current_price, trend_data, context_break_1h, trigger_break_15m, sfp_data_in_window, long_fvg_test_data, all_fvgs, long_macro_data)
-    short_score = calculate_setup_score('short', current_price, trend_data, context_break_1h, trigger_break_15m, sfp_data_in_window, short_fvg_test_data, all_fvgs, short_macro_data)
+    long_score = calculate_setup_score('long', current_price, trend_data, context_break_1h, trigger_break_15m, sfp_data_in_window, long_fvg_test_data, all_fvgs, long_macro_data, premium_discount_data)
+    short_score = calculate_setup_score('short', current_price, trend_data, context_break_1h, trigger_break_15m, sfp_data_in_window, short_fvg_test_data, all_fvgs, short_macro_data, premium_discount_data)
 
-    if long_score['total_score'] >= short_score['total_score']:
-        final_score_result = long_score
-        direction = "LONG"
-    else:
-        final_score_result = short_score
-        direction = "SHORT"    
+    final_score_result, direction = select_best_setup(long_score, short_score)
 
     analysis_data = {
         "trend_data": trend_data,
         # Для А+ сетапа нам нужен уровень от 1H структуры
         "structure_data": context_break_1h or trigger_break_15m,
+        "premium_discount_data": premium_discount_data,
         "direction": direction,
         "last_closed_15m": last_closed_15m,
     }
@@ -335,10 +355,11 @@ def market_scan(report_mode="HUNT"):
                 liquidity_line = f"💧 Ликвидность: {breakdown.get('liquidity', '0')}"
                 fvg_line = f"🎯 FVG: {breakdown.get('fvg', '0')}"
                 volume_line = f"📈 Объем: {breakdown.get('volume', '0')}"
+                premium_discount_line = f"⚖️ P/D: {breakdown.get('premium_discount', '0')}"
                 macro_line = f"🌍 Макро: {breakdown.get('macro', '0')}"
                 separator = "──────────────────"
                 
-                detailed_report = "\n".join([header, trend_line, structure_line, liquidity_line, fvg_line, volume_line, macro_line, separator])
+                detailed_report = "\n".join([header, trend_line, structure_line, liquidity_line, fvg_line, volume_line, premium_discount_line, macro_line, separator])
                 dashboard_lines.append(detailed_report)
             else:
                 dashboard_lines.append(f"• <b>{coin}</b>: {total_score} баллов | {decision} | Тренд: {trend_strength}")

@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from dataclasses import dataclass, asdict
 from typing import List, Tuple, Dict, Optional, Any, Union
+from core.displacement import evaluate_displacement
 from core.logger import logger
 
 
@@ -458,18 +459,21 @@ def find_fvg(
         if atr <= 0:
             atr = fvg_size if fvg_size > 0 else 1.0
 
-        impulse_open = _safe_float(df.loc[impulse_index, 'open'])
-        impulse_close = _safe_float(df.loc[impulse_index, 'close'])
-        impulse_body = abs(impulse_close - impulse_open)
-        displacement_ratio = impulse_body / atr
-        size_atr_ratio = fvg_size / atr
         rvol = 0.0
         if rvol_series is not None and impulse_index in rvol_series.index:
             rvol = _safe_float(rvol_series.loc[impulse_index])
         elif 'rvol' in df.columns:
             rvol = _safe_float(df.loc[impulse_index, 'rvol'])
 
-        volume_confirmed = rvol >= config.min_rvol
+        displacement = evaluate_displacement(
+            df.loc[impulse_index],
+            atr=atr,
+            rvol=rvol if rvol > 0 else None,
+            direction=fvg_type,
+        )
+        displacement_ratio = displacement.atr_ratio
+        size_atr_ratio = fvg_size / atr
+        volume_confirmed = displacement.volume_ratio is not None and displacement.volume_ratio >= config.min_rvol
         age_bars = len(df) - pos - 1
 
         if future_candles.empty or fvg_size <= 0:
@@ -845,26 +849,31 @@ def _build_sfp_result(
     if atr <= 0:
         atr = candle_range if candle_range > 0 else 1.0
 
+    displacement = evaluate_displacement(
+        candle,
+        atr=atr,
+        rvol=rvol if rvol > 0 else None,
+        direction=direction,
+    )
+
     if direction == 'bearish':
         liquidity_depth = max(candle_high - level, 0.0) / atr
         return_inside_ratio = max(level - candle_close, 0.0) / atr
         rejection_wick = max(candle_high - max(candle_open, candle_close), 0.0)
         opposite_wick = max(min(candle_open, candle_close) - candle_low, 0.0)
-        displacement_ratio = max(candle_open - candle_close, 0.0) / atr
-        close_position = (candle_high - candle_close) / candle_range if candle_range > 0 else 0.0
         close_returned_inside = candle_close < level
     else:
         liquidity_depth = max(level - candle_low, 0.0) / atr
         return_inside_ratio = max(candle_close - level, 0.0) / atr
         rejection_wick = max(min(candle_open, candle_close) - candle_low, 0.0)
         opposite_wick = max(candle_high - max(candle_open, candle_close), 0.0)
-        displacement_ratio = max(candle_close - candle_open, 0.0) / atr
-        close_position = (candle_close - candle_low) / candle_range if candle_range > 0 else 0.0
         close_returned_inside = candle_close > level
 
     rejection_ratio = rejection_wick / candle_range if candle_range > 0 else 0.0
+    displacement_ratio = displacement.atr_ratio
+    close_position = displacement.close_position
     opposite_wick_ratio = opposite_wick / candle_range if candle_range > 0 else 1.0
-    volume_confirmed = rvol >= config.min_rvol
+    volume_confirmed = displacement.volume_ratio is not None and displacement.volume_ratio >= config.min_rvol
     hold_confirmed = _check_sfp_hold_confirmation(direction, level, atr, future_candles, config)
 
     depth_score = _score_ratio(
@@ -947,10 +956,16 @@ def _build_bos_result(
     atr = _safe_float(candle.get('atr'))
     rvol = _safe_float(candle.get('rvol'))
 
-    body_size = abs(candle_close - candle_open)
-    candle_range = max(candle_high - candle_low, 0.0)
-    body_ratio = body_size / candle_range if candle_range > 0 else 0.0
-    displacement_ratio = body_size / atr if atr > 0 else 0.0
+    displacement = evaluate_displacement(
+        candle,
+        atr=atr,
+        rvol=rvol if rvol > 0 else None,
+        direction=direction,
+    )
+    body_size = displacement.body
+    candle_range = displacement.candle_range
+    body_ratio = displacement.body_ratio
+    displacement_ratio = displacement.atr_ratio
     close_buffer = atr * config.close_buffer_atr if atr > 0 else 0.0
 
     if direction == 'bullish':
@@ -963,7 +978,7 @@ def _build_bos_result(
         close_distance = max(level - candle_close, 0.0)
 
     opposite_wick_ratio = opposite_wick / candle_range if candle_range > 0 else 1.0
-    volume_confirmed = rvol >= config.min_rvol
+    volume_confirmed = displacement.volume_ratio is not None and displacement.volume_ratio >= config.min_rvol
     hold_confirmed = _check_hold_confirmation(direction, level, atr, future_candles, config)
 
     close_score = 0.0

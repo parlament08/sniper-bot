@@ -92,6 +92,38 @@ def _structure_volume_score(structure_data: Optional[Dict], confirmation_reason:
     return 5 if structure_data.get('quality_score', 0) >= 90 else 0
 
 
+def _pd_get(premium_discount_data, key: str, default=None):
+    if not premium_discount_data:
+        return default
+    if hasattr(premium_discount_data, 'get'):
+        return premium_discount_data.get(key, default)
+    return getattr(premium_discount_data, key, default)
+
+
+def _premium_discount_label(premium_discount_data) -> str:
+    zone = _pd_get(premium_discount_data, 'zone')
+    distance = _pd_get(premium_discount_data, 'distance_from_equilibrium_percent')
+
+    if zone is None:
+        return '0'
+    if distance is None:
+        return f"{zone}"
+    return f"{zone} ({float(distance):+.2f}% от EQ)"
+
+
+def select_best_setup(long_score: Dict, short_score: Dict) -> tuple:
+    long_total = long_score.get('total_score', 0)
+    short_total = short_score.get('total_score', 0)
+
+    if long_total <= 0 and short_total <= 0:
+        return long_score, 'NEUTRAL'
+
+    if long_total >= short_total:
+        return long_score, 'LONG'
+
+    return short_score, 'SHORT'
+
+
 def calculate_setup_score(
     trade_direction: str,
     current_price: float,
@@ -101,7 +133,8 @@ def calculate_setup_score(
     sfp_data_in_window: Optional[Dict],
     fvg_test_data: Optional[Dict],
     fvg_data: List[Dict],
-    macro_data: Optional[Dict]
+    macro_data: Optional[Dict],
+    premium_discount_data: Optional[Dict] = None,
 ) -> Dict:
     """
     Рассчитывает скоринговую оценку для торгового сетапа на основе набора технических факторов.
@@ -129,8 +162,24 @@ def calculate_setup_score(
         'liquidity': '0',
         'fvg': '0',
         'volume': '0',
-        'macro': '0'
+        'macro': '0',
+        'premium_discount': '0',
     }
+
+    if premium_discount_data:
+        pd_valid = (
+            _pd_get(premium_discount_data, 'valid_for_buy', False)
+            if trade_direction == 'long'
+            else _pd_get(premium_discount_data, 'valid_for_sell', False)
+        )
+        if not pd_valid:
+            breakdown['premium_discount'] = f"BLOCK ({_premium_discount_label(premium_discount_data)})"
+            return {
+                'total_score': 0,
+                'decision': 'Ignore',
+                'breakdown': breakdown,
+            }
+        breakdown['premium_discount'] = f"OK ({_premium_discount_label(premium_discount_data)})"
 
     # 1. Тренд (+25 / +10 баллов)
     # ФИКС: Если тренд глобально направлен ПРОТИВ нашей сделки,
