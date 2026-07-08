@@ -77,7 +77,7 @@ def prepare_and_analyze(coin, macro_context):
 
     df_15m_closed = df_15m.iloc[:-1].copy()
     last_closed_15m = df_15m_closed.iloc[-1]
-    window_15m = df_15m_closed.tail(20)
+    window_15m = df_15m_closed.tail(100)
     
     # ❗️ ВАЖНО: Тренд оценивается по 4H данным для глобального контекста
     trend_data = evaluate_trend(df_4h.iloc[:-1])
@@ -88,7 +88,7 @@ def prepare_and_analyze(coin, macro_context):
     is_bullish_fvg_tested_in_window = False
     is_bearish_fvg_tested_in_window = False
 
-    swing_config = {'left_bars': 2, 'right_bars': 2}
+    swing_config = {'left_bars': 5, 'right_bars': 3}
     swing_highs_full, swing_lows_full = find_swings(df_15m_closed, **swing_config)
 
     # Итерируемся по окну С КОНЦА, чтобы найти ПОСЛЕДНИЕ (самые релевантные) события SFP и BOS
