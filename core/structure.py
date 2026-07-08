@@ -152,12 +152,13 @@ def detect_structure_break(last_closed_candle: pd.Series, swing_highs: pd.DataFr
     level_high = float(last_swing_high['high'])
     level_low = float(last_swing_low['low'])
     close_price = float(last_closed_candle['close'])
+    rvol = last_closed_candle.get('rvol', 0)
 
     if close_price > level_high:
-        return {'type': 'bullish_break', 'level': level_high}
+        return {'type': 'bullish_break', 'level': level_high, 'rvol': rvol}
 
     if close_price < level_low:
-        return {'type': 'bearish_break', 'level': level_low}
+        return {'type': 'bearish_break', 'level': level_low, 'rvol': rvol}
         
     return None
 

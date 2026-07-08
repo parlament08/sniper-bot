@@ -9,7 +9,8 @@ from dotenv import load_dotenv
 
 from core.logger import logger
 from services.market_data import fetch_candles
-from services.macro_context import get_macro_context, check_macro_confirmation
+#from services.macro_context import get_macro_context, check_macro_confirmation
+from services.macro_context import get_macro_context, evaluate_macro_score
 from core.structure import find_swings, find_fvg, detect_structure_break, detect_sfp
 from core.indicators import calculate_ema, calculate_atr, calculate_rvol, calculate_adx, evaluate_trend
 from core.risk import calculate_setup_score
@@ -77,58 +78,73 @@ def prepare_and_analyze(coin, macro_context):
     df_15m_closed = df_15m.iloc[:-1].copy()
     last_closed_15m = df_15m_closed.iloc[-1]
     window_15m = df_15m_closed.tail(20)
-
+    
     # ❗️ ВАЖНО: Тренд оценивается по 4H данным для глобального контекста
     trend_data = evaluate_trend(df_4h.iloc[:-1])
 
     # --- Анализ в окне памяти (20 свечей) ---
     sfp_data_in_window = None
+    structure_data_in_window = None
     is_bullish_fvg_tested_in_window = False
     is_bearish_fvg_tested_in_window = False
 
     swing_highs_full, swing_lows_full = find_swings(df_15m_closed, left_bars=2, right_bars=2)
-    for index, candle in window_15m.iterrows():
+
+    # Итерируемся по окну С КОНЦА, чтобы найти ПОСЛЕДНИЕ (самые релевантные) события SFP и BOS
+    for index, candle in window_15m.iloc[::-1].iterrows():
         swings_before_candle_h = swing_highs_full[swing_highs_full.index < index]
         swings_before_candle_l = swing_lows_full[swing_lows_full.index < index]
-        sfp = detect_sfp(candle, swings_before_candle_h, swings_before_candle_l)
-        if sfp:
-            sfp['rvol'] = candle.get('rvol', 0)
-            sfp_data_in_window = sfp # Сохраняем SFP с его объемом
+
+        # Ищем SFP (только если еще не нашли)
+        if not sfp_data_in_window:
+            sfp = detect_sfp(candle, swings_before_candle_h, swings_before_candle_l)
+            if sfp:
+                sfp['rvol'] = candle.get('rvol', 0)
+                sfp_data_in_window = sfp
+
+        # Ищем BOS/CHoCH (только если еще не нашли)
+        if not structure_data_in_window:
+            structure_break = detect_structure_break(candle, swings_before_candle_h, swings_before_candle_l)
+            if structure_break:
+                # 'rvol' уже добавляется в detect_structure_break
+                structure_data_in_window = structure_break
+        
+        # Если нашли оба самых свежих паттерна, выходим для оптимизации
+        if sfp_data_in_window and structure_data_in_window:
             break
 
     all_fvgs = find_fvg(df_15m_closed, atr_series=df_15m_closed['atr'], min_size_atr_ratio=0.5)
     for fvg in all_fvgs:
         fvg_bottom, fvg_top = fvg['bottom'], fvg['top']
-        if fvg['type'] == 'bullish' and any((window_15m['low'] <= fvg_top) & (window_15m['high'] >= fvg_bottom)):
-            is_bullish_fvg_tested_in_window = True
-        elif fvg['type'] == 'bearish' and any((window_15m['low'] <= fvg_top) & (window_15m['high'] >= fvg_bottom)):
-            is_bearish_fvg_tested_in_window = True
-        if is_bullish_fvg_tested_in_window and is_bearish_fvg_tested_in_window:
-            break
-
-    # --- Анализ триггера (последняя закрытая свеча) ---
-    structure_data = detect_structure_break(last_closed_15m, swing_highs_full, swing_lows_full)
-    volume_data = {'rvol': last_closed_15m['rvol']}
+        if fvg['type'] == 'bullish' and any((window_15m['low'] <= fvg_top) & (window_15m['high'] >= fvg_bottom)): is_bullish_fvg_tested_in_window = True
+        elif fvg['type'] == 'bearish' and any((window_15m['low'] <= fvg_top) & (window_15m['high'] >= fvg_bottom)): is_bearish_fvg_tested_in_window = True
+        if is_bullish_fvg_tested_in_window and is_bearish_fvg_tested_in_window: break
 
     current_price = float(last_closed_15m['close'])
 
     is_altcoin = coin != "BTC"
-    long_macro_data = {'confirms': check_macro_confirmation('long', macro_context, is_altcoin=is_altcoin)}
-    short_macro_data = {'confirms': check_macro_confirmation('short', macro_context, is_altcoin=is_altcoin)}
+    
+    # ✅ НОВАЯ ЛОГИКА МАКРО
+    long_macro_score, long_macro_reason = evaluate_macro_score('long', macro_context, is_altcoin=is_altcoin)
+    short_macro_score, short_macro_reason = evaluate_macro_score('short', macro_context, is_altcoin=is_altcoin)
 
-    long_score = calculate_setup_score('long', current_price, trend_data, structure_data, sfp_data_in_window, is_bullish_fvg_tested_in_window, all_fvgs, volume_data, long_macro_data)
-    short_score = calculate_setup_score('short', current_price, trend_data, structure_data, sfp_data_in_window, is_bearish_fvg_tested_in_window, all_fvgs, volume_data, short_macro_data)
+    long_macro_data = {'score': long_macro_score, 'reason': long_macro_reason}
+    short_macro_data = {'score': short_macro_score, 'reason': short_macro_reason}
+    
+    # ✅ ВОТ ЭТИ ДВЕ СТРОКИ НУЖНО ВЕРНУТЬ (Вызов калькулятора баллов):
+    long_score = calculate_setup_score('long', current_price, trend_data, structure_data_in_window, sfp_data_in_window, is_bullish_fvg_tested_in_window, all_fvgs, None, long_macro_data)
+    short_score = calculate_setup_score('short', current_price, trend_data, structure_data_in_window, sfp_data_in_window, is_bearish_fvg_tested_in_window, all_fvgs, None, short_macro_data)
 
     if long_score['total_score'] >= short_score['total_score']:
         final_score_result = long_score
         direction = "LONG"
     else:
         final_score_result = short_score
-        direction = "SHORT"
+        direction = "SHORT"    
 
     analysis_data = {
         "trend_data": trend_data,
-        "structure_data": structure_data,
+        "structure_data": structure_data_in_window,
         "direction": direction,
         "last_closed_15m": last_closed_15m,
     }
@@ -160,7 +176,7 @@ def market_scan(report_mode="HUNT"):
                 continue
 
             total_score = score_result.get('total_score', 0)
-            is_high_score_setup = total_score >= 90
+            is_high_score_setup = total_score >= 85
             #is_high_score_setup = total_score >= 0
             decision = score_result.get('decision', 'Ignore') if in_kz else "Ignore"
 
@@ -203,9 +219,20 @@ def market_scan(report_mode="HUNT"):
             # if coin in ['BTC', 'ETH', 'SOL']:
             if coin in COINS_LIST:
                 breakdown = score_result.get('breakdown', {})
+                direction = analysis_data['direction']
                 
-                header = f"💎 <b>{coin}</b> | Score: <b>{total_score}/100</b> | {decision}"
-                trend_line = f"📊 Тренд: {breakdown.get('trend', '0')}"
+                # 1. Форматируем заголовок с направлением сетапа (15m)
+                setup_direction_text = direction
+                setup_emoji = "🟢" if direction == "LONG" else "🔴"
+                header = f"💎 <b>{coin}</b> | Сетап: <b>{setup_direction_text} {setup_emoji}</b> | Score: <b>{total_score}/100</b> | {decision}"
+
+                # 2. Форматируем строку тренда с направлением (4H)
+                trend_data = analysis_data.get('trend_data')
+                trend_4h_direction = "Н/Д"
+                if trend_data and 'is_bullish' in trend_data:
+                    trend_4h_direction = "ВВЕРХ ↗️" if trend_data['is_bullish'] else "ВНИЗ ↘️"
+                
+                trend_line = f"📊 Тренд (4H): {trend_4h_direction} | {breakdown.get('trend', '0')}"
                 structure_line = f"⚙️ Структура: {breakdown.get('structure', '0')}"
                 liquidity_line = f"💧 Ликвидность: {breakdown.get('liquidity', '0')}"
                 fvg_line = f"🎯 FVG: {breakdown.get('fvg', '0')}"

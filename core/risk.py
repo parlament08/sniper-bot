@@ -109,23 +109,34 @@ def calculate_setup_score(
         else:
             breakdown['fvg'] = '0 (Зона пробита после теста)'
 
-    # 5. Объем (+10 баллов) - Память SFP + Текущий импульс
+    # 5. Объем (+10 баллов) - Привязан к триггерным паттернам (SFP/BOS)
     breakdown['volume'] = '0 (Нет подтверждения аномальным объемом)'
     
-    # Сначала проверяем, был ли аномальный объем в момент сбора ликвидности (SFP)
-    if sfp_data_in_window and sfp_data_in_window.get('rvol', 0) > 1.5:
+    # Приоритет 1: Объем на свече SFP (сбор ликвидности)
+    is_sfp_aligned = sfp_data_in_window and (
+        (trade_direction == 'long' and 'bullish' in sfp_data_in_window.get('type', '')) or
+        (trade_direction == 'short' and 'bearish' in sfp_data_in_window.get('type', ''))
+    )
+    if is_sfp_aligned and sfp_data_in_window.get('rvol', 0) > 1.5:
         score += 10
-        breakdown['volume'] = '+10 (Подтверждение объемом на свече SFP: RVOL > 1.5)'
-        
-    # Если SFP без объема или его нет, проверяем текущую импульсную свечу
-    elif volume_data and volume_data.get('rvol', 0) > 1.5:
-        score += 10
-        breakdown['volume'] = '+10 (Подтверждение локальным объемом: RVOL > 1.5)'
+        breakdown['volume'] = '+10 (Подтверждение объемом на свече SFP)'
+    
+    # Приоритет 2: Объем на свече слома структуры (BOS/CHoCH)
+    else:
+        is_structure_aligned = structure_data and (
+            (trade_direction == 'long' and 'bullish' in structure_data.get('type', '')) or
+            (trade_direction == 'short' and 'bearish' in structure_data.get('type', ''))
+        )
+        if is_structure_aligned and structure_data.get('rvol', 0) > 1.5:
+            score += 10
+            breakdown['volume'] = '+10 (Подтверждение объемом на свече BOS/CHoCH)'
 
-    # 6. Макро-контекст (+10 баллов) - Заглушка
-    if macro_data and macro_data.get('confirms', False):
-        score += 10
-        breakdown['macro'] = '+10 (Макро-фон подтверждает)'
+    # 6. Макро-контекст (+10 / 0 баллов)
+    if macro_data:
+        m_score = macro_data.get('score', 0)
+        m_reason = macro_data.get('reason', 'Нет данных')
+        score += m_score
+        breakdown['macro'] = f"+{m_score} ({m_reason})" if m_score > 0 else f"0 ({m_reason})"
 
     # Определение итогового решения на основе суммы баллов
     decision = "Ignore"
