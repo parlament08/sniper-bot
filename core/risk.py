@@ -169,13 +169,13 @@ def calculate_setup_score(
         # Проверяем, что хотя бы одна релевантная зона не пробита
         for fvg in fvg_data:
             if trade_direction == 'long' and fvg.get('type') == 'bullish':
-                # Инвалидация: текущая цена НЕ должна быть ниже нижней границы FVG
-                if current_price >= fvg['bottom']:
+                # Зона валидна, если цена находится ВНУТРИ или КАСАЕТСЯ ее границ
+                if fvg['bottom'] <= current_price <= fvg['top']:
                     is_fvg_zone_valid = True
                     break
             elif trade_direction == 'short' and fvg.get('type') == 'bearish':
-                # Инвалидация: текущая цена НЕ должна быть выше верхней границы FVG
-                if current_price <= fvg['top']:
+                # Зона валидна, если цена находится ВНУТРИ или КАСАЕТСЯ ее границ
+                if fvg['bottom'] <= current_price <= fvg['top']:
                     is_fvg_zone_valid = True
                     break
         

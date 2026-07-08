@@ -129,10 +129,6 @@ def prepare_and_analyze(coin, macro_context):
             if structure_break:
                 trigger_break_15m = structure_break
         
-        # Если нашли оба самых свежих паттерна, выходим для оптимизации
-        if sfp_data_in_window and context_break_1h and trigger_break_15m:
-            break
-
     # Находим самый последний тест FVG в окне памяти
     all_fvgs = find_fvg(df_15m_closed, atr_series=df_15m_closed['atr'], min_size_atr_ratio=0.5)
     
