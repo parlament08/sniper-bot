@@ -54,7 +54,10 @@ def generate_coin_alert(coin):
     # 4. Поиск ближайших зон интереса (POI) относительно ЖИВОЙ ЦЕНЫ с жесткой изоляцией
     long_poi_zone, long_poi_reason = None, ""
     # ЖЕСТКОЕ ПРАВИЛО: Вся зона Long (даже ее верхняя граница) должна быть НИЖЕ текущей цены
-    bullish_fvgs_below = [f for f in all_fvgs if f['type'] == 'bullish' and f['top'] < current_live_price]
+    bullish_fvgs_below = [
+        f for f in all_fvgs
+        if f['type'] == 'bullish' and not f.get('invalidated', False) and f['top'] < current_live_price
+    ]
     
     # Приоритет: сначала ищем нетронутую макро-ликвидность (Unmitigated SSL)
     if not swing_lows.empty:
@@ -79,7 +82,10 @@ def generate_coin_alert(coin):
 
     short_poi_zone, short_poi_reason = None, ""
     # ЖЕСТКОЕ ПРАВИЛО: Вся зона Short (даже ее нижняя граница) должна быть ВЫШЕ текущей цены
-    bearish_fvgs_above = [f for f in all_fvgs if f['type'] == 'bearish' and f['bottom'] > current_live_price]
+    bearish_fvgs_above = [
+        f for f in all_fvgs
+        if f['type'] == 'bearish' and not f.get('invalidated', False) and f['bottom'] > current_live_price
+    ]
     
     # Приоритет: сначала ищем нетронутую макро-ликвидность (Unmitigated BSL)
     if not swing_highs.empty:

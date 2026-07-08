@@ -11,7 +11,16 @@ from core.logger import logger
 from services.market_data import fetch_candles
 #from services.macro_context import get_macro_context, check_macro_confirmation
 from services.macro_context import get_macro_context, evaluate_macro_score
-from core.structure import find_swings, find_fvg, detect_structure_break, detect_sfp
+from core.structure import (
+    BOSConfig,
+    MarketStructureConfig,
+    SFPConfig,
+    detect_sfp,
+    detect_structure_break,
+    evaluate_market_structure,
+    find_fvg,
+    find_swings,
+)
 from core.indicators import calculate_ema, calculate_atr, calculate_rvol, calculate_adx, evaluate_trend
 from core.risk import calculate_setup_score
 
@@ -101,23 +110,69 @@ def prepare_and_analyze(coin, macro_context):
     # 2. Ищем свинги на двух таймфреймах
     swing_highs_1h, swing_lows_1h = find_swings(df_1h_closed, left_bars=3, right_bars=2)
     swing_highs_15m, swing_lows_15m = find_swings(df_15m_closed, left_bars=5, right_bars=3)
+    market_structure = evaluate_market_structure(
+        df_15m_closed,
+        swing_highs_1h,
+        swing_lows_1h,
+        trend_data=trend_data,
+        config=MarketStructureConfig(),
+    )
+    if market_structure.trend == 'neutral':
+        return {
+            'total_score': 0,
+            'decision': 'Ignore',
+            'breakdown': {
+                'trend': f"0 (Neutral market: {market_structure.reason})",
+                'structure': '0 (Neutral market state)',
+                'liquidity': '0',
+                'fvg': '0',
+                'volume': '0',
+                'macro': '0',
+            },
+        }, {
+            'trend_data': trend_data,
+            'market_structure': market_structure,
+            'structure_data': None,
+            'direction': 'NEUTRAL',
+            'last_closed_15m': last_closed_15m,
+        }
+
+    bos_config = BOSConfig(hold_confirmation_bars=1)
+    sfp_config = SFPConfig(hold_confirmation_bars=1)
 
     # Итерируемся по окну С КОНЦА, чтобы найти ПОСЛЕДНИЕ (самые релевантные) события SFP и BOS
     for index, candle in window_15m.iloc[::-1].iterrows():
+        future_candles = window_15m[window_15m.index > index]
         # SFP ищем по старшим свингам (1H)
         swings_before_candle_h_1h = swing_highs_1h[swing_highs_1h.index < index]
         swings_before_candle_l_1h = swing_lows_1h[swing_lows_1h.index < index]
 
         # Ищем SFP (только если еще не нашли)
         if not sfp_data_in_window:
-            sfp = detect_sfp(candle, swings_before_candle_h_1h, swings_before_candle_l_1h, right_bars=2, timeframe_minutes=60)
+            sfp = detect_sfp(
+                candle,
+                swings_before_candle_h_1h,
+                swings_before_candle_l_1h,
+                right_bars=2,
+                timeframe_minutes=60,
+                config=sfp_config,
+                future_candles=future_candles,
+            )
             if sfp:
                 sfp['rvol'] = candle.get('rvol', 0)
                 sfp_data_in_window = sfp
 
         # Ищем 1H BOS/CHoCH (Контекст)
         if not context_break_1h:
-            structure_break = detect_structure_break(candle, swings_before_candle_h_1h, swings_before_candle_l_1h, right_bars=2, timeframe_minutes=60)
+            structure_break = detect_structure_break(
+                candle,
+                swings_before_candle_h_1h,
+                swings_before_candle_l_1h,
+                right_bars=2,
+                timeframe_minutes=60,
+                config=bos_config,
+                future_candles=future_candles,
+            )
             if structure_break:
                 context_break_1h = structure_break
 
@@ -125,7 +180,15 @@ def prepare_and_analyze(coin, macro_context):
         if not trigger_break_15m:
             swings_before_candle_h_15m = swing_highs_15m[swing_highs_15m.index < index]
             swings_before_candle_l_15m = swing_lows_15m[swing_lows_15m.index < index]
-            structure_break = detect_structure_break(candle, swings_before_candle_h_15m, swings_before_candle_l_15m, right_bars=3, timeframe_minutes=15)
+            structure_break = detect_structure_break(
+                candle,
+                swings_before_candle_h_15m,
+                swings_before_candle_l_15m,
+                right_bars=3,
+                timeframe_minutes=15,
+                config=bos_config,
+                future_candles=future_candles,
+            )
             if structure_break:
                 trigger_break_15m = structure_break
         
@@ -133,13 +196,13 @@ def prepare_and_analyze(coin, macro_context):
     all_fvgs = find_fvg(df_15m_closed, atr_series=df_15m_closed['atr'], min_size_atr_ratio=0.5)
     
     bullish_fvg_test_indices = []
-    for fvg in (f for f in all_fvgs if f['type'] == 'bullish'):
+    for fvg in (f for f in all_fvgs if f['type'] == 'bullish' and not f.get('invalidated', False)):
         test_candles = window_15m[(window_15m['low'] <= fvg['top']) & (window_15m['high'] >= fvg['bottom'])]
         if not test_candles.empty:
             bullish_fvg_test_indices.append(test_candles.index[-1])
     
     bearish_fvg_test_indices = []
-    for fvg in (f for f in all_fvgs if f['type'] == 'bearish'):
+    for fvg in (f for f in all_fvgs if f['type'] == 'bearish' and not f.get('invalidated', False)):
         test_candles = window_15m[(window_15m['low'] <= fvg['top']) & (window_15m['high'] >= fvg['bottom'])]
         if not test_candles.empty:
             bearish_fvg_test_indices.append(test_candles.index[-1])
@@ -254,13 +317,17 @@ def market_scan(report_mode="HUNT"):
                 
                 # 1. Форматируем заголовок с направлением сетапа (15m)
                 setup_direction_text = direction
-                setup_emoji = "🟢" if direction == "LONG" else "🔴"
+                setup_emoji = "🟢" if direction == "LONG" else "🔴" if direction == "SHORT" else "⚪"
                 header = f"💎 <b>{coin}</b> | Сетап: <b>{setup_direction_text} {setup_emoji}</b> | Score: <b>{total_score}/100</b> | {decision}"
 
                 # 2. Форматируем строку тренда с направлением (4H)
                 trend_data = analysis_data.get('trend_data')
+                market_structure = analysis_data.get('market_structure')
                 trend_4h_direction = "Н/Д"
-                if trend_data and 'is_bullish' in trend_data:
+                is_neutral_market = market_structure is not None and market_structure.get('trend') == 'neutral'
+                if is_neutral_market:
+                    trend_4h_direction = "NEUTRAL"
+                elif trend_data and 'is_bullish' in trend_data:
                     trend_4h_direction = "ВВЕРХ ↗️" if trend_data['is_bullish'] else "ВНИЗ ↘️"
                 
                 trend_line = f"📊 Тренд (4H): {trend_4h_direction} | {breakdown.get('trend', '0')}"

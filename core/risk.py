@@ -1,6 +1,97 @@
 from typing import Dict, List, Optional
 import pandas as pd
 
+
+def _structure_label(structure_data: Optional[Dict]) -> str:
+    if not structure_data:
+        return ''
+
+    struct_type = 'CHoCH' if 'choch' in structure_data.get('type', '') else 'BOS'
+    quality_score = structure_data.get('quality_score')
+
+    if quality_score is None:
+        return struct_type
+
+    displacement_ratio = structure_data.get('displacement_ratio')
+    body_ratio = structure_data.get('body_ratio')
+    confidence = structure_data.get('confidence')
+    metrics = [f"{struct_type} Q{quality_score}"]
+
+    if displacement_ratio is not None:
+        metrics.append(f"DR{float(displacement_ratio):.2f}")
+    if body_ratio is not None:
+        metrics.append(f"BR{float(body_ratio):.2f}")
+    if confidence is not None:
+        metrics.append(f"C{int(confidence)}")
+
+    return " ".join(metrics)
+
+
+def _sfp_label(sfp_data: Optional[Dict]) -> str:
+    if not sfp_data:
+        return 'SFP'
+
+    quality_score = sfp_data.get('quality_score')
+    if quality_score is None:
+        return 'SFP'
+
+    liquidity_depth = sfp_data.get('liquidity_depth')
+    rejection_strength = sfp_data.get('rejection_strength')
+    metrics = [f"SFP Q{quality_score}"]
+
+    if liquidity_depth is not None:
+        metrics.append(f"D{float(liquidity_depth):.2f}")
+    if rejection_strength is not None:
+        metrics.append(f"R{int(rejection_strength)}")
+
+    return " ".join(metrics)
+
+
+def _sfp_quality_tier(sfp_data: Optional[Dict]) -> str:
+    if not sfp_data:
+        return 'none'
+
+    quality_score = sfp_data.get('quality_score')
+    liquidity_depth = sfp_data.get('liquidity_depth')
+    rejection_strength = sfp_data.get('rejection_strength')
+
+    if quality_score is None or liquidity_depth is None or rejection_strength is None:
+        return 'legacy_strong' if sfp_data.get('rvol', 0) > 1.5 else 'legacy'
+
+    quality_score = int(quality_score)
+    liquidity_depth = float(liquidity_depth)
+    rejection_strength = int(rejection_strength)
+
+    if liquidity_depth < 0.15 or rejection_strength < 60:
+        return 'weak'
+    if quality_score >= 80 and rejection_strength >= 75:
+        return 'strong'
+    if quality_score >= 70:
+        return 'medium'
+    return 'weak'
+
+
+def _sfp_liquidity_score(sfp_data: Optional[Dict]) -> int:
+    tier = _sfp_quality_tier(sfp_data)
+    if tier in ('strong', 'legacy_strong'):
+        return 20
+    if tier == 'medium':
+        return 10
+    if tier == 'weak':
+        return 5
+    return 0
+
+
+def _structure_volume_score(structure_data: Optional[Dict], confirmation_reason: Optional[str] = None) -> int:
+    if not structure_data or structure_data.get('rvol', 0) <= 1.5:
+        return 0
+
+    if confirmation_reason:
+        return 10
+
+    return 5 if structure_data.get('quality_score', 0) >= 90 else 0
+
+
 def calculate_setup_score(
     trade_direction: str,
     current_price: float,
@@ -68,20 +159,20 @@ def calculate_setup_score(
 
     # Определяем наличие и тип структурных событий на обоих ТФ
     is_context_aligned = False
-    context_struct_type = ''
+    context_struct_label = ''
     if context_structure_data:
         if (trade_direction == 'long' and 'bullish' in context_structure_data.get('type', '')) or \
            (trade_direction == 'short' and 'bearish' in context_structure_data.get('type', '')):
             is_context_aligned = True
-            context_struct_type = 'CHoCH' if 'choch' in context_structure_data.get('type', '') else 'BOS'
+            context_struct_label = _structure_label(context_structure_data)
 
     is_trigger_aligned = False
-    trigger_struct_type = ''
+    trigger_struct_label = ''
     if trigger_structure_data:
         if (trade_direction == 'long' and 'bullish' in trigger_structure_data.get('type', '')) or \
            (trade_direction == 'short' and 'bearish' in trigger_structure_data.get('type', '')):
             is_trigger_aligned = True
-            trigger_struct_type = 'CHoCH' if 'choch' in trigger_structure_data.get('type', '') else 'BOS'
+            trigger_struct_label = _structure_label(trigger_structure_data)
             
             # --- Логика поиска подтверждения для триггера ---
             if fvg_test_data:
@@ -133,19 +224,19 @@ def calculate_setup_score(
         if is_context_aligned:
             # A++: Двойное подтверждение
             score_structure = 30
-            structure_desc = f"+30 (1H {context_struct_type} & 15m {trigger_struct_type} ({confirmation_reason}))"
+            structure_desc = f"+30 (1H {context_struct_label} & 15m {trigger_struct_label}, {confirmation_reason})"
         else:
             # A+: Только подтвержденный 15m триггер
             score_structure = 20
-            structure_desc = f"+20 (15m {trigger_struct_type} ({confirmation_reason}))"
+            structure_desc = f"+20 (15m {trigger_struct_label}, {confirmation_reason})"
     elif is_context_aligned:
         # 2. Средний приоритет: есть только 1H контекст
         score_structure = 10
-        structure_desc = f"+10 (1H {context_struct_type} only)"
+        structure_desc = f"+10 (1H {context_struct_label} only)"
     elif is_trigger_aligned: # and not confirmation_reason
         # 3. Низкий приоритет: есть неподтвержденный 15m триггер
         score_structure = 5
-        structure_desc = f"+5 (15m {trigger_struct_type} - No Confirmation)"
+        structure_desc = f"+5 (15m {trigger_struct_label}, без POI/SFP confirmation)"
 
     score += score_structure
     breakdown['structure'] = structure_desc
@@ -159,29 +250,40 @@ def calculate_setup_score(
                          (trade_direction == 'short' and 'bearish' in sfp_data_in_window.get('type', ''))
         
         if is_sfp_aligned:
-            score += 20
-            breakdown['liquidity'] = '+20 (SFP на 1H свинге)'
+            sfp_score = _sfp_liquidity_score(sfp_data_in_window)
+            if sfp_score > 0:
+                score += sfp_score
+                breakdown['liquidity'] = f"+{sfp_score} ({_sfp_label(sfp_data_in_window)} на 1H свинге)"
+            else:
+                breakdown['liquidity'] = f"0 ({_sfp_label(sfp_data_in_window)} слабый захват)"
 
     # 4. FVG (+15 баллов) - Память + Инвалидация пробоем
     breakdown['fvg'] = '0 (Зона не тестировалась)'
     if fvg_test_data:
         is_fvg_zone_valid = False
+        active_fvg_quality = None
         # Проверяем, что хотя бы одна релевантная зона не пробита
         for fvg in fvg_data:
+            if fvg.get('invalidated', False):
+                continue
+
             if trade_direction == 'long' and fvg.get('type') == 'bullish':
                 # Зона валидна, если цена находится ВНУТРИ или КАСАЕТСЯ ее границ
                 if fvg['bottom'] <= current_price <= fvg['top']:
                     is_fvg_zone_valid = True
+                    active_fvg_quality = fvg.get('quality_score')
                     break
             elif trade_direction == 'short' and fvg.get('type') == 'bearish':
                 # Зона валидна, если цена находится ВНУТРИ или КАСАЕТСЯ ее границ
                 if fvg['bottom'] <= current_price <= fvg['top']:
                     is_fvg_zone_valid = True
+                    active_fvg_quality = fvg.get('quality_score')
                     break
         
         if is_fvg_zone_valid:
             score += 15
-            breakdown['fvg'] = '+15 (Тест FVG в окне 5 часов, зона удержана)'
+            quality_text = f" Q{active_fvg_quality}" if active_fvg_quality is not None else ""
+            breakdown['fvg'] = f"+15 (Тест FVG{quality_text} в окне 5 часов, зона удержана)"
         else:
             breakdown['fvg'] = '0 (Зона пробита после теста)'
 
@@ -193,9 +295,15 @@ def calculate_setup_score(
         (trade_direction == 'long' and 'bullish' in sfp_data_in_window.get('type', '')) or
         (trade_direction == 'short' and 'bearish' in sfp_data_in_window.get('type', ''))
     )
-    if is_sfp_aligned and sfp_data_in_window.get('rvol', 0) > 1.5:
+    if (
+        is_sfp_aligned
+        and _sfp_quality_tier(sfp_data_in_window) in ('strong', 'legacy_strong')
+        and sfp_data_in_window.get('volume_confirmed', sfp_data_in_window.get('rvol', 0) > 1.5)
+    ):
         score += 10
-        breakdown['volume'] = '+10 (Подтверждение объемом на свече SFP)'
+        breakdown['volume'] = '+10 (Подтверждение объемом на сильном SFP)'
+    elif is_sfp_aligned and sfp_data_in_window.get('volume_confirmed', sfp_data_in_window.get('rvol', 0) > 1.5):
+        breakdown['volume'] = '0 (Объем есть, но SFP не strong-tier)'
     
     # Приоритет 2: Объем на свече слома структуры (BOS/CHoCH)
     # Сначала проверяем более важный 15m триггер
@@ -203,18 +311,43 @@ def calculate_setup_score(
         (trade_direction == 'long' and 'bullish' in trigger_structure_data.get('type', '')) or
         (trade_direction == 'short' and 'bearish' in trigger_structure_data.get('type', ''))
     )
-    if is_trigger_aligned and trigger_structure_data.get('rvol', 0) > 1.5:
-        score += 10
-        breakdown['volume'] = '+10 (Подтверждение объемом на 15m триггере)'
+    is_context_aligned = context_structure_data and (
+        (trade_direction == 'long' and 'bullish' in context_structure_data.get('type', '')) or
+        (trade_direction == 'short' and 'bearish' in context_structure_data.get('type', ''))
+    )
+    should_prioritize_context_volume = bool(is_context_aligned and not confirmation_reason)
+
+    context_volume_score = _structure_volume_score(context_structure_data)
+    trigger_volume_score = _structure_volume_score(trigger_structure_data, confirmation_reason) if is_trigger_aligned else 0
+
+    if not is_sfp_aligned and should_prioritize_context_volume and context_volume_score > 0:
+        score += context_volume_score
+        breakdown['volume'] = f"+{context_volume_score} (Объем на 1H сломе с Q>=90)"
+    elif (
+        not is_sfp_aligned
+        and should_prioritize_context_volume
+        and context_structure_data.get('rvol', 0) > 1.5
+    ):
+        breakdown['volume'] = '0 (Объем есть, но 1H структура Q<90)'
+    elif not is_sfp_aligned and is_trigger_aligned and trigger_volume_score > 0:
+        score += trigger_volume_score
+        if trigger_volume_score == 10:
+            breakdown['volume'] = '+10 (Объем на 15m триггере с POI/SFP confirmation)'
+        else:
+            breakdown['volume'] = '+5 (Объем на экстремальном 15m BOS без POI/SFP)'
+    elif (
+        not is_sfp_aligned
+        and is_trigger_aligned
+        and trigger_structure_data.get('rvol', 0) > 1.5
+    ):
+        breakdown['volume'] = '0 (Объем есть, но 15m структура без POI/SFP и Q<90)'
     # Если на 15м нет, проверяем 1H контекст
-    else:
-        is_context_aligned = context_structure_data and (
-            (trade_direction == 'long' and 'bullish' in context_structure_data.get('type', '')) or
-            (trade_direction == 'short' and 'bearish' in context_structure_data.get('type', ''))
-        )
-        if is_context_aligned and context_structure_data.get('rvol', 0) > 1.5:
-            score += 10
-            breakdown['volume'] = '+10 (Подтверждение объемом на 1H сломе)'
+    elif not is_sfp_aligned:
+        if is_context_aligned and context_volume_score > 0:
+            score += context_volume_score
+            breakdown['volume'] = f"+{context_volume_score} (Объем на 1H сломе с Q>=90)"
+        elif is_context_aligned and context_structure_data.get('rvol', 0) > 1.5:
+            breakdown['volume'] = '0 (Объем есть, но 1H структура Q<90)'
 
     # 6. Макро-контекст (+10 баллов)
     if macro_data:
