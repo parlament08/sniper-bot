@@ -88,7 +88,8 @@ def prepare_and_analyze(coin, macro_context):
     is_bullish_fvg_tested_in_window = False
     is_bearish_fvg_tested_in_window = False
 
-    swing_highs_full, swing_lows_full = find_swings(df_15m_closed, left_bars=2, right_bars=2)
+    swing_config = {'left_bars': 2, 'right_bars': 2}
+    swing_highs_full, swing_lows_full = find_swings(df_15m_closed, **swing_config)
 
     # Итерируемся по окну С КОНЦА, чтобы найти ПОСЛЕДНИЕ (самые релевантные) события SFP и BOS
     for index, candle in window_15m.iloc[::-1].iterrows():
@@ -97,14 +98,14 @@ def prepare_and_analyze(coin, macro_context):
 
         # Ищем SFP (только если еще не нашли)
         if not sfp_data_in_window:
-            sfp = detect_sfp(candle, swings_before_candle_h, swings_before_candle_l)
+            sfp = detect_sfp(candle, swings_before_candle_h, swings_before_candle_l, right_bars=swing_config['right_bars'])
             if sfp:
                 sfp['rvol'] = candle.get('rvol', 0)
                 sfp_data_in_window = sfp
 
         # Ищем BOS/CHoCH (только если еще не нашли)
         if not structure_data_in_window:
-            structure_break = detect_structure_break(candle, swings_before_candle_h, swings_before_candle_l)
+            structure_break = detect_structure_break(candle, swings_before_candle_h, swings_before_candle_l, right_bars=swing_config['right_bars'])
             if structure_break:
                 # 'rvol' уже добавляется в detect_structure_break
                 structure_data_in_window = structure_break

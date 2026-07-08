@@ -59,22 +59,27 @@ def calculate_setup_score(
             score += 0
             breakdown['trend'] = '0 (Контртренд - торговля против 4H EMA99)'
 
-    # 2. Структура (+20 баллов)
+    # 2. Структура (+20 баллов CHoCH / +15 баллов BOS)
     if structure_data:
-        is_structure_aligned = (trade_direction == 'long' and 'bullish' in structure_data.get('type', '')) or \
-                               (trade_direction == 'short' and 'bearish' in structure_data.get('type', ''))
+        struct_type = structure_data.get('type', '')
         
-        if is_structure_aligned:
-            # Упрощенная логика: слом против тренда = CHoCH, слом по тренду = BOS.
-            is_with_trend = (trade_direction == 'long' and trend_data.get('is_bullish', False)) or \
-                            (trade_direction == 'short' and not trend_data.get('is_bullish', True))
-            
-            if not is_with_trend:  # Слом против глобального тренда
+        # Для Лонга нам нужен только Бычий слом
+        if trade_direction == 'long' and 'bullish' in struct_type:
+            if 'choch' in struct_type:
                 score += 20
                 breakdown['structure'] = '+20 (CHoCH - смена характера)'
-            else:  # Слом по тренду
+            elif 'bos' in struct_type:
                 score += 15
                 breakdown['structure'] = '+15 (BOS - продолжение тренда)'
+                
+        # Для Шорта нам нужен только Медвежий слом
+        elif trade_direction == 'short' and 'bearish' in struct_type:
+            if 'choch' in struct_type:
+                score += 20
+                breakdown['structure'] = '+20 (CHoCH - смена характера)'
+            elif 'bos' in struct_type:
+                score += 15
+                breakdown['structure'] = '+15 (BOS - продолжение структуры)'
 
     # 3. Ликвидность (+20 баллов)
     if sfp_data_in_window:

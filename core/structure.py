@@ -126,61 +126,87 @@ def find_fvg(
         
     return fvgs
 
-def detect_structure_break(last_closed_candle: pd.Series, swing_highs: pd.DataFrame, swing_lows: pd.DataFrame) -> Optional[Dict]:
+def detect_structure_break(last_closed_candle: pd.Series, swing_highs: pd.DataFrame, swing_lows: pd.DataFrame, right_bars: int = 2) -> Optional[Dict]:
     """
     Определяет слом структуры (BOS/CHoCH) на последней закрытой свече.
-    Проверяет, закрылось ли тело последней свечи за последним свингом.
-
-    Args:
-        last_closed_candle (pd.Series): Строка DataFrame, соответствующая последней закрытой свече.
-        swing_highs (pd.DataFrame): DataFrame с найденными Swing Highs.
-        swing_lows (pd.DataFrame): DataFrame с найденными Swing Lows.
-
-    Returns:
-        Optional[Dict]: Словарь с информацией о сломе или None.
+    Включает универсальную защиту от Lookahead Bias.
     """
-    if swing_highs.empty or swing_lows.empty: return None
+    current_idx = last_closed_candle.name
+    
+    # 1. ЗАЩИТА ОТ LOOKAHEAD BIAS (Универсальная)
+    if isinstance(current_idx, (int, float)):
+        if current_idx > 1e11: 
+            offset = right_bars * 15 * 60 * 1000 # Unix Timestamp (миллисекунды)
+        elif current_idx > 1e8: 
+            offset = right_bars * 15 * 60        # Unix Timestamp (секунды)
+        else: 
+            offset = right_bars                  # Порядковый номер строки (RangeIndex)
+    else:
+        offset = pd.Timedelta(minutes=15 * right_bars) # DatetimeIndex
+        
+    valid_highs = swing_highs[swing_highs.index < (current_idx - offset)]
+    valid_lows = swing_lows[swing_lows.index < (current_idx - offset)]
 
-    relevant_highs = swing_highs[swing_highs.index < last_closed_candle.name]
-    relevant_lows = swing_lows[swing_lows.index < last_closed_candle.name]
+    if len(valid_highs) < 2 or len(valid_lows) < 2:
+        return None
 
-    if relevant_highs.empty or relevant_lows.empty: return None
+    last_h1, last_h2 = valid_highs.iloc[-1], valid_highs.iloc[-2]
+    last_l1, last_l2 = valid_lows.iloc[-1], valid_lows.iloc[-2]
 
-    last_swing_high = relevant_highs.iloc[-1]
-    last_swing_low = relevant_lows.iloc[-1]
-
-    level_high = float(last_swing_high['high'])
-    level_low = float(last_swing_low['low'])
+    level_high = float(last_h1['high'])
+    level_low = float(last_l1['low'])
     close_price = float(last_closed_candle['close'])
     rvol = last_closed_candle.get('rvol', 0)
 
+    # 2. ОПРЕДЕЛЕНИЕ ТЕКУЩЕГО ХАРАКТЕРА СТРУКТУРЫ
+    is_making_higher_highs = last_h1['high'] > last_h2['high']
+    is_making_higher_lows = last_l1['low'] > last_l2['low']
+    is_making_lower_highs = last_h1['high'] < last_h2['high']
+    is_making_lower_lows = last_l1['low'] < last_l2['low']
+
+    is_bullish_struct = is_making_higher_highs or (is_making_higher_lows and not is_making_lower_highs)
+    is_bearish_struct = is_making_lower_lows or (is_making_lower_highs and not is_making_higher_lows)
+
+    if not is_bullish_struct and not is_bearish_struct:
+        is_bullish_struct = last_h1.name > last_l1.name
+
+    # 3. КЛАССИФИКАЦИЯ ПРОБОЯ
     if close_price > level_high:
-        return {'type': 'bullish_break', 'level': level_high, 'rvol': rvol}
+        struct_type = 'bullish_choch' if is_bearish_struct else 'bullish_bos'
+        return {'type': struct_type, 'level': level_high, 'rvol': rvol}
 
     if close_price < level_low:
-        return {'type': 'bearish_break', 'level': level_low, 'rvol': rvol}
+        struct_type = 'bearish_choch' if is_bullish_struct else 'bearish_bos'
+        return {'type': struct_type, 'level': level_low, 'rvol': rvol}
         
     return None
 
-def detect_sfp(last_closed_candle: pd.Series, swing_highs: pd.DataFrame, swing_lows: pd.DataFrame) -> Optional[Dict]:
+def detect_sfp(last_closed_candle: pd.Series, swing_highs: pd.DataFrame, swing_lows: pd.DataFrame, right_bars: int = 2) -> Optional[Dict]:
     """
     Определяет паттерн "Захват ликвидности" (SFP) на последней закрытой свече.
-    Проверяет, пробила ли цена уровень свинга тенью, но закрылась обратно.
-
-    Args:
-        last_closed_candle (pd.Series): Строка DataFrame, соответствующая последней закрытой свече.
-        swing_highs (pd.DataFrame): DataFrame с найденными Swing Highs.
-        swing_lows (pd.DataFrame): DataFrame с найденными Swing Lows.
-
-    Returns:
-        Optional[Dict]: Словарь с информацией о SFP или None.
+    Включает универсальную защиту от Lookahead Bias.
     """
-    if swing_highs.empty or swing_lows.empty: return None
+    if swing_highs.empty or swing_lows.empty: 
+        return None
 
-    relevant_highs = swing_highs[swing_highs.index < last_closed_candle.name]
-    relevant_lows = swing_lows[swing_lows.index < last_closed_candle.name]
+    current_idx = last_closed_candle.name
+    
+    # ЗАЩИТА ОТ LOOKAHEAD BIAS (Универсальная)
+    if isinstance(current_idx, (int, float)):
+        if current_idx > 1e11: 
+            offset = right_bars * 15 * 60 * 1000 # Unix Timestamp (миллисекунды)
+        elif current_idx > 1e8: 
+            offset = right_bars * 15 * 60        # Unix Timestamp (секунды)
+        else: 
+            offset = right_bars                  # Порядковый номер строки (RangeIndex)
+    else:
+        offset = pd.Timedelta(minutes=15 * right_bars) # DatetimeIndex
+        
+    relevant_highs = swing_highs[swing_highs.index < (current_idx - offset)]
+    relevant_lows = swing_lows[swing_lows.index < (current_idx - offset)]
 
-    if relevant_highs.empty or relevant_lows.empty: return None
+    if relevant_highs.empty or relevant_lows.empty: 
+        return None
 
     last_swing_high = relevant_highs.iloc[-1]
     last_swing_low = relevant_lows.iloc[-1]
