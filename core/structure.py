@@ -126,23 +126,24 @@ def find_fvg(
         
     return fvgs
 
-def detect_structure_break(last_closed_candle: pd.Series, swing_highs: pd.DataFrame, swing_lows: pd.DataFrame, right_bars: int = 2) -> Optional[Dict]:
+def detect_structure_break(last_closed_candle: pd.Series, swing_highs: pd.DataFrame, swing_lows: pd.DataFrame, right_bars: int = 2, timeframe_minutes: int = 15) -> Optional[Dict]:
     """
     Определяет слом структуры (BOS/CHoCH) на последней закрытой свече.
-    Включает универсальную защиту от Lookahead Bias.
+    Включает универсальную защиту от Lookahead Bias. Поддерживает MTF-анализ.
     """
     current_idx = last_closed_candle.name
     
-    # 1. ЗАЩИТА ОТ LOOKAHEAD BIAS (Универсальная)
+    # ЗАЩИТА ОТ LOOKAHEAD BIAS (MTF-совместимая)
     if isinstance(current_idx, (int, float)):
+        offset_minutes = right_bars * timeframe_minutes
         if current_idx > 1e11: 
-            offset = right_bars * 15 * 60 * 1000 # Unix Timestamp (миллисекунды)
+            offset = offset_minutes * 60 * 1000 # Миллисекунды
         elif current_idx > 1e8: 
-            offset = right_bars * 15 * 60        # Unix Timestamp (секунды)
+            offset = offset_minutes * 60        # Секунды
         else: 
-            offset = right_bars                  # Порядковый номер строки (RangeIndex)
+            offset = right_bars                 # Индексы
     else:
-        offset = pd.Timedelta(minutes=15 * right_bars) # DatetimeIndex
+        offset = pd.Timedelta(minutes=timeframe_minutes * right_bars)
         
     valid_highs = swing_highs[swing_highs.index < (current_idx - offset)]
     valid_lows = swing_lows[swing_lows.index < (current_idx - offset)]
@@ -173,34 +174,35 @@ def detect_structure_break(last_closed_candle: pd.Series, swing_highs: pd.DataFr
     # 3. КЛАССИФИКАЦИЯ ПРОБОЯ
     if close_price > level_high:
         struct_type = 'bullish_choch' if is_bearish_struct else 'bullish_bos'
-        return {'type': struct_type, 'level': level_high, 'rvol': rvol}
+        return {'type': struct_type, 'level': level_high, 'rvol': rvol, 'index': current_idx}
 
     if close_price < level_low:
         struct_type = 'bearish_choch' if is_bullish_struct else 'bearish_bos'
-        return {'type': struct_type, 'level': level_low, 'rvol': rvol}
+        return {'type': struct_type, 'level': level_low, 'rvol': rvol, 'index': current_idx}
         
     return None
 
-def detect_sfp(last_closed_candle: pd.Series, swing_highs: pd.DataFrame, swing_lows: pd.DataFrame, right_bars: int = 2) -> Optional[Dict]:
+def detect_sfp(last_closed_candle: pd.Series, swing_highs: pd.DataFrame, swing_lows: pd.DataFrame, right_bars: int = 2, timeframe_minutes: int = 15) -> Optional[Dict]:
     """
     Определяет паттерн "Захват ликвидности" (SFP) на последней закрытой свече.
-    Включает универсальную защиту от Lookahead Bias.
+    Включает универсальную защиту от Lookahead Bias. Поддерживает MTF-анализ.
     """
     if swing_highs.empty or swing_lows.empty: 
         return None
 
     current_idx = last_closed_candle.name
     
-    # ЗАЩИТА ОТ LOOKAHEAD BIAS (Универсальная)
+    # ЗАЩИТА ОТ LOOKAHEAD BIAS (MTF-совместимая)
     if isinstance(current_idx, (int, float)):
+        offset_minutes = right_bars * timeframe_minutes
         if current_idx > 1e11: 
-            offset = right_bars * 15 * 60 * 1000 # Unix Timestamp (миллисекунды)
+            offset = offset_minutes * 60 * 1000
         elif current_idx > 1e8: 
-            offset = right_bars * 15 * 60        # Unix Timestamp (секунды)
+            offset = offset_minutes * 60
         else: 
-            offset = right_bars                  # Порядковый номер строки (RangeIndex)
+            offset = right_bars
     else:
-        offset = pd.Timedelta(minutes=15 * right_bars) # DatetimeIndex
+        offset = pd.Timedelta(minutes=timeframe_minutes * right_bars)
         
     relevant_highs = swing_highs[swing_highs.index < (current_idx - offset)]
     relevant_lows = swing_lows[swing_lows.index < (current_idx - offset)]
@@ -218,9 +220,9 @@ def detect_sfp(last_closed_candle: pd.Series, swing_highs: pd.DataFrame, swing_l
     candle_close = float(last_closed_candle['close'])
 
     if candle_high > level_high and candle_close < level_high:
-        return {'type': 'bearish_sfp', 'level': level_high}
+        return {'type': 'bearish_sfp', 'level': level_high, 'index': current_idx}
 
     if candle_low < level_low and candle_close > level_low:
-        return {'type': 'bullish_sfp', 'level': level_low}
+        return {'type': 'bullish_sfp', 'level': level_low, 'index': current_idx}
         
     return None

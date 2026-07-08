@@ -1,29 +1,31 @@
 from typing import Dict, List, Optional
+import pandas as pd
 
 def calculate_setup_score(
     trade_direction: str,
     current_price: float,
     trend_data: Optional[Dict],
-    structure_data: Optional[Dict],
+    context_structure_data: Optional[Dict], # 1H Structure
+    trigger_structure_data: Optional[Dict], # 15m Structure
     sfp_data_in_window: Optional[Dict],
-    fvg_tested_in_window: bool,
+    fvg_test_data: Optional[Dict],
     fvg_data: List[Dict],
-    volume_data: Optional[Dict],
     macro_data: Optional[Dict]
 ) -> Dict:
     """
     Рассчитывает скоринговую оценку для торгового сетапа на основе набора технических факторов.
     Использует концепцию "Окна памяти" (Lookback Window) для SFP и FVG.
+    Реализует логику "Double Confirmation" (1H Context + 15m Trigger).
 
     Args:
         trade_direction (str): Направление сделки ('long' или 'short').
         current_price (float): Текущая цена закрытия для проверки инвалидации.
         trend_data (Optional[Dict]): Данные о тренде из `evaluate_trend`.
-        structure_data (Optional[Dict]): Данные о сломе структуры (BOS/CHoCH) на ПОСЛЕДНЕЙ свече.
+        context_structure_data (Optional[Dict]): Данные о сломе 1H структуры (Контекст).
+        trigger_structure_data (Optional[Dict]): Данные о сломе 15m структуры (Триггер).
         sfp_data_in_window (Optional[Dict]): Данные о захвате ликвидности (SFP) в ОКНЕ ПАМЯТИ.
-        fvg_tested_in_window (bool): Флаг, был ли протестирован релевантный FVG в ОКНЕ ПАМЯТИ.
+        fvg_test_data (Optional[Dict]): Данные о последнем тесте FVG (включая индекс).
         fvg_data (List[Dict]): Список всех FVG для проверки на инвалидацию.
-        volume_data (Optional[Dict]): Данные об объеме на ПОСЛЕДНЕЙ свече.
         macro_data (Optional[Dict]): Данные о макро-контексте.
 
     Returns:
@@ -59,41 +61,110 @@ def calculate_setup_score(
             score += 0
             breakdown['trend'] = '0 (Контртренд - торговля против 4H EMA99)'
 
-    # 2. Структура (+20 баллов CHoCH / +15 баллов BOS)
-    if structure_data:
-        struct_type = structure_data.get('type', '')
-        
-        # Для Лонга нам нужен только Бычий слом
-        if trade_direction == 'long' and 'bullish' in struct_type:
-            if 'choch' in struct_type:
-                score += 20
-                breakdown['structure'] = '+20 (CHoCH - смена характера)'
-            elif 'bos' in struct_type:
-                score += 15
-                breakdown['structure'] = '+15 (BOS - продолжение тренда)'
+    # 2. Структура (Double Confirmation: 1H Context + 15m Trigger) - Иерархическая оценка
+    score_structure = 0
+    structure_desc = '0 (Нет валидной структуры)'
+    confirmation_reason = None # Будет использоваться для проверки в секции ликвидности
+
+    # Определяем наличие и тип структурных событий на обоих ТФ
+    is_context_aligned = False
+    context_struct_type = ''
+    if context_structure_data:
+        if (trade_direction == 'long' and 'bullish' in context_structure_data.get('type', '')) or \
+           (trade_direction == 'short' and 'bearish' in context_structure_data.get('type', '')):
+            is_context_aligned = True
+            context_struct_type = 'CHoCH' if 'choch' in context_structure_data.get('type', '') else 'BOS'
+
+    is_trigger_aligned = False
+    trigger_struct_type = ''
+    if trigger_structure_data:
+        if (trade_direction == 'long' and 'bullish' in trigger_structure_data.get('type', '')) or \
+           (trade_direction == 'short' and 'bearish' in trigger_structure_data.get('type', '')):
+            is_trigger_aligned = True
+            trigger_struct_type = 'CHoCH' if 'choch' in trigger_structure_data.get('type', '') else 'BOS'
+            
+            # --- Логика поиска подтверждения для триггера ---
+            if fvg_test_data:
+                trigger_time = trigger_structure_data['index']
+                fvg_test_time = fvg_test_data['index']
                 
-        # Для Шорта нам нужен только Медвежий слом
-        elif trade_direction == 'short' and 'bearish' in struct_type:
-            if 'choch' in struct_type:
-                score += 20
-                breakdown['structure'] = '+20 (CHoCH - смена характера)'
-            elif 'bos' in struct_type:
-                score += 15
-                breakdown['structure'] = '+15 (BOS - продолжение структуры)'
+                # Триггер (CHoCH) должен произойти ПОСЛЕ теста FVG и в пределах небольшого окна
+                if trigger_time > fvg_test_time:
+                    time_delta = trigger_time - fvg_test_time
+                    is_within_window = False
+                    if isinstance(trigger_time, (int, float)):
+                        if trigger_time > 1e11: # ms
+                            if time_delta <= 5 * 15 * 60 * 1000: is_within_window = True
+                        elif trigger_time > 1e8: # s
+                            if time_delta <= 5 * 15 * 60: is_within_window = True
+                        else: # RangeIndex
+                            if time_delta <= 5: is_within_window = True
+                    else: # DatetimeIndex
+                        if time_delta <= pd.Timedelta(minutes=75): # 5 * 15
+                            is_within_window = True
+                    
+                    if is_within_window:
+                        confirmation_reason = "in POI"
+            
+            if not confirmation_reason and sfp_data_in_window:
+                is_sfp_aligned_for_trigger = (trade_direction == 'long' and 'bullish' in sfp_data_in_window.get('type', '')) or \
+                                             (trade_direction == 'short' and 'bearish' in sfp_data_in_window.get('type', ''))
+                if is_sfp_aligned_for_trigger:
+                    trigger_time = trigger_structure_data['index']
+                    sfp_time = sfp_data_in_window['index']
+                    if trigger_time > sfp_time:
+                        time_delta = trigger_time - sfp_time
+                        is_within_window = False
+                        if isinstance(trigger_time, (int, float)):
+                            if trigger_time > 1e11: # ms
+                                if time_delta <= 5 * 15 * 60 * 1000: is_within_window = True
+                            elif trigger_time > 1e8: # s
+                                if time_delta <= 5 * 15 * 60: is_within_window = True
+                            else: # RangeIndex
+                                if time_delta <= 5: is_within_window = True
+                        else: # DatetimeIndex
+                            if time_delta <= pd.Timedelta(minutes=75): is_within_window = True
+                        if is_within_window:
+                            confirmation_reason = "after SFP"
+
+    # Иерархическая логика начисления баллов
+    if is_trigger_aligned and confirmation_reason:
+        # 1. Высший приоритет: есть подтвержденный 15m триггер
+        if is_context_aligned:
+            # A++: Двойное подтверждение
+            score_structure = 30
+            structure_desc = f"+30 (1H {context_struct_type} & 15m {trigger_struct_type} ({confirmation_reason}))"
+        else:
+            # A+: Только подтвержденный 15m триггер
+            score_structure = 20
+            structure_desc = f"+20 (15m {trigger_struct_type} ({confirmation_reason}))"
+    elif is_context_aligned:
+        # 2. Средний приоритет: есть только 1H контекст
+        score_structure = 10
+        structure_desc = f"+10 (1H {context_struct_type} only)"
+    elif is_trigger_aligned: # and not confirmation_reason
+        # 3. Низкий приоритет: есть неподтвержденный 15m триггер
+        score_structure = 5
+        structure_desc = f"+5 (15m {trigger_struct_type} - No Confirmation)"
+
+    score += score_structure
+    breakdown['structure'] = structure_desc
 
     # 3. Ликвидность (+20 баллов)
-    if sfp_data_in_window:
-        # SFP - разворотный паттерн. Bullish SFP (снизу) для лонга, Bearish SFP (сверху) для шорта.
+    # Баллы за SFP начисляются только если он НЕ был использован для подтверждения CHoCH,
+    # чтобы избежать двойного скоринга одного и того же события.
+    sfp_used_for_confirmation = (confirmation_reason == "after SFP")
+    if sfp_data_in_window and not sfp_used_for_confirmation:
         is_sfp_aligned = (trade_direction == 'long' and 'bullish' in sfp_data_in_window.get('type', '')) or \
                          (trade_direction == 'short' and 'bearish' in sfp_data_in_window.get('type', ''))
         
         if is_sfp_aligned:
             score += 20
-            breakdown['liquidity'] = '+20 (SFP в окне 5 часов)'
+            breakdown['liquidity'] = '+20 (SFP на 1H свинге)'
 
     # 4. FVG (+15 баллов) - Память + Инвалидация пробоем
     breakdown['fvg'] = '0 (Зона не тестировалась)'
-    if fvg_tested_in_window:
+    if fvg_test_data:
         is_fvg_zone_valid = False
         # Проверяем, что хотя бы одна релевантная зона не пробита
         for fvg in fvg_data:
@@ -127,16 +198,25 @@ def calculate_setup_score(
         breakdown['volume'] = '+10 (Подтверждение объемом на свече SFP)'
     
     # Приоритет 2: Объем на свече слома структуры (BOS/CHoCH)
+    # Сначала проверяем более важный 15m триггер
+    is_trigger_aligned = trigger_structure_data and (
+        (trade_direction == 'long' and 'bullish' in trigger_structure_data.get('type', '')) or
+        (trade_direction == 'short' and 'bearish' in trigger_structure_data.get('type', ''))
+    )
+    if is_trigger_aligned and trigger_structure_data.get('rvol', 0) > 1.5:
+        score += 10
+        breakdown['volume'] = '+10 (Подтверждение объемом на 15m триггере)'
+    # Если на 15м нет, проверяем 1H контекст
     else:
-        is_structure_aligned = structure_data and (
-            (trade_direction == 'long' and 'bullish' in structure_data.get('type', '')) or
-            (trade_direction == 'short' and 'bearish' in structure_data.get('type', ''))
+        is_context_aligned = context_structure_data and (
+            (trade_direction == 'long' and 'bullish' in context_structure_data.get('type', '')) or
+            (trade_direction == 'short' and 'bearish' in context_structure_data.get('type', ''))
         )
-        if is_structure_aligned and structure_data.get('rvol', 0) > 1.5:
+        if is_context_aligned and context_structure_data.get('rvol', 0) > 1.5:
             score += 10
-            breakdown['volume'] = '+10 (Подтверждение объемом на свече BOS/CHoCH)'
+            breakdown['volume'] = '+10 (Подтверждение объемом на 1H сломе)'
 
-    # 6. Макро-контекст (+10 / 0 баллов)
+    # 6. Макро-контекст (+10 баллов)
     if macro_data:
         m_score = macro_data.get('score', 0)
         m_reason = macro_data.get('reason', 'Нет данных')

@@ -84,42 +84,75 @@ def prepare_and_analyze(coin, macro_context):
 
     # --- Анализ в окне памяти (20 свечей) ---
     sfp_data_in_window = None
-    structure_data_in_window = None
-    is_bullish_fvg_tested_in_window = False
-    is_bearish_fvg_tested_in_window = False
+    context_break_1h = None
+    trigger_break_15m = None
 
-    swing_config = {'left_bars': 5, 'right_bars': 3}
-    swing_highs_full, swing_lows_full = find_swings(df_15m_closed, **swing_config)
+    # 1. Ресемплинг 15m в 1H для поиска Swing Structure (очистка от шума)
+    # Используем правило, что час закрывается по левой границе свечи
+    df_1h_closed = df_15m_closed.resample('1h', label='left').agg({
+        'open': 'first', 
+        'high': 'max', 
+        'low': 'min', 
+        'close': 'last', 
+        'volume': 'sum',
+        'rvol': 'mean' # если этот столбец нужен
+    }).dropna()
+
+    # 2. Ищем свинги на двух таймфреймах
+    swing_highs_1h, swing_lows_1h = find_swings(df_1h_closed, left_bars=3, right_bars=2)
+    swing_highs_15m, swing_lows_15m = find_swings(df_15m_closed, left_bars=5, right_bars=3)
 
     # Итерируемся по окну С КОНЦА, чтобы найти ПОСЛЕДНИЕ (самые релевантные) события SFP и BOS
     for index, candle in window_15m.iloc[::-1].iterrows():
-        swings_before_candle_h = swing_highs_full[swing_highs_full.index < index]
-        swings_before_candle_l = swing_lows_full[swing_lows_full.index < index]
+        # SFP ищем по старшим свингам (1H)
+        swings_before_candle_h_1h = swing_highs_1h[swing_highs_1h.index < index]
+        swings_before_candle_l_1h = swing_lows_1h[swing_lows_1h.index < index]
 
         # Ищем SFP (только если еще не нашли)
         if not sfp_data_in_window:
-            sfp = detect_sfp(candle, swings_before_candle_h, swings_before_candle_l, right_bars=swing_config['right_bars'])
+            sfp = detect_sfp(candle, swings_before_candle_h_1h, swings_before_candle_l_1h, right_bars=2, timeframe_minutes=60)
             if sfp:
                 sfp['rvol'] = candle.get('rvol', 0)
                 sfp_data_in_window = sfp
 
-        # Ищем BOS/CHoCH (только если еще не нашли)
-        if not structure_data_in_window:
-            structure_break = detect_structure_break(candle, swings_before_candle_h, swings_before_candle_l, right_bars=swing_config['right_bars'])
+        # Ищем 1H BOS/CHoCH (Контекст)
+        if not context_break_1h:
+            structure_break = detect_structure_break(candle, swings_before_candle_h_1h, swings_before_candle_l_1h, right_bars=2, timeframe_minutes=60)
             if structure_break:
-                # 'rvol' уже добавляется в detect_structure_break
-                structure_data_in_window = structure_break
+                context_break_1h = structure_break
+
+        # Ищем 15m CHoCH (Триггер)
+        if not trigger_break_15m:
+            swings_before_candle_h_15m = swing_highs_15m[swing_highs_15m.index < index]
+            swings_before_candle_l_15m = swing_lows_15m[swing_lows_15m.index < index]
+            structure_break = detect_structure_break(candle, swings_before_candle_h_15m, swings_before_candle_l_15m, right_bars=3, timeframe_minutes=15)
+            if structure_break:
+                trigger_break_15m = structure_break
         
         # Если нашли оба самых свежих паттерна, выходим для оптимизации
-        if sfp_data_in_window and structure_data_in_window:
+        if sfp_data_in_window and context_break_1h and trigger_break_15m:
             break
 
+    # Находим самый последний тест FVG в окне памяти
     all_fvgs = find_fvg(df_15m_closed, atr_series=df_15m_closed['atr'], min_size_atr_ratio=0.5)
-    for fvg in all_fvgs:
-        fvg_bottom, fvg_top = fvg['bottom'], fvg['top']
-        if fvg['type'] == 'bullish' and any((window_15m['low'] <= fvg_top) & (window_15m['high'] >= fvg_bottom)): is_bullish_fvg_tested_in_window = True
-        elif fvg['type'] == 'bearish' and any((window_15m['low'] <= fvg_top) & (window_15m['high'] >= fvg_bottom)): is_bearish_fvg_tested_in_window = True
-        if is_bullish_fvg_tested_in_window and is_bearish_fvg_tested_in_window: break
+    
+    bullish_fvg_test_indices = []
+    for fvg in (f for f in all_fvgs if f['type'] == 'bullish'):
+        test_candles = window_15m[(window_15m['low'] <= fvg['top']) & (window_15m['high'] >= fvg['bottom'])]
+        if not test_candles.empty:
+            bullish_fvg_test_indices.append(test_candles.index[-1])
+    
+    bearish_fvg_test_indices = []
+    for fvg in (f for f in all_fvgs if f['type'] == 'bearish'):
+        test_candles = window_15m[(window_15m['low'] <= fvg['top']) & (window_15m['high'] >= fvg['bottom'])]
+        if not test_candles.empty:
+            bearish_fvg_test_indices.append(test_candles.index[-1])
+
+    bullish_fvg_test_index = max(bullish_fvg_test_indices) if bullish_fvg_test_indices else None
+    bearish_fvg_test_index = max(bearish_fvg_test_indices) if bearish_fvg_test_indices else None
+
+    long_fvg_test_data = {'index': bullish_fvg_test_index} if bullish_fvg_test_index else None
+    short_fvg_test_data = {'index': bearish_fvg_test_index} if bearish_fvg_test_index else None
 
     current_price = float(last_closed_15m['close'])
 
@@ -133,8 +166,8 @@ def prepare_and_analyze(coin, macro_context):
     short_macro_data = {'score': short_macro_score, 'reason': short_macro_reason}
     
     # ✅ ВОТ ЭТИ ДВЕ СТРОКИ НУЖНО ВЕРНУТЬ (Вызов калькулятора баллов):
-    long_score = calculate_setup_score('long', current_price, trend_data, structure_data_in_window, sfp_data_in_window, is_bullish_fvg_tested_in_window, all_fvgs, None, long_macro_data)
-    short_score = calculate_setup_score('short', current_price, trend_data, structure_data_in_window, sfp_data_in_window, is_bearish_fvg_tested_in_window, all_fvgs, None, short_macro_data)
+    long_score = calculate_setup_score('long', current_price, trend_data, context_break_1h, trigger_break_15m, sfp_data_in_window, long_fvg_test_data, all_fvgs, long_macro_data)
+    short_score = calculate_setup_score('short', current_price, trend_data, context_break_1h, trigger_break_15m, sfp_data_in_window, short_fvg_test_data, all_fvgs, short_macro_data)
 
     if long_score['total_score'] >= short_score['total_score']:
         final_score_result = long_score
@@ -145,7 +178,8 @@ def prepare_and_analyze(coin, macro_context):
 
     analysis_data = {
         "trend_data": trend_data,
-        "structure_data": structure_data_in_window,
+        # Для А+ сетапа нам нужен уровень от 1H структуры
+        "structure_data": context_break_1h or trigger_break_15m,
         "direction": direction,
         "last_closed_15m": last_closed_15m,
     }

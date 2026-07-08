@@ -35,6 +35,9 @@ def fetch_candles(symbol, timeframe, limit=5):
         # Конвертируем тиковые миллисекунды в нормальное время UTC
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         
+        # Устанавливаем timestamp как индекс, это необходимо для resample()
+        df.set_index('timestamp', inplace=True)
+        
         return df
         
     except Exception as e:

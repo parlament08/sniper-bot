@@ -98,6 +98,11 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> Optional[pd.DataFrame]:
     if not all(col in df.columns for col in required_cols):
         logger.error(f"Необходимые колонки {required_cols} не найдены для расчета ADX.")
         return None
+    
+    if len(df) < period * 2:
+        logger.warning(f"Недостаточно данных для корректного расчета ADX (нужно минимум {period*2} свечей).")
+        return None
+        
     try:
         df_adx = df.copy()
         for col in required_cols:
@@ -115,8 +120,8 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> Optional[pd.DataFrame]:
         n_dm = np.where((move_down > move_up) & (move_down > 0), move_down, 0)
 
         tr_smoothed = tr.ewm(com=period - 1, min_periods=period, adjust=False).mean()
-        p_dm_smoothed = pd.Series(p_dm).ewm(com=period - 1, min_periods=period, adjust=False).mean()
-        n_dm_smoothed = pd.Series(n_dm).ewm(com=period - 1, min_periods=period, adjust=False).mean()
+        p_dm_smoothed = pd.Series(p_dm, index=df.index).ewm(com=period - 1, min_periods=period, adjust=False).mean()
+        n_dm_smoothed = pd.Series(n_dm, index=df.index).ewm(com=period - 1, min_periods=period, adjust=False).mean()
 
         tr_smoothed = tr_smoothed.replace(0, 1e-9)
         p_di = 100 * (p_dm_smoothed / tr_smoothed)
