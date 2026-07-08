@@ -23,7 +23,7 @@ from core.structure import (
 )
 from core.indicators import calculate_ema, calculate_atr, calculate_rvol, calculate_adx, evaluate_trend
 from core.premium_discount import evaluate_premium_discount
-from core.risk import calculate_setup_score, select_best_setup
+from core.risk import calculate_setup_score, format_setup_direction, resolve_session_decision, select_best_setup
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
@@ -292,7 +292,7 @@ def market_scan(report_mode="HUNT"):
             total_score = score_result.get('total_score', 0)
             is_high_score_setup = total_score >= 85
             #is_high_score_setup = total_score >= 0
-            decision = score_result.get('decision', 'Ignore') if in_kz else "Ignore"
+            decision = resolve_session_decision(score_result, in_kz)
 
             # Отправка А+ сетапа
             if is_high_score_setup and in_kz:
@@ -336,8 +336,7 @@ def market_scan(report_mode="HUNT"):
                 direction = analysis_data['direction']
                 
                 # 1. Форматируем заголовок с направлением сетапа (15m)
-                setup_direction_text = direction
-                setup_emoji = "🟢" if direction == "LONG" else "🔴" if direction == "SHORT" else "⚪"
+                setup_direction_text, setup_emoji = format_setup_direction(direction, total_score, decision)
                 header = f"💎 <b>{coin}</b> | Сетап: <b>{setup_direction_text} {setup_emoji}</b> | Score: <b>{total_score}/100</b> | {decision}"
 
                 # 2. Форматируем строку тренда с направлением (4H)

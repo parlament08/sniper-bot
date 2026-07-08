@@ -124,6 +124,25 @@ def select_best_setup(long_score: Dict, short_score: Dict) -> tuple:
     return short_score, 'SHORT'
 
 
+def format_setup_direction(direction: str, total_score: int, decision: str, no_trade_threshold: int = 40) -> tuple:
+    if decision == 'Ignore' and total_score < no_trade_threshold:
+        return 'NO TRADE', '⚪'
+
+    setup_emoji = '🟢' if direction == 'LONG' else '🔴' if direction == 'SHORT' else '⚪'
+    return direction, setup_emoji
+
+
+def resolve_session_decision(score_result: Dict, in_kill_zone: bool, watch_only_threshold: int = 85) -> str:
+    decision = score_result.get('decision', 'Ignore')
+    total_score = score_result.get('total_score', 0)
+
+    if in_kill_zone:
+        return decision
+    if total_score >= watch_only_threshold:
+        return 'A+ WATCH ONLY'
+    return 'Ignore'
+
+
 def calculate_setup_score(
     trade_direction: str,
     current_price: float,

@@ -1,7 +1,7 @@
 import unittest
 
 from core.premium_discount import PremiumDiscountResult
-from core.risk import calculate_setup_score, select_best_setup
+from core.risk import calculate_setup_score, format_setup_direction, resolve_session_decision, select_best_setup
 
 
 class RiskPremiumDiscountTest(unittest.TestCase):
@@ -76,6 +76,33 @@ class RiskPremiumDiscountTest(unittest.TestCase):
 
         self.assertIs(selected_score, long_score)
         self.assertEqual(direction, 'LONG')
+
+    def test_weak_ignore_formats_as_no_trade(self):
+        text, emoji = format_setup_direction('LONG', total_score=15, decision='Ignore')
+
+        self.assertEqual(text, 'NO TRADE')
+        self.assertEqual(emoji, '⚪')
+
+    def test_watchlist_keeps_directional_display(self):
+        text, emoji = format_setup_direction('SHORT', total_score=45, decision='Watchlist')
+
+        self.assertEqual(text, 'SHORT')
+        self.assertEqual(emoji, '🔴')
+
+    def test_high_score_outside_kill_zone_is_watch_only(self):
+        decision = resolve_session_decision({'total_score': 87, 'decision': 'A+'}, in_kill_zone=False)
+
+        self.assertEqual(decision, 'A+ WATCH ONLY')
+
+    def test_high_score_inside_kill_zone_keeps_a_plus(self):
+        decision = resolve_session_decision({'total_score': 87, 'decision': 'A+'}, in_kill_zone=True)
+
+        self.assertEqual(decision, 'A+')
+
+    def test_low_score_outside_kill_zone_stays_ignore(self):
+        decision = resolve_session_decision({'total_score': 55, 'decision': 'Watchlist'}, in_kill_zone=False)
+
+        self.assertEqual(decision, 'Ignore')
 
 
 if __name__ == '__main__':
