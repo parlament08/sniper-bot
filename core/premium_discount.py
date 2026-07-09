@@ -19,6 +19,7 @@ class PremiumDiscountResult:
     valid_for_buy: bool
     valid_for_sell: bool
     reason: str
+    distance_from_equilibrium_range_percent: float = 0.0
 
     def get(self, key: str, default: Any = None) -> Any:
         return asdict(self).get(key, default)
@@ -55,9 +56,11 @@ def evaluate_premium_discount(
         raise ValueError("Premium/discount range cannot have equal high and low")
 
     equilibrium = (range_high + range_low) / 2
+    dealing_range = range_high - range_low
     distance_percent = ((price - equilibrium) / equilibrium) * 100 if equilibrium else 0.0
+    distance_from_equilibrium_range_percent = (abs(price - equilibrium) / dealing_range) * 100 if dealing_range > 0 else 0.0
 
-    if abs(distance_percent) <= tolerance_percent:
+    if distance_from_equilibrium_range_percent <= tolerance_percent:
         zone: ZoneType = "equilibrium"
     elif price < equilibrium:
         zone = "discount"
@@ -77,6 +80,7 @@ def evaluate_premium_discount(
         valid_for_buy=valid_for_buy,
         valid_for_sell=valid_for_sell,
         reason=_reason(zone),
+        distance_from_equilibrium_range_percent=round(distance_from_equilibrium_range_percent, 4),
     )
 
 

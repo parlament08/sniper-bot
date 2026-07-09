@@ -4,6 +4,7 @@ import json
 import requests
 import pandas as pd
 import google.generativeai as genai
+from html import escape
 from datetime import time as dt_time
 from dotenv import load_dotenv
 
@@ -56,6 +57,10 @@ def send_telegram_alert(text):
             logger.error(f"Ошибка Telegram API: {res.text}")
     except Exception as e:
         logger.error(f"Не удалось отправить пуш в Telegram: {e}")
+
+
+def _html_text(value):
+    return escape(str(value), quote=False)
 
 
 def _resolve_premium_discount(current_price, range_candidates):
@@ -121,13 +126,14 @@ def prepare_and_analyze(coin, macro_context):
         'rvol': 'mean' # если этот столбец нужен
     }).dropna()
 
-    # 2. Ищем свинги на двух таймфреймах
+    # 2. Ищем свинги на старшем и рабочих таймфреймах
+    swing_highs_4h, swing_lows_4h = find_swings(df_4h_closed, left_bars=3, right_bars=2)
     swing_highs_1h, swing_lows_1h = find_swings(df_1h_closed, left_bars=3, right_bars=2)
     swing_highs_15m, swing_lows_15m = find_swings(df_15m_closed, left_bars=5, right_bars=3)
     market_structure = evaluate_market_structure(
-        df_15m_closed,
-        swing_highs_1h,
-        swing_lows_1h,
+        df_4h_closed,
+        swing_highs_4h,
+        swing_lows_4h,
         trend_data=trend_data,
         config=MarketStructureConfig(),
     )
@@ -229,7 +235,6 @@ def prepare_and_analyze(coin, macro_context):
     short_fvg_test_data = {'index': bearish_fvg_test_index} if bearish_fvg_test_index else None
 
     current_price = float(last_closed_15m['close'])
-    swing_highs_4h, swing_lows_4h = find_swings(df_4h_closed, left_bars=3, right_bars=2)
     premium_discount_data = _resolve_premium_discount(
         current_price,
         (
@@ -337,7 +342,11 @@ def market_scan(report_mode="HUNT"):
                 
                 # 1. Форматируем заголовок с направлением сетапа (15m)
                 setup_direction_text, setup_emoji = format_setup_direction(direction, total_score, decision)
-                header = f"💎 <b>{coin}</b> | Сетап: <b>{setup_direction_text} {setup_emoji}</b> | Score: <b>{total_score}/100</b> | {decision}"
+                header = (
+                    f"💎 <b>{_html_text(coin)}</b> | "
+                    f"Сетап: <b>{_html_text(setup_direction_text)} {setup_emoji}</b> | "
+                    f"Score: <b>{total_score}/100</b> | {_html_text(decision)}"
+                )
 
                 # 2. Форматируем строку тренда с направлением (4H)
                 trend_data = analysis_data.get('trend_data')
@@ -349,19 +358,22 @@ def market_scan(report_mode="HUNT"):
                 elif trend_data and 'is_bullish' in trend_data:
                     trend_4h_direction = "ВВЕРХ ↗️" if trend_data['is_bullish'] else "ВНИЗ ↘️"
                 
-                trend_line = f"📊 Тренд (4H): {trend_4h_direction} | {breakdown.get('trend', '0')}"
-                structure_line = f"⚙️ Структура: {breakdown.get('structure', '0')}"
-                liquidity_line = f"💧 Ликвидность: {breakdown.get('liquidity', '0')}"
-                fvg_line = f"🎯 FVG: {breakdown.get('fvg', '0')}"
-                volume_line = f"📈 Объем: {breakdown.get('volume', '0')}"
-                premium_discount_line = f"⚖️ P/D: {breakdown.get('premium_discount', '0')}"
-                macro_line = f"🌍 Макро: {breakdown.get('macro', '0')}"
+                trend_line = f"📊 Тренд (4H): {_html_text(trend_4h_direction)} | {_html_text(breakdown.get('trend', '0'))}"
+                structure_line = f"⚙️ Структура: {_html_text(breakdown.get('structure', '0'))}"
+                liquidity_line = f"💧 Ликвидность: {_html_text(breakdown.get('liquidity', '0'))}"
+                fvg_line = f"🎯 FVG: {_html_text(breakdown.get('fvg', '0'))}"
+                volume_line = f"📈 Объем: {_html_text(breakdown.get('volume', '0'))}"
+                premium_discount_line = f"⚖️ P/D: {_html_text(breakdown.get('premium_discount', '0'))}"
+                macro_line = f"🌍 Макро: {_html_text(breakdown.get('macro', '0'))}"
                 separator = "──────────────────"
                 
                 detailed_report = "\n".join([header, trend_line, structure_line, liquidity_line, fvg_line, volume_line, premium_discount_line, macro_line, separator])
                 dashboard_lines.append(detailed_report)
             else:
-                dashboard_lines.append(f"• <b>{coin}</b>: {total_score} баллов | {decision} | Тренд: {trend_strength}")
+                dashboard_lines.append(
+                    f"• <b>{_html_text(coin)}</b>: {total_score} баллов | "
+                    f"{_html_text(decision)} | Тренд: {_html_text(trend_strength)}"
+                )
 
         except Exception as e:
             logger.error(f"Критическая ошибка при анализе {coin}: {e}", exc_info=True)
@@ -371,9 +383,9 @@ def market_scan(report_mode="HUNT"):
     if dashboard_lines and (report_mode == "FULL" or in_kz):
         header_text = "РЫНОЧНЫЙ БРИФИНГ" if report_mode == "FULL" else "СНАЙПЕР ОНЛАЙН"
         summary_header = [
-            f"📡 <b>{header_text} | {current_time_str}</b>",
-            f"⚡️ Сессия: <code>{session_status}</code>",
-            f"🌍 Макро: <code>{macro_str}</code>",
+            f"📡 <b>{_html_text(header_text)} | {_html_text(current_time_str)}</b>",
+            f"⚡️ Сессия: <code>{_html_text(session_status)}</code>",
+            f"🌍 Макро: <code>{_html_text(macro_str)}</code>",
             "────────────────"
         ]
         full_message = "\n".join(summary_header + dashboard_lines)

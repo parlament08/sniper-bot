@@ -35,9 +35,12 @@ class RiskPremiumDiscountTest(unittest.TestCase):
             ),
         )
 
+        self.assertEqual(result['raw_score'], 25)
         self.assertEqual(result['total_score'], 0)
         self.assertEqual(result['decision'], 'Ignore')
+        self.assertEqual(result['breakdown']['trend'], '+25 (Сильный тренд, совпадает с направлением)')
         self.assertIn('BLOCK (premium', result['breakdown']['premium_discount'])
+        self.assertIn('score 25->0', result['breakdown']['premium_discount'])
 
     def test_sell_in_discount_is_blocked(self):
         result = self._base_score(
@@ -55,9 +58,89 @@ class RiskPremiumDiscountTest(unittest.TestCase):
             ),
         )
 
+        self.assertEqual(result['raw_score'], 25)
         self.assertEqual(result['total_score'], 0)
         self.assertEqual(result['decision'], 'Ignore')
+        self.assertEqual(result['breakdown']['trend'], '+25 (Сильный тренд, совпадает с направлением)')
         self.assertIn('BLOCK (discount', result['breakdown']['premium_discount'])
+        self.assertIn('score 25->0', result['breakdown']['premium_discount'])
+
+    def test_valid_premium_discount_keeps_raw_score_as_total_score(self):
+        result = self._base_score(
+            'long',
+            PremiumDiscountResult(
+                zone='discount',
+                range_high=120,
+                range_low=80,
+                equilibrium=100,
+                price=90,
+                distance_from_equilibrium_percent=-10,
+                valid_for_buy=True,
+                valid_for_sell=False,
+                reason='test',
+            ),
+        )
+
+        self.assertEqual(result['raw_score'], 25)
+        self.assertEqual(result['total_score'], 25)
+        self.assertIn('OK (discount', result['breakdown']['premium_discount'])
+
+    def test_premium_discount_label_shows_equilibrium_and_range_distance(self):
+        result = self._base_score(
+            'long',
+            PremiumDiscountResult(
+                zone='discount',
+                range_high=120,
+                range_low=80,
+                equilibrium=100,
+                price=99.84,
+                distance_from_equilibrium_percent=-0.16,
+                valid_for_buy=True,
+                valid_for_sell=False,
+                reason='test',
+                distance_from_equilibrium_range_percent=2.4,
+            ),
+        )
+
+        self.assertIn('-0.16% от EQ', result['breakdown']['premium_discount'])
+        self.assertIn('2.40% range', result['breakdown']['premium_discount'])
+
+    def test_blocked_setup_still_exposes_component_sum_before_gate(self):
+        result = calculate_setup_score(
+            trade_direction='long',
+            current_price=100.0,
+            trend_data={'is_bullish': True, 'strength': 'flat'},
+            context_structure_data=None,
+            trigger_structure_data=None,
+            sfp_data_in_window={
+                'type': 'bullish_sfp',
+                'index': 10,
+                'quality_score': 80,
+                'liquidity_depth': 0.73,
+                'rejection_strength': 86,
+                'volume_confirmed': False,
+            },
+            fvg_test_data=None,
+            fvg_data=[],
+            macro_data={'score': 0, 'reason': 'test'},
+            premium_discount_data=PremiumDiscountResult(
+                zone='equilibrium',
+                range_high=120,
+                range_low=80,
+                equilibrium=100,
+                price=99.99,
+                distance_from_equilibrium_percent=-0.01,
+                valid_for_buy=False,
+                valid_for_sell=False,
+                reason='test',
+            ),
+        )
+
+        self.assertEqual(result['raw_score'], 30)
+        self.assertEqual(result['total_score'], 0)
+        self.assertEqual(result['breakdown']['trend'], '+10 (Цена по тренду, слабый импульс/откат)')
+        self.assertIn('+20 (SFP Q80 D0.73 R86', result['breakdown']['liquidity'])
+        self.assertIn('score 30->0', result['breakdown']['premium_discount'])
 
     def test_zero_zero_direction_selection_returns_neutral(self):
         long_score = {'total_score': 0, 'decision': 'Ignore', 'breakdown': {'premium_discount': 'BLOCK'}}

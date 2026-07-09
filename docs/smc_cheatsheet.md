@@ -269,6 +269,9 @@ Bearish
 Neutral
 ```
 
+В брифинге строка `Тренд (4H)` использует 4H EMA/ADX и 4H swing-структуру.
+Рабочие 1H/15m swing-и используются ниже для контекста и триггеров, но не должны сами превращать 4H trend в Neutral.
+
 ### Bullish
 
 Рынок считается bullish, если структура подтверждает рост:
@@ -311,7 +314,7 @@ Neutral значит:
 
 | Причина | Что это значит |
 | --- | --- |
-| `Conflicting swing structure` | Есть одновременно `HH` и `LL` |
+| `Conflicting swing structure` | Последние swing-переходы дают одновременно `HH` и `LL` |
 | `No confirmed swing structure` | Мало подтвержденных swing-ов |
 | `ADX below neutral threshold` | ADX ниже 18, тренд слабый |
 | `Range too narrow` | Диапазон слишком узкий относительно ATR |
@@ -372,7 +375,7 @@ HH + LL
 Перевод:
 
 ```text
-Цена одновременно показывает силу вверх и вниз.
+Последние swing-и одновременно показывают силу вверх и вниз.
 Бот не угадывает направление и ставит Neutral.
 ```
 
@@ -664,7 +667,7 @@ equilibrium = середина диапазона
 Tolerance для equilibrium:
 
 ```text
-2% от equilibrium
+2% от ширины swing range вокруг equilibrium
 ```
 
 Если цена близко к середине диапазона, бот возвращает:
@@ -692,7 +695,7 @@ Decision = Ignore
 Пример:
 
 ```text
-P/D: BLOCK (premium +10.00% от EQ)
+P/D: BLOCK (premium +10.00% от EQ, 25.00% range)
 ```
 
 Это значит:
@@ -704,7 +707,7 @@ BUY заблокирован, потому что цена слишком выс
 Пример:
 
 ```text
-P/D: OK (discount -8.00% от EQ)
+P/D: OK (discount -8.00% от EQ, 20.00% range)
 ```
 
 Это значит:
@@ -1248,7 +1251,9 @@ Score: 0
 ### BUY в premium
 
 ```text
-P/D: BLOCK (premium +10.00% от EQ)
+Тренд: +25
+Ликвидность: +20
+P/D: BLOCK (premium +10.00% от EQ, 25.00% range, score 45->0)
 Score: 0
 Decision: Ignore
 ```
@@ -1258,6 +1263,8 @@ Decision: Ignore
 ```text
 Даже если есть какой-то сигнал,
 бот не хочет покупать высоко в диапазоне.
+Сначала он считает сырой score,
+а потом P/D BLOCK обнуляет итоговый score.
 ```
 
 ### Нарушен порядок сценария

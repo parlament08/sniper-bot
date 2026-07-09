@@ -103,12 +103,16 @@ def _pd_get(premium_discount_data, key: str, default=None):
 def _premium_discount_label(premium_discount_data) -> str:
     zone = _pd_get(premium_discount_data, 'zone')
     distance = _pd_get(premium_discount_data, 'distance_from_equilibrium_percent')
+    range_distance = _pd_get(premium_discount_data, 'distance_from_equilibrium_range_percent')
 
     if zone is None:
         return '0'
     if distance is None:
         return f"{zone}"
-    return f"{zone} ({float(distance):+.2f}% от EQ)"
+    label = f"{zone} ({float(distance):+.2f}% от EQ"
+    if range_distance is not None:
+        label += f", {float(range_distance):.2f}% range"
+    return f"{label})"
 
 
 def select_best_setup(long_score: Dict, short_score: Dict) -> tuple:
@@ -185,20 +189,18 @@ def calculate_setup_score(
         'premium_discount': '0',
     }
 
+    pd_valid = True
     if premium_discount_data:
         pd_valid = (
             _pd_get(premium_discount_data, 'valid_for_buy', False)
             if trade_direction == 'long'
             else _pd_get(premium_discount_data, 'valid_for_sell', False)
         )
-        if not pd_valid:
-            breakdown['premium_discount'] = f"BLOCK ({_premium_discount_label(premium_discount_data)})"
-            return {
-                'total_score': 0,
-                'decision': 'Ignore',
-                'breakdown': breakdown,
-            }
-        breakdown['premium_discount'] = f"OK ({_premium_discount_label(premium_discount_data)})"
+        breakdown['premium_discount'] = (
+            f"OK ({_premium_discount_label(premium_discount_data)})"
+            if pd_valid
+            else f"BLOCK ({_premium_discount_label(premium_discount_data)})"
+        )
 
     # 1. Тренд (+25 / +10 баллов)
     # ФИКС: Если тренд глобально направлен ПРОТИВ нашей сделки,
@@ -424,6 +426,14 @@ def calculate_setup_score(
         score += m_score
         breakdown['macro'] = f"+{m_score} ({m_reason})" if m_score > 0 else f"0 ({m_reason})"
 
+    raw_score = score
+
+    if not pd_valid:
+        breakdown['premium_discount'] = (
+            f"BLOCK ({_premium_discount_label(premium_discount_data)}, score {raw_score}->0)"
+        )
+        score = 0
+
     # Определение итогового решения на основе суммы баллов
     decision = "Ignore"
     
@@ -435,6 +445,7 @@ def calculate_setup_score(
         decision = "Ignore"
 
     return {
+        'raw_score': raw_score,
         'total_score': score,
         'decision': decision,
         'breakdown': breakdown

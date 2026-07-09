@@ -38,12 +38,20 @@ class PremiumDiscountTest(unittest.TestCase):
         self.assertFalse(result.valid_for_sell)
 
     def test_price_near_equilibrium_returns_equilibrium(self):
-        result = evaluate_premium_discount(101.0, self.swing_highs, self.swing_lows)
+        result = evaluate_premium_discount(100.5, self.swing_highs, self.swing_lows)
 
         self.assertEqual(result.zone, 'equilibrium')
         self.assertFalse(result.valid_for_buy)
         self.assertFalse(result.valid_for_sell)
         self.assertIn('equilibrium', result.reason)
+
+    def test_equilibrium_tolerance_uses_range_not_absolute_price(self):
+        result = evaluate_premium_discount(101.0, self.swing_highs, self.swing_lows)
+
+        self.assertEqual(result.zone, 'premium')
+        self.assertTrue(result.valid_for_sell)
+        self.assertAlmostEqual(result.distance_from_equilibrium_percent, 1.0)
+        self.assertAlmostEqual(result.distance_from_equilibrium_range_percent, 2.5)
 
 
 if __name__ == '__main__':

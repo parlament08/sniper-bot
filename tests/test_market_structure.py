@@ -36,6 +36,20 @@ class MarketStructureTest(unittest.TestCase):
         self.assertEqual(result.reason, 'Conflicting swing structure')
         self.assertEqual(result.confidence, 23)
 
+    def test_stale_conflict_does_not_override_latest_directional_swings(self):
+        swing_highs = pd.DataFrame({'high': [100.0, 110.0, 105.0, 115.0]}, index=[1, 3, 5, 7])
+        swing_lows = pd.DataFrame({'low': [95.0, 90.0, 92.0, 96.0]}, index=[2, 4, 6, 8])
+
+        result = evaluate_market_structure(
+            self._df(),
+            swing_highs,
+            swing_lows,
+            trend_data={'adx_value': 30, 'is_bullish': True},
+        )
+
+        self.assertEqual(result.trend, 'bullish')
+        self.assertEqual(result.reason, 'Confirmed HH/HL structure')
+
     def test_low_adx_returns_neutral_even_with_directional_swings(self):
         swing_highs = pd.DataFrame({'high': [100.0, 110.0]}, index=[1, 3])
         swing_lows = pd.DataFrame({'low': [90.0, 95.0]}, index=[2, 4])

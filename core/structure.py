@@ -338,6 +338,12 @@ def evaluate_market_structure(
     has_lh = bool((high_diff < 0).any())
     has_hl = bool((low_diff > 0).any())
     has_ll = bool((low_diff < 0).any())
+    latest_high_change = float(high_diff.iloc[-1]) if not high_diff.empty else 0.0
+    latest_low_change = float(low_diff.iloc[-1]) if not low_diff.empty else 0.0
+    latest_hh = latest_high_change > 0
+    latest_lh = latest_high_change < 0
+    latest_hl = latest_low_change > 0
+    latest_ll = latest_low_change < 0
 
     if recent_structure_events and len(recent_structure_events) >= 2:
         event_directions = [
@@ -352,14 +358,14 @@ def evaluate_market_structure(
                 reason='Conflicting recent BOS',
             )
 
-    if has_hh and has_ll:
+    if latest_hh and latest_ll:
         return MarketStructure(
             trend='neutral',
             confidence=config.conflicting_swing_confidence,
             reason='Conflicting swing structure',
         )
 
-    if has_lh and has_hl and not (has_hh or has_ll):
+    if latest_lh and latest_hl and not (latest_hh or latest_ll):
         return MarketStructure(
             trend='neutral',
             confidence=config.compressed_swing_confidence,
@@ -385,11 +391,11 @@ def evaluate_market_structure(
                 reason='Range too narrow',
             )
 
-    if has_hh and has_hl and not has_ll:
+    if latest_hh and latest_hl:
         confidence = config.directional_confidence_floor + (config.trend_alignment_bonus if trend_data and trend_data.get('is_bullish') else 0)
         return MarketStructure(trend='bullish', confidence=min(confidence, 100), reason='Confirmed HH/HL structure')
 
-    if has_lh and has_ll and not has_hh:
+    if latest_lh and latest_ll:
         confidence = config.directional_confidence_floor + (config.trend_alignment_bonus if trend_data and trend_data.get('is_bullish') is False else 0)
         return MarketStructure(trend='bearish', confidence=min(confidence, 100), reason='Confirmed LH/LL structure')
 
