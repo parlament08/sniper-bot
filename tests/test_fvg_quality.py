@@ -34,6 +34,19 @@ class FVGQualityTest(unittest.TestCase):
         self.assertGreaterEqual(fvg.displacement_ratio, 2.0)
         self.assertTrue(fvg.volume_confirmed)
 
+    def test_high_rvol_absorption_does_not_confirm_fvg_volume(self):
+        df = pd.DataFrame([
+            {'open': 9.5, 'high': 10.0, 'low': 9.0, 'close': 9.8, 'volume': 100, 'atr': 2.0, 'rvol': 1.0},
+            {'open': 10.0, 'high': 14.5, 'low': 9.8, 'close': 11.0, 'volume': 240, 'atr': 2.0, 'rvol': 2.4},
+            {'open': 12.2, 'high': 13.0, 'low': 12.0, 'close': 12.5, 'volume': 150, 'atr': 2.0, 'rvol': 1.5},
+        ])
+
+        fvg = self._first_bullish_fvg(df)
+
+        self.assertTrue(fvg.detected)
+        self.assertTrue(fvg.absorption_warning)
+        self.assertFalse(fvg.volume_confirmed)
+
     def test_partial_retest_reduces_quality_but_keeps_zone_valid(self):
         df = self._df([
             {'open': 12.8, 'high': 13.2, 'low': 11.0, 'close': 12.4, 'volume': 130, 'atr': 2.0, 'rvol': 1.1},
@@ -48,7 +61,7 @@ class FVGQualityTest(unittest.TestCase):
         self.assertEqual(fvg.retest_count, 1)
         self.assertGreater(fvg.quality_score, 50)
 
-    def test_fully_filled_fvg_is_invalidated_with_min_quality(self):
+    def test_wick_violation_penalizes_but_does_not_invalidate_fvg(self):
         df = self._df([
             {'open': 12.2, 'high': 12.4, 'low': 9.8, 'close': 10.5, 'volume': 150, 'atr': 2.0, 'rvol': 1.2},
         ])
@@ -56,8 +69,24 @@ class FVGQualityTest(unittest.TestCase):
         fvg = self._first_bullish_fvg(df)
 
         self.assertTrue(fvg.tested)
-        self.assertTrue(fvg.invalidated)
+        self.assertTrue(fvg.wick_violated)
+        self.assertFalse(fvg.close_invalidated)
+        self.assertFalse(fvg.invalidated)
         self.assertEqual(fvg.overlap_percent, 100)
+        self.assertGreater(fvg.quality_score, 0)
+        self.assertTrue(bool(fvg))
+
+    def test_close_through_fvg_invalidates_with_min_quality(self):
+        df = self._df([
+            {'open': 12.2, 'high': 12.4, 'low': 9.8, 'close': 9.7, 'volume': 150, 'atr': 2.0, 'rvol': 1.2},
+        ])
+
+        fvg = self._first_bullish_fvg(df)
+
+        self.assertTrue(fvg.tested)
+        self.assertTrue(fvg.wick_violated)
+        self.assertTrue(fvg.close_invalidated)
+        self.assertTrue(fvg.invalidated)
         self.assertEqual(fvg.quality_score, 0)
         self.assertFalse(bool(fvg))
 

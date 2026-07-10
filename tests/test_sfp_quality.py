@@ -2,7 +2,8 @@ import unittest
 
 import pandas as pd
 
-from core.structure import SFPConfig, SFPResult, detect_sfp
+from core.liquidity import LiquidityLevel
+from core.structure import SFPConfig, SFPResult, detect_sfp, detect_sfp_against_liquidity_levels
 
 
 class SFPQualityTest(unittest.TestCase):
@@ -82,6 +83,70 @@ class SFPQualityTest(unittest.TestCase):
             'atr': 2.0,
             'rvol': 2.1,
         }, config=config, future_candles=future_candles)
+
+        self.assertIsNone(result)
+
+    def test_sfp_against_liquidity_level_includes_level_quality(self):
+        level = LiquidityLevel(
+            type='equal_lows',
+            price=90.0,
+            strength=85.0,
+            touches=3,
+            age_bars=12,
+            distance_percent=1.0,
+            distance_atr=0.5,
+            swept=False,
+            swept_at=None,
+            source_index=5,
+            description='Equal lows sell-side liquidity',
+        )
+
+        result = detect_sfp_against_liquidity_levels(
+            pd.Series({
+                'open': 89.2,
+                'high': 91.3,
+                'low': 88.9,
+                'close': 91.0,
+                'atr': 2.0,
+                'rvol': 1.8,
+            }, name=10),
+            [level],
+        )
+
+        self.assertIsInstance(result, SFPResult)
+        self.assertTrue(result.detected)
+        self.assertEqual(result.type, 'bullish_sfp')
+        self.assertEqual(result.level_type, 'equal_lows')
+        self.assertEqual(result.level_strength, 85.0)
+        self.assertEqual(result.level_touches, 3)
+        self.assertGreaterEqual(result.quality_score, 75)
+
+    def test_sfp_against_swept_liquidity_level_is_ignored(self):
+        level = LiquidityLevel(
+            type='equal_lows',
+            price=90.0,
+            strength=85.0,
+            touches=3,
+            age_bars=12,
+            distance_percent=1.0,
+            distance_atr=0.5,
+            swept=True,
+            swept_at=8,
+            source_index=5,
+            description='Equal lows sell-side liquidity',
+        )
+
+        result = detect_sfp_against_liquidity_levels(
+            pd.Series({
+                'open': 89.2,
+                'high': 91.3,
+                'low': 88.9,
+                'close': 91.0,
+                'atr': 2.0,
+                'rvol': 1.8,
+            }, name=10),
+            [level],
+        )
 
         self.assertIsNone(result)
 

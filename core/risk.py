@@ -14,6 +14,7 @@ def _structure_label(structure_data: Optional[Dict]) -> str:
 
     displacement_ratio = structure_data.get('displacement_ratio')
     body_ratio = structure_data.get('body_ratio')
+    close_position = structure_data.get('close_position')
     confidence = structure_data.get('confidence')
     metrics = [f"{struct_type} Q{quality_score}"]
 
@@ -21,6 +22,8 @@ def _structure_label(structure_data: Optional[Dict]) -> str:
         metrics.append(f"DR{float(displacement_ratio):.2f}")
     if body_ratio is not None:
         metrics.append(f"BR{float(body_ratio):.2f}")
+    if close_position is not None:
+        metrics.append(f"CP{float(close_position):.2f}")
     if confidence is not None:
         metrics.append(f"C{int(confidence)}")
 
@@ -43,8 +46,21 @@ def _sfp_label(sfp_data: Optional[Dict]) -> str:
         metrics.append(f"D{float(liquidity_depth):.2f}")
     if rejection_strength is not None:
         metrics.append(f"R{int(rejection_strength)}")
+    level_type = sfp_data.get('level_type')
+    level_strength = sfp_data.get('level_strength')
+    if level_type:
+        metrics.append(f"{level_type} S{int(float(level_strength or 0))}")
 
     return " ".join(metrics)
+
+
+def _sfp_source_label(sfp_data: Optional[Dict]) -> str:
+    if not sfp_data:
+        return '1H свинге'
+    level_type = sfp_data.get('level_type')
+    if not level_type:
+        return '1H свинге'
+    return f"{level_type} liquidity"
 
 
 def _sfp_quality_tier(sfp_data: Optional[Dict]) -> str:
@@ -82,14 +98,70 @@ def _sfp_liquidity_score(sfp_data: Optional[Dict]) -> int:
     return 0
 
 
+def _rvol_text(data: Optional[Dict]) -> str:
+    if not data:
+        return "RVOL n/a"
+    rvol = data.get('rvol')
+    if rvol is None:
+        return "RVOL n/a"
+    return f"RVOL {float(rvol):.2f}"
+
+
+def _quality_text(data: Optional[Dict]) -> str:
+    if not data or data.get('quality_score') is None:
+        return "Q n/a"
+    return f"Q{int(data.get('quality_score'))}"
+
+
+def _has_absorption_warning(data: Optional[Dict]) -> bool:
+    return bool(data and data.get('absorption_warning', False))
+
+
 def _structure_volume_score(structure_data: Optional[Dict], confirmation_reason: Optional[str] = None) -> int:
-    if not structure_data or structure_data.get('rvol', 0) <= 1.5:
+    if not structure_data or structure_data.get('rvol', 0) <= 1.5 or _has_absorption_warning(structure_data):
         return 0
 
     if confirmation_reason:
         return 10
 
     return 5 if structure_data.get('quality_score', 0) >= 90 else 0
+
+
+def _fvg_quality_score(fvg: Dict) -> int:
+    quality_score = int(fvg.get('quality_score', 0))
+    retest_count = int(fvg.get('retest_count', 0))
+
+    if quality_score >= 90:
+        score = 15
+    elif quality_score >= 75:
+        score = 10
+    elif quality_score >= 60:
+        score = 5
+    else:
+        score = 0
+
+    if retest_count > 1:
+        score = max(0, score - min((retest_count - 1) * 2, 6))
+
+    return score
+
+
+def _fvg_test_age_bars(fvg_test_data: Optional[Dict], fvg: Dict) -> Optional[int]:
+    if not fvg_test_data or fvg_test_data.get('index') is None:
+        return None
+
+    test_index = fvg_test_data['index']
+    fvg_end_index = fvg.get('end_index')
+    if fvg_end_index is None:
+        return None
+
+    try:
+        age = test_index - fvg_end_index
+        if hasattr(age, 'total_seconds'):
+            return max(0, round(age.total_seconds() / (15 * 60)))
+        return max(0, int(age))
+    except (TypeError, ValueError):
+        return None
 
 
 def _pd_get(premium_discount_data, key: str, default=None):
@@ -104,15 +176,29 @@ def _premium_discount_label(premium_discount_data) -> str:
     zone = _pd_get(premium_discount_data, 'zone')
     distance = _pd_get(premium_discount_data, 'distance_from_equilibrium_percent')
     range_distance = _pd_get(premium_discount_data, 'distance_from_equilibrium_range_percent')
+    range_timeframe = _pd_get(premium_discount_data, 'range_timeframe')
+    zone_depth = _pd_get(premium_discount_data, 'zone_depth')
+    zone_strength = _pd_get(premium_discount_data, 'zone_strength')
+    range_low = _pd_get(premium_discount_data, 'range_low')
+    range_high = _pd_get(premium_discount_data, 'range_high')
 
     if zone is None:
         return '0'
     if distance is None:
         return f"{zone}"
-    label = f"{zone} ({float(distance):+.2f}% от EQ"
+    prefix = " ".join(str(item) for item in (range_timeframe, zone, zone_depth) if item and item != 'unknown')
+    label = f"{prefix or zone} ({float(distance):+.2f}% от EQ"
     if range_distance is not None:
         label += f", {float(range_distance):.2f}% range"
+    if zone_strength is not None:
+        label += f", S{int(float(zone_strength))}"
+    if range_low is not None and range_high is not None:
+        label += f", range {float(range_low):.4f}-{float(range_high):.4f}"
     return f"{label})"
+
+
+def _premium_discount_is_shallow(premium_discount_data) -> bool:
+    return _pd_get(premium_discount_data, 'zone_depth') == 'shallow'
 
 
 def select_best_setup(long_score: Dict, short_score: Dict) -> tuple:
@@ -323,39 +409,46 @@ def calculate_setup_score(
             sfp_score = _sfp_liquidity_score(sfp_data_in_window)
             if sfp_score > 0:
                 score += sfp_score
-                breakdown['liquidity'] = f"+{sfp_score} ({_sfp_label(sfp_data_in_window)} на 1H свинге)"
+                breakdown['liquidity'] = f"+{sfp_score} ({_sfp_label(sfp_data_in_window)} на {_sfp_source_label(sfp_data_in_window)})"
             else:
                 breakdown['liquidity'] = f"0 ({_sfp_label(sfp_data_in_window)} слабый захват)"
 
-    # 4. FVG (+15 баллов) - Память + Инвалидация пробоем
+    # 4. FVG - tier-based quality + свежий ретест
     breakdown['fvg'] = '0 (Зона не тестировалась)'
     if fvg_test_data:
-        is_fvg_zone_valid = False
-        active_fvg_quality = None
+        active_fvg = None
+        active_fvg_inside = False
+        matching_fvgs = []
         # Проверяем, что хотя бы одна релевантная зона не пробита
         for fvg in fvg_data:
             if fvg.get('invalidated', False):
                 continue
 
             if trade_direction == 'long' and fvg.get('type') == 'bullish':
-                # Зона валидна, если цена находится ВНУТРИ или КАСАЕТСЯ ее границ
-                if fvg['bottom'] <= current_price <= fvg['top']:
-                    is_fvg_zone_valid = True
-                    active_fvg_quality = fvg.get('quality_score')
-                    break
+                if fvg.get('tested', False):
+                    matching_fvgs.append(fvg)
             elif trade_direction == 'short' and fvg.get('type') == 'bearish':
-                # Зона валидна, если цена находится ВНУТРИ или КАСАЕТСЯ ее границ
-                if fvg['bottom'] <= current_price <= fvg['top']:
-                    is_fvg_zone_valid = True
-                    active_fvg_quality = fvg.get('quality_score')
-                    break
+                if fvg.get('tested', False):
+                    matching_fvgs.append(fvg)
+
+        if matching_fvgs:
+            active_fvg = max(matching_fvgs, key=lambda item: item.get('end_index'))
+            active_fvg_inside = active_fvg['bottom'] <= current_price <= active_fvg['top']
         
-        if is_fvg_zone_valid:
-            score += 15
-            quality_text = f" Q{active_fvg_quality}" if active_fvg_quality is not None else ""
-            breakdown['fvg'] = f"+15 (Тест FVG{quality_text} в окне 5 часов, зона удержана)"
+        if active_fvg:
+            fvg_score = _fvg_quality_score(active_fvg)
+            quality_text = f"Q{active_fvg.get('quality_score')}"
+            age_text = f" age{active_fvg.get('age_bars')}"
+            retest_text = f" retests{active_fvg.get('retest_count')}"
+            wick_text = ", wick violation penalty" if active_fvg.get('wick_violated') else ""
+            if fvg_score > 0:
+                score += fvg_score
+                location_text = "цена внутри зоны" if active_fvg_inside else "свежий ретест, зона удержана"
+                breakdown['fvg'] = f"+{fvg_score} (Тест FVG {quality_text}{age_text}{retest_text}, {location_text}{wick_text})"
+            else:
+                breakdown['fvg'] = f"0 (FVG {quality_text}{age_text}{retest_text} ниже quality tier{wick_text})"
         else:
-            breakdown['fvg'] = '0 (Зона пробита после теста)'
+            breakdown['fvg'] = '0 (Зона пробита телом после теста)'
 
     # 5. Объем (+10 баллов) - Привязан к триггерным паттернам (SFP/BOS)
     breakdown['volume'] = '0 (Нет подтверждения аномальным объемом)'
@@ -369,11 +462,14 @@ def calculate_setup_score(
         is_sfp_aligned
         and _sfp_quality_tier(sfp_data_in_window) in ('strong', 'legacy_strong')
         and sfp_data_in_window.get('volume_confirmed', sfp_data_in_window.get('rvol', 0) > 1.5)
+        and not _has_absorption_warning(sfp_data_in_window)
     ):
         score += 10
-        breakdown['volume'] = '+10 (Подтверждение объемом на сильном SFP)'
-    elif is_sfp_aligned and sfp_data_in_window.get('volume_confirmed', sfp_data_in_window.get('rvol', 0) > 1.5):
-        breakdown['volume'] = '0 (Объем есть, но SFP не strong-tier)'
+        breakdown['volume'] = f"+10 (Сильный SFP volume confirmation: {_rvol_text(sfp_data_in_window)}, {_quality_text(sfp_data_in_window)})"
+    elif is_sfp_aligned and _has_absorption_warning(sfp_data_in_window):
+        breakdown['volume'] = f"0 ({_rvol_text(sfp_data_in_window)} высокий, но слабое закрытие / absorption warning)"
+    elif is_sfp_aligned and sfp_data_in_window.get('rvol', 0) > 1.5:
+        breakdown['volume'] = f"0 ({_rvol_text(sfp_data_in_window)} есть, но SFP не strong-tier: {_quality_text(sfp_data_in_window)})"
     
     # Приоритет 2: Объем на свече слома структуры (BOS/CHoCH)
     # Сначала проверяем более важный 15m триггер
@@ -392,32 +488,38 @@ def calculate_setup_score(
 
     if not is_sfp_aligned and should_prioritize_context_volume and context_volume_score > 0:
         score += context_volume_score
-        breakdown['volume'] = f"+{context_volume_score} (Объем на 1H сломе с Q>=90)"
+        breakdown['volume'] = f"+{context_volume_score} (1H BOS volume: {_rvol_text(context_structure_data)}, {_quality_text(context_structure_data)})"
+    elif not is_sfp_aligned and should_prioritize_context_volume and _has_absorption_warning(context_structure_data):
+        breakdown['volume'] = f"0 ({_rvol_text(context_structure_data)} высокий на 1H, но possible absorption)"
     elif (
         not is_sfp_aligned
         and should_prioritize_context_volume
         and context_structure_data.get('rvol', 0) > 1.5
     ):
-        breakdown['volume'] = '0 (Объем есть, но 1H структура Q<90)'
+        breakdown['volume'] = f"0 ({_rvol_text(context_structure_data)} есть, но 1H структура {_quality_text(context_structure_data)} < Q90)"
     elif not is_sfp_aligned and is_trigger_aligned and trigger_volume_score > 0:
         score += trigger_volume_score
         if trigger_volume_score == 10:
-            breakdown['volume'] = '+10 (Объем на 15m триггере с POI/SFP confirmation)'
+            breakdown['volume'] = f"+10 (15m trigger volume с POI/SFP: {_rvol_text(trigger_structure_data)}, {_quality_text(trigger_structure_data)})"
         else:
-            breakdown['volume'] = '+5 (Объем на экстремальном 15m BOS без POI/SFP)'
+            breakdown['volume'] = f"+5 (15m BOS volume без POI/SFP: {_rvol_text(trigger_structure_data)}, {_quality_text(trigger_structure_data)})"
+    elif not is_sfp_aligned and is_trigger_aligned and _has_absorption_warning(trigger_structure_data):
+        breakdown['volume'] = f"0 ({_rvol_text(trigger_structure_data)} высокий на 15m, но possible absorption)"
     elif (
         not is_sfp_aligned
         and is_trigger_aligned
         and trigger_structure_data.get('rvol', 0) > 1.5
     ):
-        breakdown['volume'] = '0 (Объем есть, но 15m структура без POI/SFP и Q<90)'
+        breakdown['volume'] = f"0 ({_rvol_text(trigger_structure_data)} есть, но 15m структура без POI/SFP и {_quality_text(trigger_structure_data)} < Q90)"
     # Если на 15м нет, проверяем 1H контекст
     elif not is_sfp_aligned:
         if is_context_aligned and context_volume_score > 0:
             score += context_volume_score
-            breakdown['volume'] = f"+{context_volume_score} (Объем на 1H сломе с Q>=90)"
+            breakdown['volume'] = f"+{context_volume_score} (1H BOS volume: {_rvol_text(context_structure_data)}, {_quality_text(context_structure_data)})"
+        elif is_context_aligned and _has_absorption_warning(context_structure_data):
+            breakdown['volume'] = f"0 ({_rvol_text(context_structure_data)} высокий на 1H, но possible absorption)"
         elif is_context_aligned and context_structure_data.get('rvol', 0) > 1.5:
-            breakdown['volume'] = '0 (Объем есть, но 1H структура Q<90)'
+            breakdown['volume'] = f"0 ({_rvol_text(context_structure_data)} есть, но 1H структура {_quality_text(context_structure_data)} < Q90)"
 
     # 6. Макро-контекст (+10 баллов)
     if macro_data:
@@ -427,12 +529,35 @@ def calculate_setup_score(
         breakdown['macro'] = f"+{m_score} ({m_reason})" if m_score > 0 else f"0 ({m_reason})"
 
     raw_score = score
+    pd_shallow = pd_valid and _premium_discount_is_shallow(premium_discount_data)
+    scenario_valid = bool(
+        is_trigger_aligned
+        and confirmation_reason is not None
+        and (fvg_test_data is not None or sfp_data_in_window is not None)
+    )
+    breakdown['scenario'] = (
+        'OK (trigger + POI/SFP confirmation + FVG/SFP context)'
+        if scenario_valid
+        else 'WATCHLIST (нет полной SFP/POI -> trigger сценарной связки)'
+    )
 
     if not pd_valid:
         breakdown['premium_discount'] = (
             f"BLOCK ({_premium_discount_label(premium_discount_data)}, score {raw_score}->0)"
         )
         score = 0
+    elif score >= 70 and not scenario_valid:
+        breakdown['scenario'] = (
+            f"WATCHLIST (score {raw_score}->69: нет обязательного Scenario Gate для A+)"
+        )
+        score = 69
+    elif pd_shallow and score >= 70:
+        breakdown['premium_discount'] = (
+            f"WATCHLIST ({_premium_discount_label(premium_discount_data)}, shallow zone caps A+ {raw_score}->69)"
+        )
+        score = 69
+    else:
+        score = min(score, 100)
 
     # Определение итогового решения на основе суммы баллов
     decision = "Ignore"

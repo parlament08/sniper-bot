@@ -73,6 +73,17 @@ class TestDisplacementEngine(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertEqual(result.reason, 'Zero candle range')
 
+    def test_high_rvol_weak_body_returns_absorption_warning(self):
+        result = evaluate_displacement(
+            {'open': 100, 'high': 110, 'low': 99, 'close': 102, 'rvol': 2.5},
+            atr=4,
+            direction='bullish',
+        )
+
+        self.assertTrue(result.absorption_warning)
+        self.assertGreaterEqual(result.absorption_score, 70)
+        self.assertEqual(result.reason, 'High RVOL with weak body/close, possible absorption')
+
 
 if __name__ == '__main__':
     unittest.main()

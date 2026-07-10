@@ -49,9 +49,36 @@ class PremiumDiscountTest(unittest.TestCase):
         result = evaluate_premium_discount(101.0, self.swing_highs, self.swing_lows)
 
         self.assertEqual(result.zone, 'premium')
+        self.assertEqual(result.zone_depth, 'shallow')
         self.assertTrue(result.valid_for_sell)
         self.assertAlmostEqual(result.distance_from_equilibrium_percent, 1.0)
         self.assertAlmostEqual(result.distance_from_equilibrium_range_percent, 2.5)
+
+    def test_normal_discount_depth(self):
+        result = evaluate_premium_discount(90.0, self.swing_highs, self.swing_lows)
+
+        self.assertEqual(result.zone, 'discount')
+        self.assertEqual(result.zone_depth, 'normal')
+        self.assertEqual(result.zone_strength, 75.0)
+
+    def test_deep_discount_depth(self):
+        result = evaluate_premium_discount(84.0, self.swing_highs, self.swing_lows)
+
+        self.assertEqual(result.zone, 'discount')
+        self.assertEqual(result.zone_depth, 'deep')
+        self.assertEqual(result.zone_strength, 100.0)
+
+    def test_result_keeps_range_timeframe_metadata(self):
+        result = evaluate_premium_discount(
+            90.0,
+            self.swing_highs,
+            self.swing_lows,
+            range_timeframe='4H',
+            range_type='last_swing',
+        )
+
+        self.assertEqual(result.range_timeframe, '4H')
+        self.assertEqual(result.range_type, 'last_swing')
 
 
 if __name__ == '__main__':

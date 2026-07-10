@@ -30,7 +30,7 @@ class RiskSFPTierTest(unittest.TestCase):
 
         self.assertEqual(result['total_score'], 30)
         self.assertIn('+20 (SFP Q84 D0.46 R99', result['breakdown']['liquidity'])
-        self.assertEqual(result['breakdown']['volume'], '+10 (Подтверждение объемом на сильном SFP)')
+        self.assertEqual(result['breakdown']['volume'], '+10 (Сильный SFP volume confirmation: RVOL 2.00, Q84)')
 
     def test_medium_sfp_gets_reduced_liquidity_and_no_volume_bonus(self):
         result = self._score_with_sfp({
@@ -45,7 +45,7 @@ class RiskSFPTierTest(unittest.TestCase):
 
         self.assertEqual(result['total_score'], 10)
         self.assertIn('+10 (SFP Q70 D1.57 R64', result['breakdown']['liquidity'])
-        self.assertEqual(result['breakdown']['volume'], '0 (Объем есть, но SFP не strong-tier)')
+        self.assertEqual(result['breakdown']['volume'], '0 (RVOL 2.00 есть, но SFP не strong-tier: Q70)')
 
     def test_shallow_or_weak_rejection_sfp_gets_only_token_liquidity(self):
         shallow_result = self._score_with_sfp({
@@ -71,8 +71,39 @@ class RiskSFPTierTest(unittest.TestCase):
         self.assertEqual(weak_rejection_result['total_score'], 5)
         self.assertIn('+5 (SFP Q76 D0.09 R93', shallow_result['breakdown']['liquidity'])
         self.assertIn('+5 (SFP Q74 D0.87 R40', weak_rejection_result['breakdown']['liquidity'])
-        self.assertEqual(shallow_result['breakdown']['volume'], '0 (Объем есть, но SFP не strong-tier)')
-        self.assertEqual(weak_rejection_result['breakdown']['volume'], '0 (Объем есть, но SFP не strong-tier)')
+        self.assertEqual(shallow_result['breakdown']['volume'], '0 (RVOL 2.00 есть, но SFP не strong-tier: Q76)')
+        self.assertEqual(weak_rejection_result['breakdown']['volume'], '0 (RVOL 2.00 есть, но SFP не strong-tier: Q74)')
+
+    def test_sfp_liquidity_label_mentions_map_level_source(self):
+        result = self._score_with_sfp({
+            'type': 'bullish_sfp',
+            'index': 10,
+            'rvol': 2.0,
+            'quality_score': 82,
+            'liquidity_depth': 0.32,
+            'rejection_strength': 88,
+            'volume_confirmed': True,
+            'level_type': 'equal_lows',
+            'level_strength': 85.0,
+        })
+
+        self.assertIn('equal_lows S85', result['breakdown']['liquidity'])
+        self.assertIn('на equal_lows liquidity', result['breakdown']['liquidity'])
+
+    def test_absorption_warning_blocks_sfp_volume_bonus(self):
+        result = self._score_with_sfp({
+            'type': 'bullish_sfp',
+            'index': 10,
+            'rvol': 2.5,
+            'quality_score': 86,
+            'liquidity_depth': 0.46,
+            'rejection_strength': 91,
+            'volume_confirmed': False,
+            'absorption_warning': True,
+        })
+
+        self.assertEqual(result['total_score'], 20)
+        self.assertEqual(result['breakdown']['volume'], '0 (RVOL 2.50 высокий, но слабое закрытие / absorption warning)')
 
 
 if __name__ == '__main__':

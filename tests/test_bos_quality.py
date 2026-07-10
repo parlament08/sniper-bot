@@ -42,6 +42,7 @@ class BOSQualityTest(unittest.TestCase):
         self.assertGreaterEqual(result.quality_score, 80)
         self.assertGreater(result.displacement_ratio, 1.5)
         self.assertGreater(result.body_ratio, 0.75)
+        self.assertGreater(result.close_position, 0.8)
         self.assertTrue(result.volume_confirmed)
         self.assertTrue(result.close_confirmed)
         self.assertEqual(result.get('type'), 'bullish_bos')
@@ -92,6 +93,46 @@ class BOSQualityTest(unittest.TestCase):
 
         self.assertFalse(result.detected)
         self.assertFalse(result.hold_confirmed)
+
+    def test_ambiguous_structure_does_not_fallback_to_timestamp_direction(self):
+        swing_highs = pd.DataFrame(
+            {'high': [105.0, 105.0]},
+            index=[1, 7],
+        )
+        swing_lows = pd.DataFrame(
+            {'low': [95.0, 95.0]},
+            index=[2, 6],
+        )
+
+        result = detect_structure_break(
+            pd.Series({
+                'open': 104.2,
+                'high': 108.0,
+                'low': 104.0,
+                'close': 107.4,
+                'atr': 1.5,
+                'rvol': 2.1,
+            }, name=10),
+            swing_highs,
+            swing_lows,
+            right_bars=0,
+            config=self.config,
+        )
+
+        self.assertIsNone(result)
+
+    def test_poor_close_position_is_not_confirmed_as_bos(self):
+        result = self._detect({
+            'open': 107.4,
+            'high': 108.0,
+            'low': 104.0,
+            'close': 105.4,
+            'atr': 1.5,
+            'rvol': 2.1,
+        })
+
+        self.assertFalse(result.detected)
+        self.assertLess(result.close_position, self.config.min_close_position)
 
 
 if __name__ == '__main__':

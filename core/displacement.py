@@ -21,6 +21,8 @@ class DisplacementResult:
     momentum_score: float
     valid: bool
     reason: str
+    absorption_warning: bool
+    absorption_score: float
 
 
 def evaluate_displacement(
@@ -62,6 +64,13 @@ def evaluate_displacement(
         elif volume_ratio >= 1.2:
             score += 8
 
+    absorption_warning = bool(
+        volume_ratio is not None
+        and volume_ratio >= 2.0
+        and body_ratio < 0.35
+        and close_position < 0.55
+    )
+    absorption_score = _absorption_score(volume_ratio, body_ratio, close_position, absorption_warning)
     score = round(max(0.0, min(100.0, score)), 2)
     valid = score >= min_score
 
@@ -76,7 +85,9 @@ def evaluate_displacement(
         volume_ratio=volume_ratio,
         momentum_score=score,
         valid=valid,
-        reason=_reason(valid, resolved_direction, candle_range),
+        reason=_reason(valid, resolved_direction, candle_range, absorption_warning),
+        absorption_warning=absorption_warning,
+        absorption_score=absorption_score,
     )
 
 
@@ -113,11 +124,31 @@ def _close_position(direction: Direction, high: float, low: float, close: float,
     return max(0.0, min(1.0, value))
 
 
-def _reason(valid: bool, direction: Direction, candle_range: float) -> str:
+def _absorption_score(
+    volume_ratio: Optional[float],
+    body_ratio: float,
+    close_position: float,
+    absorption_warning: bool,
+) -> float:
+    if volume_ratio is None or volume_ratio < 2.0:
+        return 0.0
+
+    weak_body = max(0.0, min((0.35 - body_ratio) / 0.35, 1.0))
+    weak_close = max(0.0, min((0.55 - close_position) / 0.55, 1.0))
+    volume_pressure = max(0.0, min((volume_ratio - 2.0) / 1.0, 1.0))
+    score = (weak_body * 45) + (weak_close * 45) + (volume_pressure * 10)
+    if absorption_warning:
+        score = max(score, 70.0)
+    return round(max(0.0, min(100.0, score)), 2)
+
+
+def _reason(valid: bool, direction: Direction, candle_range: float, absorption_warning: bool = False) -> str:
     if candle_range <= 0:
         return "Zero candle range"
     if direction == "neutral":
         return "Neutral candle body"
+    if absorption_warning:
+        return "High RVOL with weak body/close, possible absorption"
     if valid:
         return "Strong displacement"
     return "Displacement score below threshold"

@@ -76,3 +76,25 @@
 [2026-07-04 20:15:13,154] INFO [sniper_bot.prepare_and_analyze:50] Анализ LTC...
 [2026-07-04 20:15:13,912] INFO [sniper_bot.prepare_and_analyze:50] Анализ DOT...
 [2026-07-04 20:15:14,965] INFO [sniper_bot.<module>:216] 💤 Ожидаю закрытия свечи. Следующий запуск в: 20:30:05
+[2026-07-10 11:12:36,206] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:12:44,038] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:13:19,514] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:19:57,097] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:20:02,910] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:24:21,785] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:25:10,032] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:25:17,770] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:33:45,441] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:37:21,839] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:41:15,394] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:48:17,311] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:48:51,982] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:49:15,310] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:49:22,882] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:55:45,195] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 11:59:25,539] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 12:05:16,868] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 12:09:06,084] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 12:10:09,349] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 12:10:47,629] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-10 12:11:17,648] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.

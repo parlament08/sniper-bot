@@ -167,7 +167,13 @@ def evaluate_trend(df: pd.DataFrame) -> Optional[Dict]:
         else:
             strength = 'flat' # Охватывает консолидации и глубокие контртрендовые откаты к POI
             
-        return {'is_bullish': is_bullish, 'strength': strength, 'adx_value': round(adx, 2)}
+        return {
+            'is_bullish': is_bullish,
+            'strength': strength,
+            'adx_value': round(adx, 2),
+            'p_di': round(p_di, 2),
+            'n_di': round(n_di, 2),
+        }
     except (ValueError, TypeError) as e:
         logger.error(f"Ошибка конвертации данных при оценке тренда: {e}")
         return None

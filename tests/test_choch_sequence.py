@@ -2,10 +2,22 @@ import unittest
 
 import pandas as pd
 
-from core.structure import CHoCHResult, detect_structure_break
+from core.structure import CHoCHResult, _sequence_matches_order, _sequence_score, detect_structure_break
 
 
 class CHoCHSequenceTest(unittest.TestCase):
+    def test_sequence_order_must_match_required_choch_path(self):
+        dirty_labels = ('HH', 'LL', 'HL', 'LH')
+
+        self.assertFalse(_sequence_matches_order(dirty_labels, ('HH', 'HL', 'LL', 'LH')))
+        self.assertLess(_sequence_score(dirty_labels, ('HH', 'HL', 'LL', 'LH')), 100)
+
+    def test_sequence_order_accepts_classic_bearish_path(self):
+        labels = ('H', 'L', 'HH', 'HL', 'LL', 'LH')
+
+        self.assertTrue(_sequence_matches_order(labels, ('HH', 'HL', 'LL', 'LH')))
+        self.assertEqual(_sequence_score(labels, ('HH', 'HL', 'LL', 'LH')), 100)
+
     def test_single_break_against_bullish_structure_is_not_choch(self):
         swing_highs = pd.DataFrame({'high': [100.0, 110.0]}, index=[1, 3])
         swing_lows = pd.DataFrame({'low': [90.0, 100.0]}, index=[2, 4])
@@ -48,8 +60,8 @@ class CHoCHSequenceTest(unittest.TestCase):
         self.assertIn('LH', result.swing_sequence)
 
     def test_classic_bullish_choch_requires_sequence_confirmation(self):
-        swing_highs = pd.DataFrame({'high': [110.0, 105.0, 115.0]}, index=[1, 4, 6])
-        swing_lows = pd.DataFrame({'low': [100.0, 90.0, 95.0]}, index=[2, 5, 7])
+        swing_highs = pd.DataFrame({'high': [110.0, 105.0, 115.0]}, index=[3, 5, 7])
+        swing_lows = pd.DataFrame({'low': [100.0, 90.0, 95.0]}, index=[2, 4, 8])
         candle = pd.Series({
             'open': 112.0,
             'high': 119.0,
@@ -57,7 +69,7 @@ class CHoCHSequenceTest(unittest.TestCase):
             'close': 117.5,
             'atr': 3.0,
             'rvol': 2.0,
-        }, name=8)
+        }, name=9)
 
         result = detect_structure_break(candle, swing_highs, swing_lows, right_bars=0)
 

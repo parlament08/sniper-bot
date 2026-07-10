@@ -99,11 +99,80 @@ class RiskPremiumDiscountTest(unittest.TestCase):
                 valid_for_sell=False,
                 reason='test',
                 distance_from_equilibrium_range_percent=2.4,
+                range_timeframe='4H',
+                zone_depth='shallow',
+                zone_strength=35.0,
             ),
         )
 
+        self.assertIn('4H discount shallow', result['breakdown']['premium_discount'])
         self.assertIn('-0.16% от EQ', result['breakdown']['premium_discount'])
         self.assertIn('2.40% range', result['breakdown']['premium_discount'])
+        self.assertIn('S35', result['breakdown']['premium_discount'])
+
+    def test_shallow_premium_discount_caps_a_plus_to_watchlist(self):
+        result = calculate_setup_score(
+            trade_direction='long',
+            current_price=100.0,
+            trend_data={'is_bullish': True, 'strength': 'strong'},
+            context_structure_data={
+                'type': 'bullish_bos',
+                'index': 8,
+                'rvol': 2.0,
+                'quality_score': 95,
+                'displacement_ratio': 1.8,
+                'body_ratio': 0.82,
+            },
+            trigger_structure_data={
+                'type': 'bullish_bos',
+                'index': 10,
+                'rvol': 2.0,
+                'quality_score': 95,
+                'displacement_ratio': 1.8,
+                'body_ratio': 0.82,
+            },
+            sfp_data_in_window={
+                'type': 'bullish_sfp',
+                'index': 9,
+                'quality_score': 84,
+                'liquidity_depth': 0.46,
+                'rejection_strength': 90,
+                'volume_confirmed': True,
+                'rvol': 2.0,
+            },
+            fvg_test_data={'index': 10},
+            fvg_data=[{
+                'type': 'bullish',
+                'top': 101.0,
+                'bottom': 99.0,
+                'quality_score': 92,
+                'tested': True,
+                'invalidated': False,
+                'age_bars': 3,
+                'retest_count': 1,
+            }],
+            macro_data={'score': 10, 'reason': 'test macro'},
+            premium_discount_data=PremiumDiscountResult(
+                zone='discount',
+                range_high=120,
+                range_low=80,
+                equilibrium=100,
+                price=96,
+                distance_from_equilibrium_percent=-4,
+                valid_for_buy=True,
+                valid_for_sell=False,
+                reason='test',
+                distance_from_equilibrium_range_percent=10,
+                range_timeframe='4H',
+                zone_depth='shallow',
+                zone_strength=35.0,
+            ),
+        )
+
+        self.assertGreaterEqual(result['raw_score'], 70)
+        self.assertEqual(result['total_score'], 69)
+        self.assertEqual(result['decision'], 'Watchlist')
+        self.assertIn('shallow zone caps A+', result['breakdown']['premium_discount'])
 
     def test_blocked_setup_still_exposes_component_sum_before_gate(self):
         result = calculate_setup_score(

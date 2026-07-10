@@ -11,6 +11,8 @@ class BOSConfig:
     min_quality_score: int = 70
     min_body_ratio: float = 0.55
     excellent_body_ratio: float = 0.85
+    min_close_position: float = 0.65
+    excellent_close_position: float = 0.9
     min_displacement_atr: float = 0.8
     excellent_displacement_atr: float = 1.8
     close_buffer_atr: float = 0.1
@@ -19,9 +21,10 @@ class BOSConfig:
     max_opposite_wick_ratio: float = 0.35
     hold_confirmation_bars: int = 0
     hold_buffer_atr: float = 0.0
-    body_score_weight: int = 20
+    body_score_weight: int = 15
     displacement_score_weight: int = 25
-    close_score_weight: int = 20
+    close_score_weight: int = 15
+    close_position_score_weight: int = 10
     volume_score_weight: int = 15
     wick_score_weight: int = 10
     hold_score_weight: int = 10
@@ -40,6 +43,9 @@ class SFPConfig:
     min_quality_score: int = 65
     min_liquidity_depth_atr: float = 0.08
     excellent_liquidity_depth_atr: float = 0.45
+    min_liquidity_level_strength: float = 35.0
+    candle_quality_weight: float = 0.65
+    level_quality_weight: float = 0.35
     min_rejection_atr: float = 0.15
     excellent_rejection_atr: float = 0.7
     min_displacement_atr: float = 0.2
@@ -72,6 +78,7 @@ class FVGConfig:
     age_score_weight: int = 10
     overlap_score_weight: int = 15
     retest_score_weight: int = 10
+    wick_violation_penalty: int = 25
 
 
 @dataclass(frozen=True)
@@ -103,6 +110,9 @@ class BOSResult:
     candle_range: float = 0.0
     opposite_wick_ratio: float = 0.0
     hold_confirmed: bool = True
+    close_position: float = 0.0
+    absorption_warning: bool = False
+    absorption_score: float = 0.0
 
     def __bool__(self) -> bool:
         return self.detected
@@ -139,6 +149,8 @@ class CHoCHResult:
     opposite_wick_ratio: float = 0.0
     hold_confirmed: bool = True
     swing_sequence: Tuple[str, ...] = ()
+    absorption_warning: bool = False
+    absorption_score: float = 0.0
 
     @property
     def detected(self) -> bool:
@@ -183,6 +195,16 @@ class SFPResult:
     displacement_ratio: float = 0.0
     opposite_wick_ratio: float = 0.0
     hold_confirmed: bool = True
+    swept: bool = True
+    rejection_wick_ratio: float = 0.0
+    level_type: Optional[str] = None
+    level_strength: float = 0.0
+    level_touches: int = 0
+    level_age_bars: int = 0
+    level_distance_atr: float = 0.0
+    level_swept: bool = False
+    absorption_warning: bool = False
+    absorption_score: float = 0.0
 
     def __bool__(self) -> bool:
         return self.detected
@@ -222,6 +244,10 @@ class FVGResult:
     volume_confirmed: bool = False
     retest_depth: float = 0.0
     retest_count: int = 0
+    wick_violated: bool = False
+    close_invalidated: bool = False
+    absorption_warning: bool = False
+    absorption_score: float = 0.0
 
     def __bool__(self) -> bool:
         return self.detected and not self.invalidated
@@ -479,12 +505,18 @@ def find_fvg(
         )
         displacement_ratio = displacement.atr_ratio
         size_atr_ratio = fvg_size / atr
-        volume_confirmed = displacement.volume_ratio is not None and displacement.volume_ratio >= config.min_rvol
+        volume_confirmed = (
+            displacement.volume_ratio is not None
+            and displacement.volume_ratio >= config.min_rvol
+            and not displacement.absorption_warning
+        )
         age_bars = len(df) - pos - 1
 
         if future_candles.empty or fvg_size <= 0:
             tested = False
             invalidated = False
+            wick_violated = False
+            close_invalidated = False
             overlap_percent = 0
             retest_depth = 0.0
             retest_count = 0
@@ -494,7 +526,9 @@ def find_fvg(
             deepest_price = _safe_float(future_candles['low'].min(), top)
             retest_depth = max(0.0, min((top - deepest_price) / fvg_size, 1.0))
             overlap_percent = round(retest_depth * 100)
-            invalidated = bool((future_candles['low'] <= bottom).any() or (future_candles['close'] < bottom).any())
+            wick_violated = bool((future_candles['low'] <= bottom).any())
+            close_invalidated = bool((future_candles['close'] < bottom).any())
+            invalidated = close_invalidated
             retest_count = _count_retests(touch_mask)
         else:
             touch_mask = (future_candles['high'] >= bottom) & (future_candles['low'] <= top)
@@ -502,7 +536,9 @@ def find_fvg(
             deepest_price = _safe_float(future_candles['high'].max(), bottom)
             retest_depth = max(0.0, min((deepest_price - bottom) / fvg_size, 1.0))
             overlap_percent = round(retest_depth * 100)
-            invalidated = bool((future_candles['high'] >= top).any() or (future_candles['close'] > top).any())
+            wick_violated = bool((future_candles['high'] >= top).any())
+            close_invalidated = bool((future_candles['close'] > top).any())
+            invalidated = close_invalidated
             retest_count = _count_retests(touch_mask)
 
         size_score = _score_ratio(size_atr_ratio, min_size_atr_ratio, config.excellent_size_atr, config.size_score_weight)
@@ -522,10 +558,11 @@ def find_fvg(
             + _age_score(age_bars)
             + overlap_score
             + retest_score
+            - (config.wick_violation_penalty if wick_violated and not close_invalidated else 0)
         )
         quality_score = max(0, min(100, quality_score))
 
-        if invalidated or overlap_percent >= 100:
+        if close_invalidated:
             quality_score = config.invalid_quality_score
             invalidated = True
 
@@ -547,6 +584,10 @@ def find_fvg(
             volume_confirmed=volume_confirmed,
             retest_depth=round(retest_depth, 4),
             retest_count=retest_count,
+            wick_violated=wick_violated,
+            close_invalidated=close_invalidated,
+            absorption_warning=displacement.absorption_warning,
+            absorption_score=displacement.absorption_score,
         )
     
     is_bullish_fvg = (df['low'] > df['high'].shift(2))
@@ -662,8 +703,21 @@ def _sequence_score(sequence_labels: Tuple[str, ...], required_labels: Tuple[str
     if not sequence_labels:
         return 0
 
-    matched = sum(1 for label in required_labels if label in sequence_labels)
+    matched = 0
+    search_from = 0
+    for required_label in required_labels:
+        try:
+            found_at = sequence_labels.index(required_label, search_from)
+        except ValueError:
+            continue
+        matched += 1
+        search_from = found_at + 1
+
     return round((matched / len(required_labels)) * 100)
+
+
+def _sequence_matches_order(sequence_labels: Tuple[str, ...], required_order: Tuple[str, ...]) -> bool:
+    return _sequence_score(sequence_labels, required_order) == 100
 
 
 def _build_choch_result(
@@ -704,6 +758,8 @@ def _build_choch_result(
         opposite_wick_ratio=base_result.opposite_wick_ratio,
         hold_confirmed=base_result.hold_confirmed,
         swing_sequence=sequence_labels,
+        absorption_warning=base_result.absorption_warning,
+        absorption_score=base_result.absorption_score,
     )
 
 
@@ -748,10 +804,11 @@ def _detect_confirmed_choch(
         )
         sequence_labels = _labels_between(swing_points, h_prev2_idx, h_last_idx)
         sequence_score = _sequence_score(sequence_labels, ('HH', 'HL', 'LL', 'LH'))
+        sequence_valid = _sequence_matches_order(sequence_labels, ('HH', 'HL', 'LL', 'LH'))
         return _build_choch_result(
             base_result,
             'bearish_choch',
-            sequence_score == 100,
+            sequence_valid,
             sequence_score,
             sequence_labels,
             choch_config,
@@ -778,10 +835,11 @@ def _detect_confirmed_choch(
         )
         sequence_labels = _labels_between(swing_points, l_prev2_idx, l_last_idx)
         sequence_score = _sequence_score(sequence_labels, ('LL', 'LH', 'HH', 'HL'))
+        sequence_valid = _sequence_matches_order(sequence_labels, ('LL', 'LH', 'HH', 'HL'))
         return _build_choch_result(
             base_result,
             'bullish_choch',
-            sequence_score == 100,
+            sequence_valid,
             sequence_score,
             sequence_labels,
             choch_config,
@@ -836,6 +894,14 @@ def _check_sfp_hold_confirmation(
     return bool((closes >= level - buffer).all())
 
 
+def _level_value(level: Optional[Any], key: str, default: Any = None) -> Any:
+    if level is None:
+        return default
+    if isinstance(level, dict):
+        return level.get(key, default)
+    return getattr(level, key, default)
+
+
 def _build_sfp_result(
     candle: pd.Series,
     struct_type: str,
@@ -843,6 +909,7 @@ def _build_sfp_result(
     level: float,
     future_candles: Optional[pd.DataFrame],
     config: SFPConfig,
+    liquidity_level: Optional[Any] = None,
 ) -> SFPResult:
     candle_open = _safe_float(candle.get('open'))
     candle_high = _safe_float(candle.get('high'))
@@ -879,7 +946,11 @@ def _build_sfp_result(
     displacement_ratio = displacement.atr_ratio
     close_position = displacement.close_position
     opposite_wick_ratio = opposite_wick / candle_range if candle_range > 0 else 1.0
-    volume_confirmed = displacement.volume_ratio is not None and displacement.volume_ratio >= config.min_rvol
+    volume_confirmed = (
+        displacement.volume_ratio is not None
+        and displacement.volume_ratio >= config.min_rvol
+        and not displacement.absorption_warning
+    )
     hold_confirmed = _check_sfp_hold_confirmation(direction, level, atr, future_candles, config)
 
     depth_score = _score_ratio(
@@ -902,7 +973,7 @@ def _build_sfp_result(
         config.displacement_score_weight,
     )
 
-    quality_score = round(
+    candle_quality_score = round(
         depth_score
         + rejection_score
         + close_position_score
@@ -911,7 +982,24 @@ def _build_sfp_result(
         + (config.volume_score_weight if volume_confirmed else 0)
         + (config.hold_score_weight if hold_confirmed else 0)
     )
-    quality_score = max(0, min(100, quality_score))
+    candle_quality_score = max(0, min(100, candle_quality_score))
+
+    level_type = _level_value(liquidity_level, 'type')
+    level_strength = float(_level_value(liquidity_level, 'strength', 0.0) or 0.0)
+    level_touches = int(_level_value(liquidity_level, 'touches', 0) or 0)
+    level_age_bars = int(_level_value(liquidity_level, 'age_bars', 0) or 0)
+    level_distance_atr = float(_level_value(liquidity_level, 'distance_atr', 0.0) or 0.0)
+    level_swept = bool(_level_value(liquidity_level, 'swept', False))
+
+    quality_score = candle_quality_score
+    level_is_usable = True
+    if liquidity_level is not None:
+        level_is_usable = (not level_swept) and level_strength >= config.min_liquidity_level_strength
+        quality_score = round(
+            candle_quality_score * config.candle_quality_weight
+            + level_strength * config.level_quality_weight
+        )
+        quality_score = max(0, min(100, quality_score))
 
     rejection_strength = round(
         _score_ratio(return_inside_ratio, config.min_rejection_atr, config.excellent_rejection_atr, 60)
@@ -926,6 +1014,7 @@ def _build_sfp_result(
         return_inside_ratio >= config.min_rejection_atr,
         opposite_wick_ratio <= config.max_opposite_wick_ratio,
         hold_confirmed,
+        level_is_usable,
         quality_score >= config.min_quality_score,
     ])
 
@@ -944,6 +1033,16 @@ def _build_sfp_result(
         displacement_ratio=round(displacement_ratio, 4),
         opposite_wick_ratio=round(opposite_wick_ratio, 4),
         hold_confirmed=hold_confirmed,
+        swept=close_returned_inside,
+        rejection_wick_ratio=round(rejection_ratio, 4),
+        level_type=level_type,
+        level_strength=round(level_strength, 2),
+        level_touches=level_touches,
+        level_age_bars=level_age_bars,
+        level_distance_atr=round(level_distance_atr, 4),
+        level_swept=level_swept,
+        absorption_warning=displacement.absorption_warning,
+        absorption_score=displacement.absorption_score,
     )
 
 
@@ -972,6 +1071,7 @@ def _build_bos_result(
     candle_range = displacement.candle_range
     body_ratio = displacement.body_ratio
     displacement_ratio = displacement.atr_ratio
+    close_position = displacement.close_position
     close_buffer = atr * config.close_buffer_atr if atr > 0 else 0.0
 
     if direction == 'bullish':
@@ -984,7 +1084,11 @@ def _build_bos_result(
         close_distance = max(level - candle_close, 0.0)
 
     opposite_wick_ratio = opposite_wick / candle_range if candle_range > 0 else 1.0
-    volume_confirmed = displacement.volume_ratio is not None and displacement.volume_ratio >= config.min_rvol
+    volume_confirmed = (
+        displacement.volume_ratio is not None
+        and displacement.volume_ratio >= config.min_rvol
+        and not displacement.absorption_warning
+    )
     hold_confirmed = _check_hold_confirmation(direction, level, atr, future_candles, config)
 
     close_score = 0.0
@@ -1007,6 +1111,12 @@ def _build_bos_result(
             config.displacement_score_weight,
         )
         + close_score
+        + _score_ratio(
+            close_position,
+            config.min_close_position,
+            config.excellent_close_position,
+            config.close_position_score_weight,
+        )
         + (config.volume_score_weight if volume_confirmed else 0)
         + (config.wick_score_weight if opposite_wick_ratio <= config.max_opposite_wick_ratio else 0)
         + (config.hold_score_weight if hold_confirmed else 0)
@@ -1017,6 +1127,7 @@ def _build_bos_result(
         close_confirmed,
         body_ratio >= config.min_body_ratio,
         displacement_ratio >= config.min_displacement_atr,
+        close_position >= config.min_close_position,
         opposite_wick_ratio <= config.max_opposite_wick_ratio,
         hold_confirmed,
         quality_score >= config.min_quality_score,
@@ -1037,6 +1148,9 @@ def _build_bos_result(
         candle_range=round(candle_range, 8),
         opposite_wick_ratio=round(opposite_wick_ratio, 4),
         hold_confirmed=hold_confirmed,
+        close_position=round(close_position, 4),
+        absorption_warning=displacement.absorption_warning,
+        absorption_score=displacement.absorption_score,
     )
 
 
@@ -1104,7 +1218,7 @@ def detect_structure_break(
     is_bearish_struct = is_making_lower_lows or (is_making_lower_highs and not is_making_higher_lows)
 
     if not is_bullish_struct and not is_bearish_struct:
-        is_bullish_struct = last_h1.name > last_l1.name
+        return None
 
     # 3. КЛАССИФИКАЦИЯ ПРОБОЯ
     if close_price > level_high:
@@ -1190,3 +1304,81 @@ def detect_sfp(
         return result if result else None
         
     return None
+
+
+def _liquidity_level_side(level: Any, candle_close: float) -> str:
+    level_type = str(_level_value(level, 'type', ''))
+    if level_type in ('equal_highs', 'buy_side', 'old_high'):
+        return 'buy_side'
+    if level_type in ('equal_lows', 'sell_side', 'old_low'):
+        return 'sell_side'
+    price = float(_level_value(level, 'price', 0.0) or 0.0)
+    return 'buy_side' if price > candle_close else 'sell_side'
+
+
+def detect_sfp_against_liquidity_levels(
+    last_closed_candle: pd.Series,
+    liquidity_levels: Optional[List[Any]],
+    config: Optional[SFPConfig] = None,
+    future_candles: Optional[pd.DataFrame] = None,
+) -> Optional[SFPResult]:
+    """
+    Ищет SFP против свежих уровней Liquidity Map.
+    Функция ожидает карту, построенную только на свечах ДО проверяемой свечи.
+    """
+    config = config or SFPConfig()
+    if not liquidity_levels:
+        return None
+
+    candle_high = _safe_float(last_closed_candle.get('high'))
+    candle_low = _safe_float(last_closed_candle.get('low'))
+    candle_close = _safe_float(last_closed_candle.get('close'))
+    candidates: List[SFPResult] = []
+
+    for level_data in liquidity_levels:
+        if bool(_level_value(level_data, 'swept', False)):
+            continue
+        if float(_level_value(level_data, 'strength', 0.0) or 0.0) < config.min_liquidity_level_strength:
+            continue
+
+        level = float(_level_value(level_data, 'price', 0.0) or 0.0)
+        side = _liquidity_level_side(level_data, candle_close)
+
+        if side == 'buy_side' and candle_high > level and candle_close < level:
+            result = _build_sfp_result(
+                last_closed_candle,
+                'bearish_sfp',
+                'bearish',
+                level,
+                future_candles,
+                config,
+                liquidity_level=level_data,
+            )
+            if result:
+                candidates.append(result)
+
+        if side == 'sell_side' and candle_low < level and candle_close > level:
+            result = _build_sfp_result(
+                last_closed_candle,
+                'bullish_sfp',
+                'bullish',
+                level,
+                future_candles,
+                config,
+                liquidity_level=level_data,
+            )
+            if result:
+                candidates.append(result)
+
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda item: (
+            item.quality_score,
+            item.level_strength,
+            item.rejection_strength,
+            item.liquidity_depth,
+        ),
+    )

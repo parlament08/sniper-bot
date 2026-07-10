@@ -1,7 +1,6 @@
-version: '3.8'
-
 services:
   analyzer:
+    image: sniper-bot:local
     build: .
     container_name: sniper_analyzer
     restart: unless-stopped
@@ -13,6 +12,7 @@ services:
     command: python -u analyzer.py
 
   listener:
+    image: sniper-bot:local
     build: .
     container_name: sniper_listener
     restart: unless-stopped
