@@ -79,7 +79,7 @@ class RiskFVGQualityTest(unittest.TestCase):
         })
 
         self.assertEqual(result['total_score'], 0)
-        self.assertEqual(result['breakdown']['fvg'], '0 (Зона пробита телом после теста)')
+        self.assertEqual(result['breakdown']['fvg'], '0 (FVG close invalidated после retest)')
 
 
 if __name__ == '__main__':

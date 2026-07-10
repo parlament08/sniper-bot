@@ -201,6 +201,41 @@ def _premium_discount_is_shallow(premium_discount_data) -> bool:
     return _pd_get(premium_discount_data, 'zone_depth') == 'shallow'
 
 
+def _infer_no_trade_reason(
+    *,
+    pd_valid: bool,
+    pd_shallow: bool,
+    is_with_trend: Optional[bool],
+    is_context_aligned: bool,
+    is_trigger_aligned: bool,
+    confirmation_reason: Optional[str],
+    sfp_data_in_window: Optional[Dict],
+    fvg_test_data: Optional[Dict],
+    fvg_breakdown: str,
+    scenario_valid: bool,
+    score: int,
+) -> str:
+    if not pd_valid:
+        return "pd_block"
+    if is_with_trend is False:
+        return "countertrend"
+    if "пробита телом" in fvg_breakdown or "close invalidated" in fvg_breakdown:
+        return "fvg_invalid"
+    if not is_context_aligned and not is_trigger_aligned:
+        return "missing_structure"
+    if is_context_aligned and not is_trigger_aligned:
+        return "context_only"
+    if is_trigger_aligned and not confirmation_reason:
+        return "waiting_for_confirmation"
+    if not sfp_data_in_window and not fvg_test_data:
+        return "missing_sweep_or_poi"
+    if pd_shallow and score >= 40:
+        return "shallow_pd_zone"
+    if not scenario_valid:
+        return "incomplete_scenario"
+    return "low_score"
+
+
 def select_best_setup(long_score: Dict, short_score: Dict) -> tuple:
     long_total = long_score.get('total_score', 0)
     short_total = short_score.get('total_score', 0)
@@ -276,6 +311,7 @@ def calculate_setup_score(
     }
 
     pd_valid = True
+    is_with_trend = None
     if premium_discount_data:
         pd_valid = (
             _pd_get(premium_discount_data, 'valid_for_buy', False)
@@ -440,7 +476,7 @@ def calculate_setup_score(
             quality_text = f"Q{active_fvg.get('quality_score')}"
             age_text = f" age{active_fvg.get('age_bars')}"
             retest_text = f" retests{active_fvg.get('retest_count')}"
-            wick_text = ", wick violation penalty" if active_fvg.get('wick_violated') else ""
+            wick_text = ", wick violation only / Q penalty" if active_fvg.get('wick_violated') else ""
             if fvg_score > 0:
                 score += fvg_score
                 location_text = "цена внутри зоны" if active_fvg_inside else "свежий ретест, зона удержана"
@@ -448,7 +484,7 @@ def calculate_setup_score(
             else:
                 breakdown['fvg'] = f"0 (FVG {quality_text}{age_text}{retest_text} ниже quality tier{wick_text})"
         else:
-            breakdown['fvg'] = '0 (Зона пробита телом после теста)'
+            breakdown['fvg'] = '0 (FVG close invalidated после retest)'
 
     # 5. Объем (+10 баллов) - Привязан к триггерным паттернам (SFP/BOS)
     breakdown['volume'] = '0 (Нет подтверждения аномальным объемом)'
@@ -569,9 +605,38 @@ def calculate_setup_score(
     else:
         decision = "Ignore"
 
+    no_trade_reason = _infer_no_trade_reason(
+        pd_valid=pd_valid,
+        pd_shallow=pd_shallow,
+        is_with_trend=is_with_trend,
+        is_context_aligned=bool(is_context_aligned),
+        is_trigger_aligned=bool(is_trigger_aligned),
+        confirmation_reason=confirmation_reason,
+        sfp_data_in_window=sfp_data_in_window,
+        fvg_test_data=fvg_test_data,
+        fvg_breakdown=breakdown.get('fvg', ''),
+        scenario_valid=scenario_valid,
+        score=score,
+    )
+
+    diagnostics = {
+        'pd_valid': bool(pd_valid),
+        'pd_shallow': bool(pd_shallow),
+        'with_trend': bool(is_with_trend),
+        'context_structure_aligned': bool(is_context_aligned),
+        'trigger_structure_aligned': bool(is_trigger_aligned),
+        'trigger_confirmed': bool(confirmation_reason),
+        'sfp_present': bool(sfp_data_in_window),
+        'fvg_test_present': bool(fvg_test_data),
+        'scenario_valid': bool(scenario_valid),
+        'no_trade_reason': no_trade_reason,
+    }
+
     return {
         'raw_score': raw_score,
         'total_score': score,
         'decision': decision,
+        'no_trade_reason': no_trade_reason,
+        'diagnostics': diagnostics,
         'breakdown': breakdown
     }

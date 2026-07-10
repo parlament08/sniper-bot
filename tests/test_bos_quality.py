@@ -134,6 +134,29 @@ class BOSQualityTest(unittest.TestCase):
         self.assertFalse(result.detected)
         self.assertLess(result.close_position, self.config.min_close_position)
 
+    def test_unconfirmed_swing_inside_right_bars_is_not_used_for_break(self):
+        swing_highs = pd.DataFrame({'high': [100.0, 120.0, 105.0]}, index=[1, 4, 9])
+        swing_lows = pd.DataFrame({'low': [95.0, 90.0, 96.0]}, index=[2, 5, 8])
+        candle = pd.Series({
+            'open': 103.0,
+            'high': 107.0,
+            'low': 102.5,
+            'close': 106.5,
+            'atr': 2.0,
+            'rvol': 2.0,
+        }, name=10)
+
+        result = detect_structure_break(
+            candle,
+            swing_highs,
+            swing_lows,
+            right_bars=2,
+            timeframe_minutes=15,
+            config=BOSConfig(hold_confirmation_bars=0),
+        )
+
+        self.assertIsNone(result)
+
 
 if __name__ == '__main__':
     unittest.main()

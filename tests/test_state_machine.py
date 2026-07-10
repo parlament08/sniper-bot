@@ -225,6 +225,27 @@ class SniperStateMachineTest(unittest.TestCase):
         self.assertEqual(result.state, SniperState.SIGNAL_READY)
         self.assertTrue(result.signal_allowed)
 
+    def test_fvg_retest_without_displacement_is_not_signal_ready(self):
+        machine = SniperStateMachine(direction='bullish')
+        pd_result = self._premium_discount('discount', valid_for_buy=True, valid_for_sell=False)
+
+        result = machine.update(
+            events=[
+                SniperEvent.HTF_CONTEXT_CONFIRMED,
+                SniperEvent.POI_TOUCHED,
+                SniperEvent.LIQUIDITY_SWEEP_CONFIRMED,
+                SniperEvent.CHOCH_CONFIRMED,
+                SniperEvent.BOS_CONFIRMED,
+                SniperEvent.FVG_CREATED,
+                SniperEvent.FVG_RETESTED,
+            ],
+            current_bar=10,
+        )
+
+        self.assertEqual(result.state, SniperState.WAITING_FOR_DISPLACEMENT_CONFIRMATION)
+        self.assertFalse(result.signal_allowed)
+        self.assertEqual(result.missing_steps, [SniperEvent.DISPLACEMENT_CONFIRMED.value])
+
 
 if __name__ == '__main__':
     unittest.main()

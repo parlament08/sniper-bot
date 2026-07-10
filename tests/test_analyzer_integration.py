@@ -7,6 +7,7 @@ import pandas as pd
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
 
 import analyzer
+from core.risk_plan import RiskPlan
 from core.structure import MarketStructure
 
 
@@ -59,8 +60,201 @@ class AnalyzerIntegrationTest(unittest.TestCase):
             score_result, analysis_data = analyzer.prepare_and_analyze("BTC", {})
 
         self.assertIn(("BTC", "1h", 300), calls)
-        self.assertEqual(score_result["breakdown"]["liquidity_map"], "Buy: none | Sell: none | Strongest B/S: none / none")
+        self.assertEqual(score_result["breakdown"]["liquidity_map"], "BSL: none | SSL: none")
         self.assertIs(analysis_data["liquidity_map"], liquidity_map)
+
+    def test_analyze_symbol_snapshot_does_not_fetch_live_data(self):
+        liquidity_map = {
+            "nearest_buy_side": None,
+            "nearest_sell_side": None,
+            "strongest_buy_side": None,
+            "strongest_sell_side": None,
+        }
+
+        with patch("analyzer.fetch_candles", side_effect=AssertionError("snapshot must not fetch")), \
+            patch("analyzer.calculate_ema", side_effect=lambda df, period: pd.Series(100.0, index=df.index)), \
+            patch("analyzer.calculate_adx", side_effect=lambda df, period: pd.DataFrame({"adx": 25.0}, index=df.index)), \
+            patch("analyzer.calculate_atr", side_effect=lambda df, period: pd.Series(1.0, index=df.index)), \
+            patch("analyzer.calculate_rvol", side_effect=lambda df, period: pd.Series(1.0, index=df.index)), \
+            patch("analyzer.find_swings", side_effect=lambda df, left_bars=2, right_bars=2: self._swings(df)), \
+            patch("analyzer.build_liquidity_map", return_value=liquidity_map), \
+            patch(
+                "analyzer.evaluate_market_structure",
+                return_value=MarketStructure(trend="neutral", confidence=20, reason="test neutral"),
+            ):
+            score_result, analysis_data = analyzer.analyze_symbol_snapshot(
+                "BTC",
+                self._df(freq="4h"),
+                self._df(freq="1h"),
+                self._df(freq="15min"),
+                {},
+            )
+
+        self.assertEqual(score_result["total_score"], 0)
+        self.assertEqual(analysis_data["direction"], "NEUTRAL")
+
+    def test_prepare_calculates_rvol_on_direct_1h_candles(self):
+        rvol_time_steps = []
+
+        def fake_fetch(coin, timeframe, limit):
+            freq = "4h" if timeframe == "4h" else "1h" if timeframe == "1h" else "15min"
+            return self._df(freq=freq)
+
+        def fake_rvol(df, period):
+            rvol_time_steps.append(df.index[1] - df.index[0])
+            return pd.Series(1.0, index=df.index)
+
+        with patch("analyzer.fetch_candles", side_effect=fake_fetch), \
+            patch("analyzer.calculate_ema", side_effect=lambda df, period: pd.Series(100.0, index=df.index)), \
+            patch("analyzer.calculate_adx", side_effect=lambda df, period: pd.DataFrame({"adx": 25.0}, index=df.index)), \
+            patch("analyzer.calculate_atr", side_effect=lambda df, period: pd.Series(1.0, index=df.index)), \
+            patch("analyzer.calculate_rvol", side_effect=fake_rvol), \
+            patch("analyzer.find_swings", side_effect=lambda df, left_bars=2, right_bars=2: self._swings(df)), \
+            patch("analyzer.build_liquidity_map", return_value=None), \
+            patch(
+                "analyzer.evaluate_market_structure",
+                return_value=MarketStructure(trend="neutral", confidence=20, reason="test neutral"),
+            ):
+            analyzer.prepare_and_analyze("BTC", {})
+
+        self.assertIn(pd.Timedelta(hours=1), rvol_time_steps)
+        self.assertIn(pd.Timedelta(minutes=15), rvol_time_steps)
+
+    def test_prepare_caps_high_score_when_state_machine_gate_fails(self):
+        def fake_fetch(coin, timeframe, limit):
+            freq = "4h" if timeframe == "4h" else "1h" if timeframe == "1h" else "15min"
+            return self._df(freq=freq)
+
+        high_score = {
+            "raw_score": 92,
+            "total_score": 92,
+            "decision": "A+",
+            "breakdown": {
+                "trend": "+25",
+                "structure": "+30",
+                "liquidity": "+20",
+                "fvg": "+15",
+                "volume": "+10",
+                "macro": "0",
+                "premium_discount": "OK",
+            },
+            "diagnostics": {},
+        }
+        low_score = {
+            "raw_score": 0,
+            "total_score": 0,
+            "decision": "Ignore",
+            "breakdown": {},
+            "diagnostics": {},
+        }
+        blocked_state = type(
+            "BlockedState",
+            (),
+            {
+                "signal_allowed": False,
+                "state": type("State", (), {"value": "waiting_for_liquidity_sweep"})(),
+                "missing_steps": ["liquidity_sweep_confirmed"],
+            },
+        )()
+
+        with patch("analyzer.fetch_candles", side_effect=fake_fetch), \
+            patch("analyzer.calculate_ema", side_effect=lambda df, period: pd.Series(100.0, index=df.index)), \
+            patch("analyzer.calculate_adx", side_effect=lambda df, period: pd.DataFrame({"adx": 25.0}, index=df.index)), \
+            patch("analyzer.calculate_atr", side_effect=lambda df, period: pd.Series(1.0, index=df.index)), \
+            patch("analyzer.calculate_rvol", side_effect=lambda df, period: pd.Series(1.0, index=df.index)), \
+            patch("analyzer.find_swings", side_effect=lambda df, left_bars=2, right_bars=2: self._swings(df)), \
+            patch("analyzer.build_liquidity_map", return_value=None), \
+            patch("analyzer.detect_structure_break", return_value=None), \
+            patch("analyzer.find_fvg", return_value=[]), \
+            patch(
+                "analyzer.evaluate_market_structure",
+                return_value=MarketStructure(trend="bullish", confidence=80, reason="test bullish"),
+            ), \
+            patch("analyzer.calculate_setup_score", side_effect=[high_score.copy(), low_score.copy()]), \
+            patch("analyzer._state_machine_diagnostic", return_value=("waiting_for_liquidity_sweep C25", blocked_state)):
+            score_result, _ = analyzer.prepare_and_analyze("BTC", {})
+
+        self.assertEqual(score_result["total_score"], 69)
+        self.assertEqual(score_result["decision"], "Watchlist")
+        self.assertEqual(score_result["no_trade_reason"], "state_machine_block")
+
+    def test_prepare_caps_high_score_when_risk_plan_is_invalid(self):
+        def fake_fetch(coin, timeframe, limit):
+            freq = "4h" if timeframe == "4h" else "1h" if timeframe == "1h" else "15min"
+            return self._df(freq=freq)
+
+        high_score = {
+            "raw_score": 92,
+            "total_score": 92,
+            "decision": "A+",
+            "breakdown": {
+                "trend": "+25",
+                "structure": "+30",
+                "liquidity": "+20",
+                "fvg": "+15",
+                "volume": "+10",
+                "macro": "0",
+                "premium_discount": "OK",
+            },
+            "diagnostics": {},
+        }
+        low_score = {
+            "raw_score": 0,
+            "total_score": 0,
+            "decision": "Ignore",
+            "breakdown": {},
+            "diagnostics": {},
+        }
+        allowed_state = type(
+            "AllowedState",
+            (),
+            {
+                "signal_allowed": True,
+                "state": type("State", (), {"value": "signal_ready"})(),
+                "missing_steps": [],
+            },
+        )()
+        invalid_risk = RiskPlan(
+            direction="LONG",
+            entry=100.0,
+            stop_loss=98.0,
+            invalidation_level=98.2,
+            target_1=102.0,
+            target_2=None,
+            risk_per_unit=2.0,
+            rr_to_target_1=1.0,
+            rr_to_target_2=None,
+            stop_distance_percent=2.0,
+            entry_distance_from_poi_atr=0.1,
+            valid=False,
+            reason="RR to target 1 below minimum",
+            entry_model="fvg_midpoint",
+            stop_model="structural_invalidation",
+            target_model="nearest_liquidity",
+        )
+
+        with patch("analyzer.fetch_candles", side_effect=fake_fetch), \
+            patch("analyzer.calculate_ema", side_effect=lambda df, period: pd.Series(100.0, index=df.index)), \
+            patch("analyzer.calculate_adx", side_effect=lambda df, period: pd.DataFrame({"adx": 25.0}, index=df.index)), \
+            patch("analyzer.calculate_atr", side_effect=lambda df, period: pd.Series(1.0, index=df.index)), \
+            patch("analyzer.calculate_rvol", side_effect=lambda df, period: pd.Series(1.0, index=df.index)), \
+            patch("analyzer.find_swings", side_effect=lambda df, left_bars=2, right_bars=2: self._swings(df)), \
+            patch("analyzer.build_liquidity_map", return_value=None), \
+            patch("analyzer.detect_structure_break", return_value=None), \
+            patch("analyzer.find_fvg", return_value=[]), \
+            patch(
+                "analyzer.evaluate_market_structure",
+                return_value=MarketStructure(trend="bullish", confidence=80, reason="test bullish"),
+            ), \
+            patch("analyzer.calculate_setup_score", side_effect=[high_score.copy(), low_score.copy()]), \
+            patch("analyzer._state_machine_diagnostic", return_value=("signal_ready C100", allowed_state)), \
+            patch("analyzer.build_risk_plan", return_value=invalid_risk):
+            score_result, analysis_data = analyzer.prepare_and_analyze("BTC", {})
+
+        self.assertEqual(score_result["total_score"], 69)
+        self.assertEqual(score_result["decision"], "Watchlist")
+        self.assertEqual(score_result["no_trade_reason"], "risk_plan_block")
+        self.assertIs(analysis_data["risk_plan"], invalid_risk)
 
     def test_send_telegram_blocks_splits_long_dashboard_without_cutting_blocks(self):
         header = ["<b>header</b>", "macro"]
@@ -75,6 +269,54 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertIn("A" * 80, sent_messages[0])
         self.assertIn("B" * 80, sent_messages[1])
         self.assertIn("C" * 80, sent_messages[2])
+
+    def test_send_telegram_blocks_splits_oversized_single_block(self):
+        header = ["<b>header</b>"]
+        block = "\n".join(["line-" + ("A" * 70), "line-" + ("B" * 70), "line-" + ("C" * 70)])
+        sent_messages = []
+
+        with patch("analyzer.send_telegram_alert", side_effect=sent_messages.append):
+            analyzer.send_telegram_blocks(header, [block], max_length=120)
+
+        self.assertGreater(len(sent_messages), 1)
+        self.assertTrue(all(len(message) <= 120 for message in sent_messages))
+
+    def test_dashboard_block_shows_no_trade_reason_gates_and_sweep_label(self):
+        score_result = {
+            "total_score": 0,
+            "decision": "Ignore",
+            "no_trade_reason": "pd_block",
+            "diagnostics": {
+                "pd_valid": False,
+                "sfp_present": True,
+                "trigger_structure_aligned": False,
+                "fvg_test_present": False,
+            },
+            "breakdown": {
+                "trend": "+10 (test)",
+                "adx": "ADX 20.00 | weak/neutral",
+                "structure": "0 (Нет валидной структуры)",
+                "liquidity": "+20 (SFP Q80 D0.73 R86)",
+                "liquidity_map": "BSL: none | SSL: none",
+                "fvg": "0 (FVG close invalidated после retest)",
+                "volume": "0 (RVOL n/a)",
+                "premium_discount": "BLOCK (4H equilibrium shallow)",
+                "state_machine": "waiting_for_liquidity_sweep C20 (2/8, next: sweep)",
+                "macro": "0 (mixed)",
+            },
+        }
+        analysis_data = {
+            "direction": "LONG",
+            "trend_data": {"is_bullish": True, "adx_value": 20.0, "strength": "flat"},
+            "market_structure": MarketStructure(trend="bullish", confidence=55, reason="test"),
+        }
+
+        block = analyzer._build_dashboard_block("BTC", score_result, analysis_data, "Ignore", in_kz=True)
+
+        self.assertIn("NO TRADE — P/D block", block)
+        self.assertIn("Sweep/SFP", block)
+        self.assertIn("🚧 Gates:", block)
+        self.assertIn("P/D FAIL", block)
 
     def test_strong_reversal_context_requires_sfp_choch_and_bos(self):
         direction = analyzer._has_strong_reversal_context(

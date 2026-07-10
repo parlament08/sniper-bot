@@ -35,6 +35,82 @@
 
 Если есть только один сильный фактор, бот обычно оставляет `Ignore`.
 
+### Новый компактный Telegram-отчет
+
+Теперь отчет разделяет две вещи:
+
+```text
+Score = сколько баллов получил сетап.
+Diagnostics = что именно рынок уже показал и чего еще не хватает.
+```
+
+Пример:
+
+```text
+💎 ADA | NO TRADE — Context only | 40/100 | Ignore
+📊 4H: ВВЕРХ по EMA99 | +10 (...) | ADX 20.4
+⚙️ Structure: +10 (1H BOS Q95 DR1.61 BR0.88 only)
+💧 Sweep/SFP: 0
+📈 Volume: +5 (1H BOS volume: RVOL 1.72, Q95)
+🎯 FVG: 0 (FVG close invalidated после retest)
+⚖️ P/D: OK (4H discount normal...)
+🧭 Scenario: wait_sweep C35 (next: liquidity_sweep)
+🚧 Gates: KZ PASS | P/D PASS | Sweep FAIL | Trigger FAIL | FVG FAIL | SM WAIT | Macro MIXED
+```
+
+Как читать:
+
+| Строка | Что говорит |
+| --- | --- |
+| `NO TRADE — ...` | главная причина, почему нет сделки |
+| `Sweep/SFP` | был ли свежий захват ликвидности |
+| `Liq` | карта ближайшей buy-side / sell-side liquidity, если включен audit-режим |
+| `Scenario` | этап State Machine: чего ждет сценарий дальше |
+| `Gates` | обязательные фильтры, которые должны пройти до A+ |
+
+Важно:
+
+```text
+Не каждый найденный элемент должен давать баллы.
+Например, ближайшая ликвидность полезна для понимания карты,
+но сама по себе не является входом.
+```
+
+### Категории NO TRADE
+
+| Категория | Простыми словами |
+| --- | --- |
+| `Neutral HTF` | старший рынок неоднозначный |
+| `P/D block` | BUY в premium или SELL в discount / equilibrium |
+| `Countertrend` | сетап против 4H EMA99 |
+| `FVG invalid` | FVG пробит закрытием свечи |
+| `Missing structure` | нет BOS/CHoCH |
+| `Context only` | есть только 1H контекст, нет 15m триггера |
+| `Waiting confirmation` | есть триггер, но нет POI/SFP подтверждения |
+| `Missing sweep/POI` | нет свежего sweep или FVG/POI контекста |
+| `Scenario gate` | баллы есть, но State Machine последовательность не завершена |
+
+### FVG в отчете
+
+Теперь отчет различает:
+
+```text
+wick violation only / Q penalty
+```
+
+и:
+
+```text
+FVG close invalidated после retest
+```
+
+Разница важная:
+
+```text
+wick violation = цена проколола зону тенью, качество снижено;
+close invalidated = свеча закрылась за зоной, FVG больше не считается рабочим.
+```
+
 ## 2. Главные сокращения
 
 | Сокращение | Расшифровка | Простыми словами |
@@ -1380,10 +1456,51 @@ FVG может дать баллы как часть сценария.
 
 ### Macro
 
-Макро дает дополнительные баллы, если DXY/SPX/BTC.D подтверждают направление. Если есть рассинхрон или флэт:
+Макро дает дополнительные баллы, если DXY/SPX/BTC.D подтверждают направление.
+
+Важно:
+
+```text
+Макро не создает сделку само по себе.
+Price Action first, Macro second.
+```
+
+DXY/SPX теперь оцениваются не по одному последнему закрытию, а по 5-дневному bias:
+
+```text
+цена относительно EMA5
+изменение за несколько дней
+neutral threshold отдельно для DXY и SPX
+```
+
+Если данные DXY/SPX устарели или недоступны:
 
 ```text
 0
+```
+
+BTC.D:
+
+```text
+BTC.D unavailable -> N/A, macro 0
+BTC.D высокий для альтов -> 0, риск оттока ликвидности
+```
+
+Градация:
+
+| Фон | Баллы |
+| --- | --- |
+| clean risk-on для long | `+10` |
+| clean risk-off для short | `+10` |
+| частичная поддержка, один из DXY/SPX neutral | `+5` |
+| mixed / stale / unavailable | `0` |
+
+Пример mixed:
+
+```text
+DXY bearish поддерживает риск,
+SPX bearish давит на риск.
+Макро: 0 (смешанный фон)
 ```
 
 ## 18. Решение по итоговому score
@@ -1442,6 +1559,57 @@ Scenario: WATCHLIST (score 90->69: нет обязательного Scenario Ga
 Вне Kill Zone score >= 85 показывается как A+ WATCH ONLY.
 Это наблюдение, а не сигнал на сделку.
 ```
+
+### Kill Zone / Session
+
+Сессия считается через timezone:
+
+```text
+Europe/Chisinau
+```
+
+Больше нет ручного `UTC+3`, поэтому переход лето/зима учитывается автоматически.
+
+Kill Zone окна:
+
+| Session | Время |
+| --- | --- |
+| London KZ | `10:00 <= t < 12:00` |
+| New York KZ | `15:30 <= t < 18:00` |
+
+Граница окончания не включается:
+
+```text
+12:00 уже Outside KZ
+18:00 уже Outside KZ
+```
+
+Сессия теперь объект:
+
+```text
+SessionResult(
+    in_kill_zone=True,
+    session_name="New York",
+    local_time="16:15",
+    timezone="Europe/Chisinau",
+    minutes_to_session_end=105
+)
+```
+
+В отчете:
+
+```text
+Session: New York KZ (105m left)
+Session: ВНЕ KILL ZONE (next 30m)
+```
+
+Для настройки можно включить диагностику вне KZ:
+
+```text
+SEND_DIAGNOSTIC_OUTSIDE_KZ=true
+```
+
+Тогда HUNT dashboard будет приходить и вне Kill Zone, но A+ alert все равно не отправляется вне KZ.
 
 ## 19. Как бот думает по шагам
 
@@ -1529,6 +1697,8 @@ SELL находится в premium?
 
 ```text
 DXY/SPX/BTC.D помогают или мешают?
+Данные свежие?
+Фон clean, partial или mixed?
 ```
 
 ### Шаг 10. Проверить State Machine
@@ -1681,7 +1851,392 @@ State Machine: INVALIDATED.
 
 Если ответов мало, это не сетап.
 
-## 22. Самая короткая версия
+## 22. Risk Plan
+
+`RiskPlan` отвечает на вопрос:
+
+```text
+Даже если сетап найден, есть ли хорошая сделка по риску?
+```
+
+Это отдельный слой после score и State Machine.
+
+### Что считает RiskPlan
+
+| Поле | Что означает |
+| --- | --- |
+| `entry` | предполагаемая цена входа |
+| `stop_loss` | стоп |
+| `invalidation_level` | уровень, который ломает идею сделки |
+| `target_1` | первая логичная цель |
+| `target_2` | вторая цель, если есть |
+| `rr_to_target_1` | RR до первой цели |
+| `rr_to_target_2` | RR до второй цели |
+| `entry_model` | откуда взят вход |
+| `stop_model` | почему стоп стоит именно там |
+| `target_model` | почему цель выбрана именно там |
+| `late_entry` | не поздно ли входить |
+| `valid` | можно ли дать A+ по риску |
+
+### Entry
+
+Приоритет входа:
+
+```text
+1. FVG midpoint
+2. confirmation close, если цена еще рядом с FVG/POI
+3. reclaim level после SFP
+4. structure level fallback
+```
+
+Важно:
+
+```text
+BOS level больше не является основным entry по умолчанию.
+Это только fallback.
+```
+
+### Stop Loss
+
+Стоп теперь старается быть структурным:
+
+Для LONG:
+
+```text
+ниже sweep level / FVG bottom / structural invalidation
+```
+
+Для SHORT:
+
+```text
+выше sweep level / FVG top / structural invalidation
+```
+
+ATR используется как buffer, а не как единственная логика стопа.
+
+### Take Profit
+
+Цель берется из Liquidity Map:
+
+Для LONG:
+
+```text
+nearest buy-side liquidity
+strongest buy-side liquidity
+```
+
+Для SHORT:
+
+```text
+nearest sell-side liquidity
+strongest sell-side liquidity
+```
+
+Если реальной liquidity target нет, `3R fallback` может быть рассчитан, но A+ блокируется:
+
+```text
+no logical liquidity target
+```
+
+### RR-фильтр
+
+| Условие | Решение |
+| --- | --- |
+| `RR < 1.5` | RiskPlan invalid |
+| `1.5 <= RR < 2.0` | максимум Watchlist |
+| `RR >= 2.0` | риск допустим |
+
+### Late Entry
+
+Если цена уже ушла далеко от POI/FVG:
+
+```text
+late entry: price moved too far from POI
+```
+
+Такой сетап не должен уходить как A+.
+
+### В отчете
+
+Пример:
+
+```text
+🛡 Risk: OK (fvg_midpoint -> nearest_liquidity, T1 2.40R / T2 3.80R, SL 1.20%, Risk plan valid)
+```
+
+Или:
+
+```text
+🛡 Risk: WATCHLIST (RR to target 1 below minimum, score 92->69, T1 1.00R)
+```
+
+Главное правило:
+
+```text
+Score показывает качество сетапа.
+RiskPlan показывает качество сделки.
+```
+
+## 23. Research / Journal / Backtesting
+
+Система теперь умеет сохранять не только сигналы, но и все сканы.
+
+Главная идея:
+
+```text
+Telegram = для человека.
+Journal = для исследования и статистики.
+```
+
+### Scan Journal
+
+Каждый scan по каждой монете сохраняется в JSONL:
+
+```text
+data/journal/scans_YYYY-MM-DD.jsonl
+```
+
+Одна строка = один symbol scan.
+
+В журнал попадает:
+
+| Блок | Что сохраняется |
+| --- | --- |
+| `trend_4h` | EMA bias, ADX, +DI / -DI |
+| `market_structure_4h` | trend, confidence, reason |
+| `context_1h` | BOS/CHoCH context event |
+| `trigger_15m` | BOS/CHoCH trigger event |
+| `sfp` | sweep / SFP параметры |
+| `premium_discount` | zone, depth, range |
+| `liquidity_map` | nearest/strongest BSL/SSL |
+| `risk_plan` | entry, SL, TP, RR, valid/reason |
+| `diagnostics` | gates and no_trade_reason |
+| `breakdown` | score components |
+
+Журнал включен по умолчанию:
+
+```bash
+SCAN_JOURNAL_ENABLED=true
+```
+
+Отключить:
+
+```bash
+SCAN_JOURNAL_ENABLED=false
+```
+
+Для Docker путь журнала проброшен volume:
+
+```text
+./data:/app/data
+```
+
+После изменения `docker-compose.yml` нужно пересоздать контейнеры:
+
+```bash
+docker-compose up -d --build
+```
+
+Важно:
+
+```text
+/scan пишет scan journal.
+/alerts использует старый daily_alerts.py и не является research scan.
+```
+
+### Смотреть summary журнала
+
+```bash
+.venv/bin/python research/analyze_journal.py
+```
+
+Или конкретный файл:
+
+```bash
+.venv/bin/python research/analyze_journal.py data/journal/scans_2026-07-10.jsonl
+```
+
+Скрипт покажет:
+
+```text
+сколько строк
+какие symbols
+decision_counts
+no_trade_reason_counts
+средний score
+максимальный score
+score_by_symbol
+trend / neutral причины
+1H context и 15m trigger quality
+SFP strong/weak статистику
+P/D zone и shallow/deep статистику
+risk_plan valid/reason/RR
+state_machine_counts
+gates pass/fail
+```
+
+Как читать этот отчет:
+
+| Поле | Что означает |
+| --- | --- |
+| `no_trade_reason_counts` | главные причины, почему бот не дает сделку |
+| `features.market_structure_4h.trend_counts` | сколько раз 4H был bullish/bearish/neutral |
+| `features.context_1h.detected` | сколько 1H BOS/CHoCH контекстов найдено |
+| `features.trigger_15m.detected` | сколько 15m триггеров найдено |
+| `features.sfp.strong_tier` | сколько SFP прошли strong-tier |
+| `features.premium_discount.pd_valid_counts` | сколько сетапов прошли P/D фильтр |
+| `features.risk_plan.valid_counts` | сколько сделок имели нормальный entry/SL/TP/RR |
+| `gates.scenario_valid` | сколько сетапов прошли обязательную последовательность Sniper |
+| `state_machine_counts` | на каком этапе чаще всего ломается сценарий |
+
+Если почти все `Ignore`, сначала смотри:
+
+```text
+no_trade_reason_counts
+gates
+state_machine_counts
+features.market_structure_4h.reason_counts
+features.risk_plan.reason_counts
+```
+
+Например:
+
+```text
+scenario_valid=false 30/30
+trigger_confirmed=false 30/30
+neutral_htf 21/30
+```
+
+Это значит, что рынок может давать отдельные элементы,
+но полная последовательность Sniper еще не собрана.
+
+### Чистая snapshot-функция
+
+Для backtest добавлена чистая функция:
+
+```python
+analyze_symbol_snapshot(symbol, df_4h, df_1h, df_15m, macro_data)
+```
+
+Она:
+
+```text
+не отправляет Telegram
+не вызывает Gemini
+не использует глобальный last_alert_time
+не фетчит свечи сама
+возвращает score_result и analysis_data
+```
+
+`prepare_and_analyze()` осталась live-wrapper функцией:
+
+```text
+fetch candles -> analyze_symbol_snapshot(...)
+```
+
+### Trade Simulator
+
+Добавлен простой simulator:
+
+```python
+simulate_trade(
+    candles,
+    direction,
+    entry,
+    stop_loss,
+    target_1,
+    target_2=None,
+    max_bars=96,
+)
+```
+
+Правила:
+
+| Ситуация | Итог |
+| --- | --- |
+| TP раньше SL | win |
+| SL раньше TP | loss |
+| SL и TP в одной свече | conservative: SL first |
+| ни SL, ни TP до timeout | close at market |
+
+Simulator считает:
+
+```text
+gross_R
+net_R
+MAE
+MFE
+bars_held
+exit_reason
+```
+
+Важно:
+
+```text
+Это еще не полноценный годовой backtest.
+Это фундамент для paper research и будущего historical backtest.
+```
+
+## 24. Тесты и валидация
+
+Тесты разделены по смыслу:
+
+```text
+tests/
+```
+
+Это автоматические unit/integration тесты торговой логики.
+
+```text
+tools/
+```
+
+Это ручные диагностические скрипты.
+Они могут ходить в сеть, требовать ключи и тратить квоты.
+Их нельзя запускать как обычный test suite.
+
+### Что запускать для регрессии
+
+```bash
+.venv/bin/python -m unittest discover tests
+```
+
+Если в окружении установлен pytest:
+
+```bash
+.venv/bin/python -m pytest
+```
+
+`pytest.ini` ограничивает discovery папкой `tests`.
+
+### Что НЕ является unit-тестом
+
+Эти файлы вынесены из `tests/`:
+
+| Файл | Почему вынесен |
+| --- | --- |
+| `tools/check_gemini_models.py` | требует Gemini API |
+| `tools/check_gemini_models_stress.py` | делает реальные API-запросы и может тратить квоту |
+| `tools/run_score_engine_test.py` | live-полигон с реальными market data |
+| `tools/run_smc_engine_test.py` | live-полигон с реальными market data |
+
+### Новые regression guards
+
+| Тест | Что защищает |
+| --- | --- |
+| look-ahead swing test | swing внутри `right_bars` не используется для BOS |
+| direct 1H RVOL test | 1H RVOL считается по прямым 1H свечам, не из 15m RVOL |
+| State Machine gate test | высокий score не становится A+, если сценарий не завершен |
+| FVG retest without displacement | retest FVG без displacement не готовит сигнал |
+
+Главный принцип тестов:
+
+```text
+Правильный порядок событий -> сигнал может стать готовым.
+Нарушенный порядок или неполная цепочка -> NO TRADE / Watchlist.
+```
+
+## 25. Самая короткая версия
 
 ```text
 Neutral = не торгуем.
@@ -1695,6 +2250,9 @@ Premium = верхняя половина range, лучше для SELL.
 Discount = нижняя половина range, лучше для BUY.
 Equilibrium = середина range, слабая зона входа.
 State Machine = проверка правильной последовательности сценария.
+RiskPlan = проверка entry / SL / TP / RR.
+Journal = память всех решений системы.
+Trade Simulator = проверка исхода сделки по будущим свечам.
 Q = качество.
 DR = сила импульса относительно ATR.
 BR = чистота тела свечи.

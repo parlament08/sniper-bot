@@ -1,11 +1,11 @@
 import os
 import time
 import json
+import uuid
 import requests
 import pandas as pd
 import google.generativeai as genai
 from html import escape
-from datetime import time as dt_time
 from dotenv import load_dotenv
 
 from core.logger import logger
@@ -24,9 +24,12 @@ from core.structure import (
     find_swings,
 )
 from core.indicators import calculate_ema, calculate_atr, calculate_rvol, calculate_adx, evaluate_trend
+from core.journal import write_scan_record
 from core.liquidity import build_liquidity_map
 from core.premium_discount import evaluate_premium_discount
 from core.risk import calculate_setup_score, format_setup_direction, resolve_session_decision, select_best_setup
+from core.risk_plan import build_risk_plan
+from core.session import DEFAULT_TIMEZONE, evaluate_session, next_quarter_close
 from core.state_machine import SniperEvent, SniperStateMachine
 
 # Загружаем переменные окружения из .env файла
@@ -43,6 +46,9 @@ genai.configure(api_key=api_key)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TELEGRAM_MAX_MESSAGE_LENGTH = 3900
+SEND_DIAGNOSTIC_OUTSIDE_KZ = os.environ.get("SEND_DIAGNOSTIC_OUTSIDE_KZ", "false").lower() == "true"
+TELEGRAM_REPORT_DETAIL = os.environ.get("TELEGRAM_REPORT_DETAIL", "compact").lower()
+SCAN_JOURNAL_ENABLED = os.environ.get("SCAN_JOURNAL_ENABLED", "true").lower() == "true"
 
 A_PLUS_NARRATOR_INSTRUCTION = """
 Ты — профессиональный финансовый диктор. Оформи этот JSON с А+ сетапом в красивый HTML для Telegram с тегами <b> и <code>. Ничего не выдумывай от себя.
@@ -83,13 +89,38 @@ def send_telegram_blocks(header_lines, body_blocks, max_length=TELEGRAM_MAX_MESS
             projected_length = len("\n".join([header] + projected_blocks))
 
         if projected_length > max_length:
-            logger.warning("Dashboard block exceeds Telegram safe length; sending it as a standalone message.")
-            send_telegram_alert("\n".join([header, block]))
+            logger.warning("Dashboard block exceeds Telegram safe length; splitting it by lines.")
+            for chunk in _split_oversized_block(header, block, max_length):
+                send_telegram_alert(chunk)
             continue
 
         current_blocks.append(block)
 
     flush()
+
+
+def _split_oversized_block(header, block, max_length):
+    chunks = []
+    current_lines = []
+    for line in block.splitlines():
+        projected = "\n".join([header] + current_lines + [line])
+        if current_lines and len(projected) > max_length:
+            chunks.append("\n".join([header] + current_lines))
+            current_lines = [line]
+            continue
+
+        if not current_lines and len(projected) > max_length:
+            available = max(200, max_length - len(header) - 32)
+            for start in range(0, len(line), available):
+                chunks.append("\n".join([header, line[start:start + available]]))
+            current_lines = []
+            continue
+
+        current_lines.append(line)
+
+    if current_lines:
+        chunks.append("\n".join([header] + current_lines))
+    return chunks
 
 
 def _html_text(value):
@@ -137,7 +168,7 @@ def _format_liquidity_level(level):
     touches = _level_value(level, 'touches', 0)
     swept = _level_value(level, 'swept', False)
     state = 'swept' if swept else 'fresh'
-    return f"{level_type} {float(price):.4f} S{int(strength)} D{float(distance_atr):.2f}ATR T{touches} {state}"
+    return f"{level_type} {float(price):.4f} Q{int(strength)} D{float(distance_atr):.2f}ATR T{touches} {state}"
 
 
 def _format_liquidity_map(liquidity_map):
@@ -146,14 +177,221 @@ def _format_liquidity_map(liquidity_map):
 
     nearest_buy = _level_value(liquidity_map, 'nearest_buy_side')
     nearest_sell = _level_value(liquidity_map, 'nearest_sell_side')
-    strongest_buy = _level_value(liquidity_map, 'strongest_buy_side')
-    strongest_sell = _level_value(liquidity_map, 'strongest_sell_side')
 
     return (
-        f"Buy: {_format_liquidity_level(nearest_buy)} | "
-        f"Sell: {_format_liquidity_level(nearest_sell)} | "
-        f"Strongest B/S: {_format_liquidity_level(strongest_buy)} / {_format_liquidity_level(strongest_sell)}"
+        f"BSL: {_format_liquidity_level(nearest_buy)} | "
+        f"SSL: {_format_liquidity_level(nearest_sell)}"
     )
+
+
+NO_TRADE_REASON_LABELS = {
+    "neutral_htf": "Neutral HTF",
+    "pd_block": "P/D block",
+    "countertrend": "Countertrend",
+    "fvg_invalid": "FVG invalid",
+    "missing_structure": "Missing structure",
+    "context_only": "Context only",
+    "waiting_for_confirmation": "Waiting confirmation",
+    "missing_sweep_or_poi": "Missing sweep/POI",
+    "shallow_pd_zone": "Shallow P/D",
+    "incomplete_scenario": "Incomplete scenario",
+    "state_machine_block": "Scenario gate",
+    "risk_plan_block": "Risk plan",
+    "low_score": "Low score",
+}
+
+
+def _format_no_trade_reason(score_result):
+    reason = score_result.get('no_trade_reason') or score_result.get('diagnostics', {}).get('no_trade_reason')
+    return NO_TRADE_REASON_LABELS.get(reason, str(reason).replace('_', ' ').title() if reason else '')
+
+
+def _gate(value, pass_text='PASS', fail_text='FAIL'):
+    return pass_text if value else fail_text
+
+
+def _build_gates_summary(score_result, analysis_data, in_kz):
+    diagnostics = score_result.get('diagnostics', {})
+    state_text = str(score_result.get('breakdown', {}).get('state_machine', '0'))
+    state_ok = 'signal_ready' in state_text
+    macro_text = str(score_result.get('breakdown', {}).get('macro', '0'))
+    macro_state = 'PASS' if macro_text.startswith('+') else 'MIXED'
+    risk_plan = analysis_data.get('risk_plan')
+    risk_ok = bool(risk_plan and risk_plan.get('valid', False))
+    risk_state = 'PASS' if risk_ok else 'WAIT' if risk_plan is None else 'FAIL'
+
+    return (
+        f"KZ {_gate(in_kz)} | "
+        f"P/D {_gate(diagnostics.get('pd_valid', True))} | "
+        f"Sweep {_gate(diagnostics.get('sfp_present', False))} | "
+        f"Trigger {_gate(diagnostics.get('trigger_structure_aligned', False))} | "
+        f"FVG {_gate(diagnostics.get('fvg_test_present', False))} | "
+        f"SM {'PASS' if state_ok else 'WAIT'} | "
+        f"Risk {risk_state} | "
+        f"Macro {macro_state}"
+    )
+
+
+def _compact_state_text(state_text):
+    if not state_text or state_text == '0':
+        return '0'
+    return state_text.replace('waiting_for_', 'wait_').replace('liquidity_sweep', 'sweep')
+
+
+def _build_dashboard_block(coin, score_result, analysis_data, decision, in_kz):
+    total_score = score_result.get('total_score', 0)
+    breakdown = score_result.get('breakdown', {})
+    direction = analysis_data['direction']
+    setup_direction_text, setup_emoji = format_setup_direction(direction, total_score, decision)
+    reason_label = _format_no_trade_reason(score_result)
+    reason_suffix = f" — {reason_label}" if setup_direction_text == 'NO TRADE' and reason_label else ""
+
+    header = (
+        f"💎 <b>{_html_text(coin)}</b> | "
+        f"<b>{_html_text(setup_direction_text + reason_suffix)} {setup_emoji}</b> | "
+        f"<b>{total_score}/100</b> | {_html_text(decision)}"
+    )
+
+    trend_data = analysis_data.get('trend_data')
+    market_structure = analysis_data.get('market_structure')
+    bias_line = (
+        f"📊 4H: {_html_text(_format_bias(trend_data))} | "
+        f"{_html_text(breakdown.get('trend', '0'))} | "
+        f"{_html_text(breakdown.get('adx', _format_adx(trend_data)))}"
+    )
+    htf_structure_line = f"🧱 HTF: {_html_text(breakdown.get('htf_structure', _format_market_structure(market_structure)))}"
+    structure_line = f"⚙️ Structure: {_html_text(breakdown.get('structure', '0'))}"
+    liquidity_line = f"💧 Sweep/SFP: {_html_text(breakdown.get('liquidity', '0'))}"
+    liquidity_map_line = f"🗺 Liq: {_html_text(breakdown.get('liquidity_map', '0'))}"
+    fvg_line = f"🎯 FVG: {_html_text(breakdown.get('fvg', '0'))}"
+    volume_line = f"📈 Volume: {_html_text(breakdown.get('volume', '0'))}"
+    premium_discount_line = f"⚖️ P/D: {_html_text(breakdown.get('premium_discount', '0'))}"
+    risk_plan_line = f"🛡 Risk: {_html_text(breakdown.get('risk_plan', '0'))}"
+    state_machine_line = f"🧭 Scenario: {_html_text(_compact_state_text(breakdown.get('state_machine', '0')))}"
+    gates_line = f"🚧 Gates: {_html_text(_build_gates_summary(score_result, analysis_data, in_kz))}"
+    macro_line = f"🌍 Macro: {_html_text(breakdown.get('macro', '0'))}"
+    separator = "──────────────────"
+
+    lines = [
+        header,
+        bias_line,
+        structure_line,
+        liquidity_line,
+        fvg_line,
+        premium_discount_line,
+        risk_plan_line,
+        state_machine_line,
+        gates_line,
+        macro_line,
+    ]
+
+    if TELEGRAM_REPORT_DETAIL == "audit":
+        lines.insert(2, htf_structure_line)
+        lines.insert(5, liquidity_map_line)
+        lines.insert(7, volume_line)
+    else:
+        lines.insert(5, volume_line)
+
+    lines.append(separator)
+    return "\n".join(lines)
+
+
+def _format_risk_plan(risk_plan):
+    if not risk_plan:
+        return '0'
+    validity = 'OK' if risk_plan.get('valid') else 'BLOCK'
+    target_2 = risk_plan.get('target_2')
+    rr2_text = f" / T2 {risk_plan.get('rr_to_target_2'):.2f}R" if target_2 is not None and risk_plan.get('rr_to_target_2') is not None else ""
+    return (
+        f"{validity} ({risk_plan.get('entry_model')} -> {risk_plan.get('target_model')}, "
+        f"T1 {risk_plan.get('rr_to_target_1'):.2f}R{rr2_text}, "
+        f"SL {risk_plan.get('stop_distance_percent'):.2f}%, "
+        f"{risk_plan.get('reason')})"
+    )
+
+
+def _event_snapshot(event):
+    if not event:
+        return None
+    return {
+        'type': event.get('type'),
+        'index': str(event.get('index')) if event.get('index') is not None else None,
+        'level': event.get('level'),
+        'quality_score': event.get('quality_score'),
+        'confidence': event.get('confidence'),
+        'displacement_ratio': event.get('displacement_ratio'),
+        'body_ratio': event.get('body_ratio'),
+        'close_position': event.get('close_position'),
+        'rvol': event.get('rvol'),
+        'level_type': event.get('level_type'),
+        'level_strength': event.get('level_strength'),
+        'liquidity_depth': event.get('liquidity_depth'),
+        'rejection_strength': event.get('rejection_strength'),
+        'volume_confirmed': event.get('volume_confirmed'),
+        'absorption_warning': event.get('absorption_warning'),
+    }
+
+
+def _liquidity_level_snapshot(level):
+    if not level:
+        return None
+    return {
+        'type': _level_value(level, 'type'),
+        'price': _level_value(level, 'price'),
+        'strength': _level_value(level, 'strength'),
+        'touches': _level_value(level, 'touches'),
+        'age_bars': _level_value(level, 'age_bars'),
+        'distance_atr': _level_value(level, 'distance_atr'),
+        'swept': _level_value(level, 'swept'),
+    }
+
+
+def _build_scan_journal_record(run_id, timestamp, symbol, session, score_result, analysis_data, macro):
+    trend_data = analysis_data.get('trend_data') or {}
+    market_structure = analysis_data.get('market_structure')
+    liquidity_map = analysis_data.get('liquidity_map')
+    premium_discount = analysis_data.get('premium_discount_data')
+    risk_plan = analysis_data.get('risk_plan')
+    last_15m = analysis_data.get('last_closed_15m')
+
+    return {
+        'run_id': run_id,
+        'timestamp': timestamp,
+        'symbol': symbol,
+        'timeframes': {
+            '15m_last_closed': str(last_15m.name) if last_15m is not None else None,
+        },
+        'session': session.to_dict() if hasattr(session, 'to_dict') else session,
+        'decision': score_result.get('decision'),
+        'score': score_result.get('total_score'),
+        'raw_score': score_result.get('raw_score'),
+        'direction': analysis_data.get('direction'),
+        'no_trade_reason': score_result.get('no_trade_reason'),
+        'features': {
+            'trend_4h': {
+                'is_bullish': trend_data.get('is_bullish'),
+                'strength': trend_data.get('strength'),
+                'adx': trend_data.get('adx_value'),
+                'p_di': trend_data.get('p_di'),
+                'n_di': trend_data.get('n_di'),
+            },
+            'market_structure_4h': market_structure.to_dict() if hasattr(market_structure, 'to_dict') else market_structure,
+            'context_1h': _event_snapshot(analysis_data.get('context_break_1h')),
+            'trigger_15m': _event_snapshot(analysis_data.get('trigger_break_15m')),
+            'sfp': _event_snapshot(analysis_data.get('sfp_data')),
+            'premium_discount': premium_discount.to_dict() if hasattr(premium_discount, 'to_dict') else premium_discount,
+            'liquidity_map': {
+                'nearest_buy_side': _liquidity_level_snapshot(_level_value(liquidity_map, 'nearest_buy_side')),
+                'nearest_sell_side': _liquidity_level_snapshot(_level_value(liquidity_map, 'nearest_sell_side')),
+                'strongest_buy_side': _liquidity_level_snapshot(_level_value(liquidity_map, 'strongest_buy_side')),
+                'strongest_sell_side': _liquidity_level_snapshot(_level_value(liquidity_map, 'strongest_sell_side')),
+            },
+            'risk_plan': risk_plan.to_dict() if hasattr(risk_plan, 'to_dict') else risk_plan,
+        },
+        'diagnostics': score_result.get('diagnostics', {}),
+        'breakdown': score_result.get('breakdown', {}),
+        'macro': macro,
+    }
 
 
 def _build_liquidity_map_before_candle(
@@ -215,6 +453,12 @@ def _format_adx(trend_data):
     if p_di is not None and n_di is not None:
         di_text = f" +DI {float(p_di):.2f} / -DI {float(n_di):.2f}"
     return f"ADX {adx_value:.2f}{di_text} | {mode}"
+
+
+def _macro_price_text(value, suffix=''):
+    if value is None:
+        return 'N/A'
+    return f"{value}{suffix}"
 
 
 def _event_direction(event):
@@ -491,6 +735,10 @@ def prepare_and_analyze(coin, macro_context):
     df_1h = fetch_candles(coin, '1h', limit=300)
     df_15m = fetch_candles(coin, '15m', limit=300)
 
+    return analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context)
+
+
+def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
     if df_4h is None or df_1h is None or df_15m is None or len(df_4h) < 100 or len(df_1h) < 100 or len(df_15m) < 100:
         logger.warning(f"Недостаточно данных для {coin}.")
         return None, None
@@ -646,8 +894,22 @@ def prepare_and_analyze(coin, macro_context):
 
     if market_structure.trend == 'neutral' and not low_adx_override_direction:
         return {
+            'raw_score': 0,
             'total_score': 0,
             'decision': 'Ignore',
+            'no_trade_reason': 'neutral_htf',
+            'diagnostics': {
+                'pd_valid': False,
+                'pd_shallow': False,
+                'with_trend': False,
+                'context_structure_aligned': False,
+                'trigger_structure_aligned': False,
+                'trigger_confirmed': False,
+                'sfp_present': bool(sfp_data_in_window),
+                'fvg_test_present': False,
+                'scenario_valid': False,
+                'no_trade_reason': 'neutral_htf',
+            },
             'breakdown': {
                 'trend': f"0 (Neutral market: {market_structure.reason})",
                 'structure': '0 (Neutral market state)',
@@ -656,6 +918,7 @@ def prepare_and_analyze(coin, macro_context):
                 'volume': '0',
                 'macro': '0',
                 'premium_discount': '0',
+                'risk_plan': '0',
                 'liquidity_map': _format_liquidity_map(liquidity_map),
                 'state_machine': '0',
                 'htf_structure': _format_market_structure(market_structure),
@@ -665,8 +928,16 @@ def prepare_and_analyze(coin, macro_context):
             'trend_data': trend_data,
             'market_structure': market_structure,
             'structure_data': None,
+            'context_break_1h': context_break_1h,
+            'trigger_break_15m': trigger_break_15m,
+            'sfp_data': sfp_data_in_window,
+            'fvg_candidates': [],
+            'active_fvg': None,
+            'premium_discount_data': None,
             'liquidity_map': liquidity_map,
+            'risk_plan': None,
             'state_machine': None,
+            'session': None,
             'direction': 'NEUTRAL',
             'last_closed_15m': last_closed_15m,
         }
@@ -726,8 +997,22 @@ def prepare_and_analyze(coin, macro_context):
             final_score_result = _cap_low_adx_override(final_score_result, low_adx_override_direction)
         else:
             final_score_result = {
+                'raw_score': 0,
                 'total_score': 0,
                 'decision': 'Ignore',
+                'no_trade_reason': 'neutral_htf',
+                'diagnostics': {
+                    'pd_valid': False,
+                    'pd_shallow': False,
+                    'with_trend': False,
+                    'context_structure_aligned': False,
+                    'trigger_structure_aligned': False,
+                    'trigger_confirmed': False,
+                    'sfp_present': bool(sfp_data_in_window),
+                    'fvg_test_present': False,
+                    'scenario_valid': False,
+                    'no_trade_reason': 'neutral_htf',
+                },
                 'breakdown': {
                     'trend': f"0 (Neutral market: {market_structure.reason})",
                     'structure': '0 (Low ADX override direction mismatch)',
@@ -736,6 +1021,7 @@ def prepare_and_analyze(coin, macro_context):
                     'volume': '0',
                     'macro': '0',
                     'premium_discount': '0',
+                    'risk_plan': '0',
                 },
             }
             direction = 'NEUTRAL'
@@ -762,6 +1048,9 @@ def prepare_and_analyze(coin, macro_context):
         final_score_result['raw_score'] = raw_before_state
         final_score_result['total_score'] = 69
         final_score_result['decision'] = 'Watchlist'
+        final_score_result['no_trade_reason'] = 'state_machine_block'
+        final_score_result.setdefault('diagnostics', {})['no_trade_reason'] = 'state_machine_block'
+        final_score_result['diagnostics']['state_machine_allowed'] = False
         final_score_result.setdefault('breakdown', {})
         final_score_result['breakdown']['scenario'] = (
             f"WATCHLIST (State Machine gate: {state_machine_result.state.value}, "
@@ -772,15 +1061,53 @@ def prepare_and_analyze(coin, macro_context):
     final_score_result['breakdown']['state_machine'] = state_machine_status
     final_score_result['breakdown']['htf_structure'] = _format_market_structure(market_structure)
     final_score_result['breakdown']['adx'] = _format_adx(trend_data)
+    final_score_result.setdefault('diagnostics', {})['state_machine_allowed'] = (
+        state_machine_result.signal_allowed if state_machine_result is not None else False
+    )
+
+    risk_plan = build_risk_plan(
+        direction=direction,
+        current_price=current_price,
+        atr=float(last_closed_15m.get('atr', 0.0)),
+        liquidity_map=liquidity_map,
+        fvg_data=all_fvgs,
+        fvg_test_data=selected_fvg_test_data,
+        sfp_data=sfp_data_in_window,
+        structure_data=context_break_1h or trigger_break_15m,
+    ) if direction in ('LONG', 'SHORT') else None
+    if risk_plan:
+        final_score_result['breakdown']['risk_plan'] = _format_risk_plan(risk_plan)
+        final_score_result.setdefault('diagnostics', {})['risk_plan_valid'] = risk_plan.valid
+        if final_score_result.get('total_score', 0) >= 70 and not risk_plan.valid:
+            raw_before_risk = final_score_result.get('raw_score', final_score_result.get('total_score', 0))
+            final_score_result['raw_score'] = raw_before_risk
+            final_score_result['total_score'] = 69
+            final_score_result['decision'] = 'Watchlist'
+            final_score_result['no_trade_reason'] = 'risk_plan_block'
+            final_score_result['diagnostics']['no_trade_reason'] = 'risk_plan_block'
+            final_score_result['breakdown']['risk_plan'] = (
+                f"WATCHLIST ({risk_plan.reason}, score {raw_before_risk}->69, "
+                f"T1 {risk_plan.rr_to_target_1:.2f}R)"
+            )
+    else:
+        final_score_result['breakdown']['risk_plan'] = '0'
+        final_score_result.setdefault('diagnostics', {})['risk_plan_valid'] = False
 
     analysis_data = {
         "trend_data": trend_data,
         "market_structure": market_structure,
         # Для А+ сетапа нам нужен уровень от 1H структуры
         "structure_data": context_break_1h or trigger_break_15m,
+        "context_break_1h": context_break_1h,
+        "trigger_break_15m": trigger_break_15m,
+        "sfp_data": sfp_data_in_window,
+        "fvg_candidates": all_fvgs,
+        "active_fvg": selected_fvg_test_data,
         "premium_discount_data": premium_discount_data,
         "liquidity_map": liquidity_map,
+        "risk_plan": risk_plan,
         "state_machine": state_machine_status,
+        "session": None,
         "direction": direction,
         "last_closed_15m": last_closed_15m,
     }
@@ -788,21 +1115,25 @@ def prepare_and_analyze(coin, macro_context):
     return final_score_result, analysis_data
 
 def market_scan(report_mode="HUNT"):
-    # Логика времени (Кишинев UTC+3)
-    t = time.time() + 10800
-    local_struct = time.gmtime(t)
-    current_time_str = f"{local_struct.tm_hour:02d}:{local_struct.tm_min:02d}"
-    curr_t = dt_time(local_struct.tm_hour, local_struct.tm_min)
-    
-    in_kz = (dt_time(10, 0) <= curr_t <= dt_time(12, 0)) or \
-            (dt_time(15, 30) <= curr_t <= dt_time(18, 0))
-    session_status = "В KILL ZONE" if in_kz else "ВНЕ KILL ZONE"
+    session = evaluate_session()
+    current_time_str = session.local_time
+    in_kz = session.in_kill_zone
+    session_status = (
+        f"{session.session_name} KZ ({session.minutes_to_session_end}m left)"
+        if in_kz
+        else f"ВНЕ KILL ZONE (next {session.minutes_to_next_session}m)"
+    )
     
     macro = get_macro_context()
-    macro_str = f"DXY: {macro.get('DXY', {}).get('trend')} | SPX: {macro.get('SPX', {}).get('trend')} | BTC.D: {macro.get('BTC.D', {}).get('price')}%"
+    macro_str = (
+        f"DXY: {macro.get('DXY', {}).get('trend')} | "
+        f"SPX: {macro.get('SPX', {}).get('trend')} | "
+        f"BTC.D: {_macro_price_text(macro.get('BTC.D', {}).get('price'), '%')}"
+    )
     logger.info(f"[{current_time_str}] Запуск сканирования | Режим: {report_mode} | Сессия: {session_status}")
 
     dashboard_lines = []
+    run_id = str(uuid.uuid4())
 
     for coin in COINS_LIST:
         try:
@@ -810,26 +1141,39 @@ def market_scan(report_mode="HUNT"):
             if not score_result or not analysis_data:
                 dashboard_lines.append(f"• <b>{coin}</b>: Н/Д (ошибка данных)")
                 continue
+            analysis_data['session'] = session
 
             total_score = score_result.get('total_score', 0)
             is_high_score_setup = total_score >= 85
             #is_high_score_setup = total_score >= 0
             decision = resolve_session_decision(score_result, in_kz)
+            if SCAN_JOURNAL_ENABLED:
+                try:
+                    journal_path = write_scan_record(
+                        _build_scan_journal_record(
+                            run_id,
+                            pd.Timestamp.now(tz=DEFAULT_TIMEZONE).isoformat(),
+                            coin,
+                            session,
+                            score_result,
+                            analysis_data,
+                            macro,
+                        )
+                    )
+                    logger.info(f"Scan journal записан: {journal_path}")
+                except Exception as journal_error:
+                    logger.error(f"Не удалось записать scan journal для {coin}: {journal_error}")
 
             # Отправка А+ сетапа
             if is_high_score_setup and in_kz:
                 direction = analysis_data['direction']
-                atr = analysis_data['last_closed_15m']['atr']
-                entry_price = analysis_data.get('structure_data', {}).get('level')
+                risk_plan = analysis_data.get('risk_plan')
+                entry_price = risk_plan.get('entry') if risk_plan and risk_plan.get('valid') else None
 
                 if entry_price and (time.time() - last_alert_time.get(coin, 0) > 7200):
                     entry_price = float(entry_price)
-                    if direction == 'LONG':
-                        stop_loss = entry_price - 2 * atr
-                        take_profit = entry_price + 3 * (entry_price - stop_loss)
-                    else:
-                        stop_loss = entry_price + 2 * atr
-                        take_profit = entry_price - 3 * (stop_loss - entry_price)
+                    stop_loss = float(risk_plan.get('stop_loss'))
+                    take_profit = float(risk_plan.get('target_1'))
 
                     setup_details_json = {
                         "coin": coin, 
@@ -837,7 +1181,16 @@ def market_scan(report_mode="HUNT"):
                         "entry_price": f"{entry_price:.4f}",
                         "stop_loss": f"{stop_loss:.4f}",
                         "take_profit": f"{take_profit:.4f}",
-                        "score": total_score
+                        "target_2": f"{risk_plan.get('target_2'):.4f}" if risk_plan.get('target_2') is not None else None,
+                        "score": total_score,
+                        "entry_model": risk_plan.get('entry_model'),
+                        "stop_model": risk_plan.get('stop_model'),
+                        "target_model": risk_plan.get('target_model'),
+                        "rr_to_t1": risk_plan.get('rr_to_target_1'),
+                        "rr_to_t2": risk_plan.get('rr_to_target_2'),
+                        "invalidation_level": f"{risk_plan.get('invalidation_level'):.4f}",
+                        "late_entry": risk_plan.get('late_entry'),
+                        "risk_reason": risk_plan.get('reason'),
                     }
                     
                     prompt = f"{A_PLUS_NARRATOR_INSTRUCTION}\n\nJSON ДАННЫЕ:\n{json.dumps(setup_details_json, indent=2, ensure_ascii=False)}"
@@ -854,52 +1207,7 @@ def market_scan(report_mode="HUNT"):
             # Добавляем строку в дашборд
             # if coin in ['BTC', 'ETH', 'SOL']:
             if coin in COINS_LIST:
-                breakdown = score_result.get('breakdown', {})
-                direction = analysis_data['direction']
-                
-                # 1. Форматируем заголовок с направлением сетапа (15m)
-                setup_direction_text, setup_emoji = format_setup_direction(direction, total_score, decision)
-                header = (
-                    f"💎 <b>{_html_text(coin)}</b> | "
-                    f"Сетап: <b>{_html_text(setup_direction_text)} {setup_emoji}</b> | "
-                    f"Score: <b>{total_score}/100</b> | {_html_text(decision)}"
-                )
-
-                # 2. Форматируем HTF-контекст отдельно: EMA bias, swing-structure и ADX.
-                trend_data = analysis_data.get('trend_data')
-                market_structure = analysis_data.get('market_structure')
-                
-                bias_line = f"📊 4H Bias: {_html_text(_format_bias(trend_data))} | {_html_text(breakdown.get('trend', '0'))}"
-                htf_structure_line = f"🧱 4H Structure: {_html_text(breakdown.get('htf_structure', _format_market_structure(market_structure)))}"
-                adx_line = f"💪 ADX: {_html_text(breakdown.get('adx', _format_adx(trend_data)))}"
-                structure_line = f"⚙️ Структура: {_html_text(breakdown.get('structure', '0'))}"
-                liquidity_line = f"💧 Ликвидность: {_html_text(breakdown.get('liquidity', '0'))}"
-                liquidity_map_line = f"🗺 Liquidity Map: {_html_text(breakdown.get('liquidity_map', '0'))}"
-                fvg_line = f"🎯 FVG: {_html_text(breakdown.get('fvg', '0'))}"
-                volume_line = f"📈 Объем: {_html_text(breakdown.get('volume', '0'))}"
-                premium_discount_line = f"⚖️ P/D: {_html_text(breakdown.get('premium_discount', '0'))}"
-                state_machine_line = f"🧭 State: {_html_text(breakdown.get('state_machine', '0'))}"
-                scenario_line = f"🧩 Scenario: {_html_text(breakdown.get('scenario', '0'))}"
-                macro_line = f"🌍 Макро: {_html_text(breakdown.get('macro', '0'))}"
-                separator = "──────────────────"
-                
-                detailed_report = "\n".join([
-                    header,
-                    bias_line,
-                    htf_structure_line,
-                    adx_line,
-                    structure_line,
-                    liquidity_line,
-                    liquidity_map_line,
-                    fvg_line,
-                    volume_line,
-                    premium_discount_line,
-                    state_machine_line,
-                    scenario_line,
-                    macro_line,
-                    separator,
-                ])
-                dashboard_lines.append(detailed_report)
+                dashboard_lines.append(_build_dashboard_block(coin, score_result, analysis_data, decision, in_kz))
             else:
                 dashboard_lines.append(
                     f"• <b>{_html_text(coin)}</b>: {total_score} баллов | "
@@ -911,7 +1219,8 @@ def market_scan(report_mode="HUNT"):
             dashboard_lines.append(f"• <b>{coin}</b>: ОШИБКА АНАЛИЗА")
 
     # Отправка единого дашборда
-    if dashboard_lines and (report_mode == "FULL" or in_kz):
+    should_send_dashboard = report_mode == "FULL" or in_kz or SEND_DIAGNOSTIC_OUTSIDE_KZ
+    if dashboard_lines and should_send_dashboard:
         header_text = "РЫНОЧНЫЙ БРИФИНГ" if report_mode == "FULL" else "СНАЙПЕР ОНЛАЙН"
         summary_header = [
             f"📡 <b>{_html_text(header_text)} | {_html_text(current_time_str)}</b>",
@@ -936,13 +1245,15 @@ if __name__ == "__main__":
         seconds_to_wait = 900 - seconds_past_quarter + 5  # 5 секунд буфера на закрытие свечи биржи
         
         next_run_time = time.gmtime(t_now + seconds_to_wait + 10800)
-        logger.info(f"💤 Ожидаю закрытия свечи. Следующий запуск в: {next_run_time.tm_hour:02d}:{next_run_time.tm_min:02d}:05")
+        next_run_time = next_quarter_close(timezone=DEFAULT_TIMEZONE)
+        logger.info(f"💤 Ожидаю закрытия свечи. Следующий запуск в: {next_run_time.strftime('%H:%M:%S')}")
         
         time.sleep(seconds_to_wait)
         
         # Автоматический выбор режима отчета
-        next_run_struct = time.gmtime(time.time() + 10800)
-        current_mode = "FULL" if (next_run_struct.tm_min == 0 and next_run_struct.tm_hour in [9, 15]) else "HUNT"
+        next_session = evaluate_session()
+        next_hour, next_minute = map(int, next_session.local_time.split(":"))
+        current_mode = "FULL" if (next_minute == 0 and next_hour in [9, 15]) else "HUNT"
             
         try:
             market_scan(report_mode=current_mode)
