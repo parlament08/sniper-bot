@@ -138,6 +138,63 @@ def _gate_summary(df: pd.DataFrame) -> dict:
     }
 
 
+def _trigger_debug_summary(df: pd.DataFrame) -> dict:
+    return {
+        "rejected_reason_counts": _count_values(df, "features.trigger_debug.trigger_rejected_reason"),
+        "selected_type_counts": _count_values(df, "features.trigger_debug.selected_trigger.type"),
+        "opposite_type_counts": _count_values(df, "features.trigger_debug.opposite_trigger.type"),
+        "long_candidate_type_counts": _count_values(df, "features.trigger_debug.long_trigger_candidate.type"),
+        "short_candidate_type_counts": _count_values(df, "features.trigger_debug.short_trigger_candidate.type"),
+        "candidate_type_counts": _count_values(df, "features.trigger_debug.trigger_candidate_type"),
+        "candidate_direction_counts": _count_values(df, "features.trigger_debug.trigger_candidate_direction"),
+        "expected_direction_counts": _count_values(df, "features.trigger_debug.expected_direction"),
+        "selected_quality": _numeric_summary(df, "features.trigger_debug.selected_trigger.quality_score"),
+        "opposite_quality": _numeric_summary(df, "features.trigger_debug.opposite_trigger.quality_score"),
+        "candidate_quality": _numeric_summary(df, "features.trigger_debug.trigger_candidate_quality"),
+        "trigger_confirmed_counts": _bool_counts(df, "features.trigger_debug.trigger_confirmed"),
+        "fvg_scenario_valid_counts": _bool_counts(df, "features.trigger_debug.fvg_scenario_valid"),
+        "fvg_rejected_reason_counts": _count_values(df, "features.trigger_debug.fvg_rejected_reason"),
+    }
+
+
+def _trigger_scan_summary(df: pd.DataFrame) -> dict:
+    return {
+        "rejected_reason_counts": _count_values(df, "features.trigger_scan.rejected_reason"),
+        "expected_direction_counts": _count_values(df, "features.trigger_scan.expected_direction"),
+        "selected_type_counts": _count_values(df, "features.trigger_scan.selected_trigger.type"),
+        "pre_sfp_type_counts": _count_values(df, "features.trigger_scan.pre_sfp_trigger.type"),
+        "post_sfp_type_counts": _count_values(df, "features.trigger_scan.post_sfp_trigger.type"),
+        "pre_poi_type_counts": _count_values(df, "features.trigger_scan.pre_poi_trigger.type"),
+        "post_poi_type_counts": _count_values(df, "features.trigger_scan.post_poi_trigger.type"),
+        "candidate_type_counts": _count_values(df, "features.trigger_scan.candidate_trigger.type"),
+        "opposite_type_counts": _count_values(df, "features.trigger_scan.opposite_trigger.type"),
+        "anchor_present_counts": _bool_counts(df, "features.trigger_scan.anchor_index"),
+        "confirmed_counts": _bool_counts(df, "features.trigger_scan.trigger_confirmed"),
+        "selected_quality": _numeric_summary(df, "features.trigger_scan.selected_trigger.quality_score"),
+        "candidate_quality": _numeric_summary(df, "features.trigger_scan.candidate_trigger.quality_score"),
+        "pre_sfp_quality": _numeric_summary(df, "features.trigger_scan.pre_sfp_trigger.quality_score"),
+        "post_sfp_quality": _numeric_summary(df, "features.trigger_scan.post_sfp_trigger.quality_score"),
+        "opposite_quality": _numeric_summary(df, "features.trigger_scan.opposite_trigger.quality_score"),
+    }
+
+
+def _scenario_scan_summary(df: pd.DataFrame) -> dict:
+    return {
+        "reason_counts": _count_values(df, "features.scenario_scan.reason"),
+        "selected_direction_counts": _count_values(df, "features.scenario_scan.selected_direction"),
+        "signal_allowed_counts": _bool_counts(df, "features.scenario_scan.signal_allowed"),
+        "scenario_valid_counts": _bool_counts(df, "features.scenario_scan.scenario_valid"),
+        "selected_status_counts": _count_values(df, "features.scenario_scan.selected_scenario.status"),
+        "long_status_counts": _count_values(df, "features.scenario_scan.best_long_scenario.status"),
+        "short_status_counts": _count_values(df, "features.scenario_scan.best_short_scenario.status"),
+        "long_invalidated_reason_counts": _count_values(df, "features.scenario_scan.best_long_scenario.invalidated_reason"),
+        "short_invalidated_reason_counts": _count_values(df, "features.scenario_scan.best_short_scenario.invalidated_reason"),
+        "selected_completion_ratio": _numeric_summary(df, "features.scenario_scan.selected_scenario.completion_ratio"),
+        "selected_completed_steps": _numeric_summary(df, "features.scenario_scan.selected_scenario.completed_steps"),
+        "selected_quality": _numeric_summary(df, "features.scenario_scan.selected_scenario.quality_score"),
+    }
+
+
 def _symbol_summary(df: pd.DataFrame) -> dict:
     if "symbol" not in df:
         return {}
@@ -177,10 +234,14 @@ def summarize(df: pd.DataFrame) -> dict:
             },
             "context_1h": _quality_block(df, "features.context_1h"),
             "trigger_15m": _quality_block(df, "features.trigger_15m"),
+            "scenario_trigger_15m": _quality_block(df, "features.scenario_trigger_15m"),
             "sfp": _sfp_summary(df),
             "premium_discount": _premium_discount_summary(df),
             "liquidity_map": _liquidity_map_summary(df),
             "risk_plan": _risk_plan_summary(df),
+            "trigger_debug": _trigger_debug_summary(df),
+            "trigger_scan": _trigger_scan_summary(df),
+            "scenario_scan": _scenario_scan_summary(df),
         },
         "gates": _gate_summary(df),
         "state_machine_counts": _count_values(df, "breakdown.state_machine", limit=10),

@@ -246,6 +246,33 @@ class SniperStateMachineTest(unittest.TestCase):
         self.assertFalse(result.signal_allowed)
         self.assertEqual(result.missing_steps, [SniperEvent.DISPLACEMENT_CONFIRMED.value])
 
+    def test_scenario_invalid_fvg_is_not_inferred(self):
+        machine = SniperStateMachine(direction='bullish')
+
+        result = machine.update(
+            events=[
+                SniperEvent.HTF_CONTEXT_CONFIRMED,
+                SniperEvent.POI_TOUCHED,
+                SniperEvent.LIQUIDITY_SWEEP_CONFIRMED,
+                SniperEvent.CHOCH_CONFIRMED,
+                SniperEvent.BOS_CONFIRMED,
+            ],
+            structure_result={'trend': 'bullish'},
+            premium_discount_result={'valid_for_buy': True, 'valid_for_sell': False},
+            fvg_result={
+                'detected': True,
+                'direction': 'bullish',
+                'type': 'bullish',
+                'tested': True,
+                'invalidated': False,
+                'scenario_valid': False,
+            },
+        )
+
+        self.assertEqual(result.state, SniperState.WAITING_FOR_FVG)
+        self.assertFalse(result.signal_allowed)
+        self.assertIn(SniperEvent.FVG_CREATED.value, result.missing_steps)
+
 
 if __name__ == '__main__':
     unittest.main()

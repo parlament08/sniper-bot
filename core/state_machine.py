@@ -175,6 +175,9 @@ class SniperStateMachine:
             self._invalidate("Timeout")
             return
 
+        if event.value in self.completed_steps:
+            return
+
         expected = self._FLOW[self._next_index]
         if event != expected:
             self._invalidate(f"Unexpected {event.value} while waiting for {expected.value}")
@@ -294,10 +297,11 @@ class SniperStateMachine:
             return False
         detected = _get(fvg_result, "detected", True)
         invalidated = _get(fvg_result, "invalidated", False)
+        scenario_valid = _get(fvg_result, "scenario_valid", True)
         direction = _get(fvg_result, "direction")
         fvg_type = _get(fvg_result, "type", "")
         direction_ok = direction == self.direction or self.direction in str(fvg_type)
-        return bool(detected and not invalidated and direction_ok)
+        return bool(detected and not invalidated and scenario_valid and direction_ok)
 
     def _fvg_retested(self, fvg_result: Optional[object]) -> bool:
         return self._fvg_created(fvg_result) and bool(_get(fvg_result, "tested", False))

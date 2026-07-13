@@ -170,13 +170,15 @@ class AnalyzerIntegrationTest(unittest.TestCase):
                 "analyzer.evaluate_market_structure",
                 return_value=MarketStructure(trend="bullish", confidence=80, reason="test bullish"),
             ), \
+            patch("analyzer._resolve_premium_discount", return_value={"valid_for_buy": True, "valid_for_sell": False, "zone": "discount"}), \
             patch("analyzer.calculate_setup_score", side_effect=[high_score.copy(), low_score.copy()]), \
             patch("analyzer._state_machine_diagnostic", return_value=("waiting_for_liquidity_sweep C25", blocked_state)):
             score_result, _ = analyzer.prepare_and_analyze("BTC", {})
 
         self.assertEqual(score_result["total_score"], 69)
         self.assertEqual(score_result["decision"], "Watchlist")
-        self.assertEqual(score_result["no_trade_reason"], "state_machine_block")
+        self.assertEqual(score_result["no_trade_reason"], "waiting_for_liquidity_sweep")
+        self.assertEqual(score_result["diagnostics"]["scenario_scan_reason"], "waiting_for_liquidity_sweep")
 
     def test_prepare_caps_high_score_when_risk_plan_is_invalid(self):
         def fake_fetch(coin, timeframe, limit):
@@ -246,6 +248,7 @@ class AnalyzerIntegrationTest(unittest.TestCase):
                 "analyzer.evaluate_market_structure",
                 return_value=MarketStructure(trend="bullish", confidence=80, reason="test bullish"),
             ), \
+            patch("analyzer._resolve_premium_discount", return_value={"valid_for_buy": True, "valid_for_sell": False, "zone": "discount"}), \
             patch("analyzer.calculate_setup_score", side_effect=[high_score.copy(), low_score.copy()]), \
             patch("analyzer._state_machine_diagnostic", return_value=("signal_ready C100", allowed_state)), \
             patch("analyzer.build_risk_plan", return_value=invalid_risk):
@@ -253,7 +256,8 @@ class AnalyzerIntegrationTest(unittest.TestCase):
 
         self.assertEqual(score_result["total_score"], 69)
         self.assertEqual(score_result["decision"], "Watchlist")
-        self.assertEqual(score_result["no_trade_reason"], "risk_plan_block")
+        self.assertEqual(score_result["no_trade_reason"], "waiting_for_liquidity_sweep")
+        self.assertEqual(score_result["diagnostics"]["scenario_scan_reason"], "waiting_for_liquidity_sweep")
         self.assertIs(analysis_data["risk_plan"], invalid_risk)
 
     def test_send_telegram_blocks_splits_long_dashboard_without_cutting_blocks(self):
@@ -281,6 +285,31 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertGreater(len(sent_messages), 1)
         self.assertTrue(all(len(message) <= 120 for message in sent_messages))
 
+    def test_format_scenario_scan_humanizes_waiting_and_no_valid_reasons(self):
+        waiting_scan = {
+            "reason": "waiting_for_liquidity_sweep",
+            "selected_scenario": {
+                "status": "waiting_for_confirmation",
+                "direction": "SHORT",
+                "waiting_for": "waiting_for_liquidity_sweep",
+                "completed_steps": 2,
+                "total_steps": 10,
+            },
+        }
+        no_valid_scan = {
+            "reason": "htf_direction_conflict",
+            "selected_scenario": None,
+        }
+
+        self.assertEqual(
+            analyzer._format_scenario_scan(waiting_scan),
+            "waiting for liquidity sweep / SFP | 2/10 steps",
+        )
+        self.assertEqual(
+            analyzer._format_scenario_scan(no_valid_scan),
+            "no valid scenario — HTF direction conflict",
+        )
+
     def test_dashboard_block_shows_no_trade_reason_gates_and_sweep_label(self):
         score_result = {
             "total_score": 0,
@@ -301,6 +330,8 @@ class AnalyzerIntegrationTest(unittest.TestCase):
                 "fvg": "0 (FVG close invalidated после retest)",
                 "volume": "0 (RVOL n/a)",
                 "premium_discount": "BLOCK (4H equilibrium shallow)",
+                "trigger_scan": "waiting — no bullish trigger after SFP/POI",
+                "scenario_scan": "waiting for bullish CHOCH/BOS after SFP | 3/10 steps",
                 "state_machine": "waiting_for_liquidity_sweep C20 (2/8, next: sweep)",
                 "macro": "0 (mixed)",
             },
@@ -315,6 +346,10 @@ class AnalyzerIntegrationTest(unittest.TestCase):
 
         self.assertIn("NO TRADE — P/D block", block)
         self.assertIn("Sweep/SFP", block)
+        self.assertIn("Trigger Scan", block)
+        self.assertIn("waiting — no bullish trigger after SFP/POI", block)
+        self.assertIn("Scenario Scan", block)
+        self.assertIn("waiting for bullish CHOCH/BOS after SFP", block)
         self.assertIn("🚧 Gates:", block)
         self.assertIn("P/D FAIL", block)
 
@@ -382,6 +417,9 @@ class AnalyzerIntegrationTest(unittest.TestCase):
                 "end_index": 4,
                 "tested": True,
                 "invalidated": False,
+                "quality_score": 90,
+                "age_bars": 2,
+                "retest_count": 1,
             }],
             current_price=100.0,
             current_bar=12,
@@ -412,6 +450,9 @@ class AnalyzerIntegrationTest(unittest.TestCase):
                 "end_index": 5,
                 "tested": True,
                 "invalidated": False,
+                "quality_score": 90,
+                "age_bars": 2,
+                "retest_count": 1,
             }],
             current_price=100.0,
             current_bar=7,
@@ -419,6 +460,190 @@ class AnalyzerIntegrationTest(unittest.TestCase):
 
         self.assertTrue(result.signal_allowed)
         self.assertIn("signal_ready", status)
+
+    def test_state_machine_ignores_old_low_quality_fvg_as_scenario_event(self):
+        market_structure = MarketStructure(trend="bullish", confidence=80, reason="test")
+        pd_result = {
+            "valid_for_buy": True,
+            "valid_for_sell": False,
+            "zone": "discount",
+        }
+        old_fvg = {
+            "type": "bullish",
+            "end_index": 1,
+            "tested": True,
+            "invalidated": False,
+            "quality_score": 40,
+            "age_bars": 203,
+            "retest_count": 8,
+        }
+        annotated = analyzer._annotate_scenario_fvgs([old_fvg])
+
+        status, result = analyzer._state_machine_diagnostic(
+            "LONG",
+            market_structure,
+            pd_result,
+            liquidity_map=None,
+            sfp_data={"type": "bullish_sfp", "index": 2, "detected": True, "swept": True},
+            context_structure={"type": "bullish_choch", "index": 3, "quality_score": 90},
+            trigger_structure={"type": "bullish_bos", "index": 4, "quality_score": 95},
+            fvg_test_data={"index": 6, "displacement_index": 7},
+            fvg_data=annotated,
+            current_price=100.0,
+            current_bar=7,
+        )
+
+        self.assertFalse(annotated[0]["scenario_valid"])
+        self.assertEqual(annotated[0]["scenario_reject_reason"], "fvg_quality_below_min")
+        self.assertFalse(result.signal_allowed)
+        self.assertIn("waiting_for_fvg", status)
+        self.assertNotIn("Unexpected fvg_created", status)
+
+    def test_trigger_debug_reports_stale_low_quality_fvg(self):
+        debug = analyzer._build_trigger_debug(
+            "LONG",
+            {"type": "bullish_bos", "index": 10, "quality_score": 88},
+            {"type": "bullish_sfp", "index": 8},
+            {"index": 9},
+            analyzer._annotate_scenario_fvgs([{
+                "type": "bullish",
+                "end_index": 4,
+                "tested": True,
+                "invalidated": False,
+                "quality_score": 40,
+                "age_bars": 203,
+                "retest_count": 8,
+            }]),
+            {"valid_for_buy": True},
+        )
+
+        self.assertEqual(debug["trigger_rejected_reason"], "fvg_quality_below_min")
+        self.assertEqual(debug["fvg_rejected_reason"], "fvg_quality_below_min")
+
+    def test_trigger_debug_reports_missing_15m_trigger(self):
+        debug = analyzer._build_trigger_debug(
+            "LONG",
+            None,
+            {"type": "bullish_sfp", "index": 8},
+            None,
+            [],
+            {"valid_for_buy": True},
+        )
+
+        self.assertEqual(debug["trigger_rejected_reason"], "no_bullish_trigger_after_sfp_or_poi")
+
+    def test_long_debug_keeps_bearish_trigger_as_opposite(self):
+        debug = analyzer._build_trigger_debug(
+            "LONG",
+            {"type": "bearish_bos", "index": 110, "quality_score": 81},
+            {"type": "bullish_sfp", "index": 100},
+            None,
+            [],
+            {"valid_for_buy": True},
+            long_trigger_candidate=None,
+            short_trigger_candidate={"type": "bearish_bos", "index": 110, "quality_score": 81},
+        )
+
+        self.assertIsNone(debug["selected_trigger"])
+        self.assertEqual(debug["opposite_trigger"]["type"], "bearish_bos")
+        self.assertEqual(debug["trigger_rejected_reason"], "no_bullish_trigger_after_sfp_or_poi")
+        self.assertFalse(debug["trigger_confirmed"])
+
+    def test_short_debug_keeps_bullish_trigger_as_opposite(self):
+        debug = analyzer._build_trigger_debug(
+            "SHORT",
+            {"type": "bullish_bos", "index": 110, "quality_score": 85},
+            {"type": "bearish_sfp", "index": 100},
+            None,
+            [],
+            {"valid_for_sell": True},
+            long_trigger_candidate={"type": "bullish_bos", "index": 110, "quality_score": 85},
+            short_trigger_candidate=None,
+        )
+
+        self.assertIsNone(debug["selected_trigger"])
+        self.assertEqual(debug["opposite_trigger"]["type"], "bullish_bos")
+        self.assertEqual(debug["trigger_rejected_reason"], "no_bearish_trigger_after_sfp_or_poi")
+        self.assertFalse(debug["trigger_confirmed"])
+
+    def test_long_debug_confirms_bullish_trigger_after_sfp(self):
+        debug = analyzer._build_trigger_debug(
+            "LONG",
+            {"type": "bullish_bos", "index": 110, "quality_score": 88},
+            {"type": "bullish_sfp", "index": 100},
+            None,
+            [],
+            {"valid_for_buy": True},
+            long_trigger_candidate={"type": "bullish_bos", "index": 110, "quality_score": 88},
+            short_trigger_candidate=None,
+        )
+
+        self.assertEqual(debug["selected_trigger"]["type"], "bullish_bos")
+        self.assertTrue(debug["trigger_confirmed"])
+        self.assertIsNone(debug["trigger_rejected_reason"])
+
+    def test_long_debug_rejects_bullish_trigger_before_sfp(self):
+        debug = analyzer._build_trigger_debug(
+            "LONG",
+            {"type": "bullish_bos", "index": 90, "quality_score": 88},
+            {"type": "bullish_sfp", "index": 100},
+            None,
+            [],
+            {"valid_for_buy": True},
+            long_trigger_candidate={"type": "bullish_bos", "index": 90, "quality_score": 88},
+            short_trigger_candidate=None,
+        )
+
+        self.assertIsNone(debug["selected_trigger"])
+        self.assertEqual(debug["trigger_rejected_reason"], "trigger_before_sfp")
+        self.assertFalse(debug["trigger_confirmed"])
+
+    def test_ape_like_debug_reports_no_bullish_trigger_with_opposite_bearish(self):
+        debug = analyzer._build_trigger_debug(
+            "LONG",
+            {"type": "bearish_bos", "index": 110, "quality_score": 81},
+            {"type": "bullish_sfp", "index": 100},
+            None,
+            [],
+            {"valid_for_buy": True},
+            long_trigger_candidate=None,
+            short_trigger_candidate={"type": "bearish_bos", "index": 110, "quality_score": 81},
+        )
+
+        self.assertIsNone(debug["selected_trigger"])
+        self.assertEqual(debug["opposite_trigger"]["type"], "bearish_bos")
+        self.assertEqual(debug["trigger_rejected_reason"], "no_bullish_trigger_after_sfp_or_poi")
+
+    def test_neutral_debug_reports_candidate_without_opposite(self):
+        debug = analyzer._build_trigger_debug(
+            "NEUTRAL",
+            {"type": "bearish_choch", "index": 100, "quality_score": 84},
+            {"type": "bullish_sfp", "index": 95},
+            None,
+            [],
+            None,
+            short_trigger_candidate={"type": "bearish_choch", "index": 100, "quality_score": 84},
+        )
+
+        self.assertIsNone(debug["selected_trigger"])
+        self.assertIsNone(debug["opposite_trigger"])
+        self.assertEqual(debug["candidate_trigger"]["type"], "bearish_choch")
+        self.assertEqual(debug["trigger_rejected_reason"], "no_trade_direction")
+        self.assertIn("candidate: bearish CHOCH Q84", analyzer._format_trigger_debug(debug))
+        self.assertNotIn("opposite", analyzer._format_trigger_debug(debug))
+
+    def test_trigger_scan_format_waits_for_bos_or_choch_and_reports_opposite(self):
+        scan = analyzer.scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": 100},
+            long_trigger_candidate={"type": "bullish_bos", "index": 90, "quality_score": 97},
+            short_trigger_candidate={"type": "bearish_bos", "index": 110, "quality_score": 93},
+        )
+
+        self.assertEqual(
+            analyzer._format_trigger_scan(scan),
+            "waiting — no bullish CHOCH/BOS after SFP/POI | opposite: bearish BOS Q93",
+        )
 
 
 if __name__ == "__main__":

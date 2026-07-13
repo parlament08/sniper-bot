@@ -30,7 +30,9 @@ from core.premium_discount import evaluate_premium_discount
 from core.risk import calculate_setup_score, format_setup_direction, resolve_session_decision, select_best_setup
 from core.risk_plan import build_risk_plan
 from core.session import DEFAULT_TIMEZONE, evaluate_session, next_quarter_close
+from core.scenario_scanner import ScenarioEvent, scan_scenarios
 from core.state_machine import SniperEvent, SniperStateMachine
+from core.trigger_scanner import scan_post_anchor_trigger
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
@@ -49,13 +51,32 @@ TELEGRAM_MAX_MESSAGE_LENGTH = 3900
 SEND_DIAGNOSTIC_OUTSIDE_KZ = os.environ.get("SEND_DIAGNOSTIC_OUTSIDE_KZ", "false").lower() == "true"
 TELEGRAM_REPORT_DETAIL = os.environ.get("TELEGRAM_REPORT_DETAIL", "compact").lower()
 SCAN_JOURNAL_ENABLED = os.environ.get("SCAN_JOURNAL_ENABLED", "true").lower() == "true"
+MIN_SCENARIO_FVG_QUALITY = 70
+MAX_SCENARIO_FVG_AGE = 64
+MAX_SCENARIO_FVG_RETESTS = 3
+MIN_TRIGGER_QUALITY = 70
+TRIGGER_LINK_WINDOW_BARS = 5
+MAX_TRIGGER_BARS_AFTER_SFP = 24
+MAX_TRIGGER_BARS_AFTER_POI = 24
 
 A_PLUS_NARRATOR_INSTRUCTION = """
 Ты — профессиональный финансовый диктор. Оформи этот JSON с А+ сетапом в красивый HTML для Telegram с тегами <b> и <code>. Ничего не выдумывай от себя.
 """
 
 model = genai.GenerativeModel(model_name='models/gemini-3.1-flash-lite')
-COINS_LIST = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'LINK', 'INJ', 'HYPE', 'LTC', 'DOT']
+# COINS_LIST = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'LINK', 'INJ', 'HYPE', 'LTC', 'DOT']
+COINS_LIST = [
+    'BTC', 'ETH', 'SOL', 'XRP', 'BNB',
+    'DOGE', 'ADA', 'AVAX', 'LINK', 'DOT',
+    'TRX', 'LTC', 'BCH', 'UNI', 'SUI',
+    'NEAR', 'APT', 'ICP', 'FIL', 'ETC',
+    'ATOM', 'ARB', 'OP', 'INJ', 'TIA',
+    'SEI', 'AAVE', 'MKR', 'RUNE', 'LDO',
+    'ORDI', 'WIF', 'PEPE', 'BONK', 'FET',
+    'RENDER', 'GRT', 'JUP', 'PYTH', 'ENA',
+    'HYPE', 'TON', 'WLD', 'ALGO', 'SAND',
+    'MANA', 'APE', 'DYDX', 'IMX', 'STX',
+]
 last_alert_time = {coin: 0 for coin in COINS_LIST}
 
 def send_telegram_alert(text):
@@ -267,6 +288,8 @@ def _build_dashboard_block(coin, score_result, analysis_data, decision, in_kz):
     volume_line = f"📈 Volume: {_html_text(breakdown.get('volume', '0'))}"
     premium_discount_line = f"⚖️ P/D: {_html_text(breakdown.get('premium_discount', '0'))}"
     risk_plan_line = f"🛡 Risk: {_html_text(breakdown.get('risk_plan', '0'))}"
+    trigger_scan_line = f"🔎 Trigger Scan: {_html_text(breakdown.get('trigger_scan', breakdown.get('trigger_debug', '0')))}"
+    scenario_scan_line = f"🧭 Scenario Scan: {_html_text(breakdown.get('scenario_scan', '0'))}"
     state_machine_line = f"🧭 Scenario: {_html_text(_compact_state_text(breakdown.get('state_machine', '0')))}"
     gates_line = f"🚧 Gates: {_html_text(_build_gates_summary(score_result, analysis_data, in_kz))}"
     macro_line = f"🌍 Macro: {_html_text(breakdown.get('macro', '0'))}"
@@ -280,6 +303,8 @@ def _build_dashboard_block(coin, score_result, analysis_data, decision, in_kz):
         fvg_line,
         premium_discount_line,
         risk_plan_line,
+        trigger_scan_line,
+        scenario_scan_line,
         state_machine_line,
         gates_line,
         macro_line,
@@ -332,6 +357,46 @@ def _event_snapshot(event):
     }
 
 
+def _trigger_candidate_snapshot(event, rejection_reason=None):
+    snapshot = _event_snapshot(event)
+    if not snapshot:
+        return None
+    snapshot['direction'] = _event_direction(event)
+    snapshot['rejection_reason'] = rejection_reason
+    return snapshot
+
+
+def _trigger_scan_snapshot(trigger_scan):
+    if not trigger_scan:
+        return None
+    data = trigger_scan.to_dict() if hasattr(trigger_scan, 'to_dict') else dict(trigger_scan)
+    return {
+        'expected_direction': data.get('expected_direction'),
+        'selected_trigger': _trigger_candidate_snapshot(data.get('selected_trigger')),
+        'pre_sfp_trigger': _trigger_candidate_snapshot(data.get('pre_sfp_trigger')),
+        'post_sfp_trigger': _trigger_candidate_snapshot(data.get('post_sfp_trigger')),
+        'pre_poi_trigger': _trigger_candidate_snapshot(data.get('pre_poi_trigger')),
+        'post_poi_trigger': _trigger_candidate_snapshot(data.get('post_poi_trigger')),
+        'candidate_trigger': _trigger_candidate_snapshot(data.get('candidate_trigger')),
+        'opposite_trigger': _trigger_candidate_snapshot(data.get('opposite_trigger')),
+        'sfp_index': str(data.get('sfp_index')) if data.get('sfp_index') is not None else None,
+        'poi_index': str(data.get('poi_index')) if data.get('poi_index') is not None else None,
+        'anchor_index': str(data.get('anchor_index')) if data.get('anchor_index') is not None else None,
+        'trigger_index': str(data.get('trigger_index')) if data.get('trigger_index') is not None else None,
+        'trigger_confirmed': data.get('trigger_confirmed'),
+        'rejected_reason': data.get('rejected_reason'),
+        'waiting_for': data.get('waiting_for'),
+    }
+
+
+def _scenario_scan_snapshot(scenario_output):
+    if not scenario_output:
+        return None
+    if hasattr(scenario_output, 'to_dict'):
+        return scenario_output.to_dict()
+    return dict(scenario_output)
+
+
 def _liquidity_level_snapshot(level):
     if not level:
         return None
@@ -378,6 +443,9 @@ def _build_scan_journal_record(run_id, timestamp, symbol, session, score_result,
             'market_structure_4h': market_structure.to_dict() if hasattr(market_structure, 'to_dict') else market_structure,
             'context_1h': _event_snapshot(analysis_data.get('context_break_1h')),
             'trigger_15m': _event_snapshot(analysis_data.get('trigger_break_15m')),
+            'scenario_trigger_15m': _event_snapshot(analysis_data.get('scenario_trigger_15m')),
+            'long_trigger_candidate': _trigger_candidate_snapshot(analysis_data.get('long_trigger_candidate')),
+            'short_trigger_candidate': _trigger_candidate_snapshot(analysis_data.get('short_trigger_candidate')),
             'sfp': _event_snapshot(analysis_data.get('sfp_data')),
             'premium_discount': premium_discount.to_dict() if hasattr(premium_discount, 'to_dict') else premium_discount,
             'liquidity_map': {
@@ -387,6 +455,9 @@ def _build_scan_journal_record(run_id, timestamp, symbol, session, score_result,
                 'strongest_sell_side': _liquidity_level_snapshot(_level_value(liquidity_map, 'strongest_sell_side')),
             },
             'risk_plan': risk_plan.to_dict() if hasattr(risk_plan, 'to_dict') else risk_plan,
+            'trigger_debug': analysis_data.get('trigger_debug'),
+            'trigger_scan': _trigger_scan_snapshot(analysis_data.get('trigger_scan')),
+            'scenario_scan': _scenario_scan_snapshot(analysis_data.get('scenario_scan')),
         },
         'diagnostics': score_result.get('diagnostics', {}),
         'breakdown': score_result.get('breakdown', {}),
@@ -575,25 +646,81 @@ def _structure_for_state_machine(direction, market_structure, context_structure,
     }
 
 
+def _as_dict(item):
+    if item is None:
+        return None
+    if hasattr(item, 'to_dict'):
+        return item.to_dict()
+    return dict(item)
+
+
+def _scenario_fvg_reject_reason(fvg):
+    if not fvg:
+        return 'no_fvg_candidate'
+    if fvg.get('invalidated', False):
+        return 'fvg_invalidated'
+    if int(fvg.get('quality_score', 0) or 0) < MIN_SCENARIO_FVG_QUALITY:
+        return 'fvg_quality_below_min'
+    if int(fvg.get('age_bars', 0) or 0) > MAX_SCENARIO_FVG_AGE:
+        return 'fvg_too_old'
+    if int(fvg.get('retest_count', 0) or 0) > MAX_SCENARIO_FVG_RETESTS:
+        return 'fvg_too_many_retests'
+    return None
+
+
+def _annotate_scenario_fvgs(fvg_data):
+    annotated = []
+    for item in fvg_data or []:
+        fvg = _as_dict(item)
+        reject_reason = _scenario_fvg_reject_reason(fvg)
+        fvg['scenario_valid'] = reject_reason is None
+        fvg['scenario_reject_reason'] = reject_reason
+        annotated.append(fvg)
+    return annotated
+
+
+def _directional_fvgs(direction, fvg_data):
+    state_direction = _direction_to_state_direction(direction)
+    if state_direction is None:
+        return []
+    target_type = 'bullish' if state_direction == 'bullish' else 'bearish'
+    return [
+        fvg for fvg in (fvg_data or [])
+        if fvg.get('type') == target_type
+    ]
+
+
+def _select_scenario_fvg(direction, fvg_test_data, fvg_data):
+    candidates = [
+        fvg for fvg in _directional_fvgs(direction, fvg_data)
+        if fvg.get('scenario_valid', _scenario_fvg_reject_reason(fvg) is None)
+        and (fvg.get('tested', False) or bool(fvg_test_data))
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: _event_sort_key(item.get('end_index')))
+
+
 def _fvg_for_state_machine(direction, fvg_test_data, fvg_data, current_price):
     state_direction = _direction_to_state_direction(direction)
     if state_direction is None or not fvg_test_data:
         return None
 
-    target_type = 'bullish' if state_direction == 'bullish' else 'bearish'
-    for fvg in fvg_data:
-        if fvg.get('type') != target_type or fvg.get('invalidated', False):
-            continue
-        if fvg.get('tested', False) or fvg_test_data:
-            return {
-                'detected': True,
-                'direction': state_direction,
-                'type': target_type,
-                'tested': True,
-                'invalidated': False,
-                'end_index': fvg.get('end_index'),
-                'test_index': fvg_test_data.get('index') if fvg_test_data else None,
-            }
+    fvg = _select_scenario_fvg(direction, fvg_test_data, fvg_data)
+    if fvg:
+        return {
+            'detected': True,
+            'direction': state_direction,
+            'type': fvg.get('type'),
+            'tested': True,
+            'invalidated': False,
+            'scenario_valid': True,
+            'quality_score': fvg.get('quality_score'),
+            'age_bars': fvg.get('age_bars'),
+            'retest_count': fvg.get('retest_count'),
+            'end_index': fvg.get('end_index'),
+            'test_index': fvg_test_data.get('index') if fvg_test_data else None,
+        }
     return None
 
 
@@ -606,6 +733,396 @@ def _event_sort_key(index):
         return float(pd.Timestamp(index).value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _event_within_15m_window(later_index, earlier_index, bars=5):
+    if later_index is None or earlier_index is None:
+        return False
+    try:
+        if later_index <= earlier_index:
+            return False
+        delta = later_index - earlier_index
+        if isinstance(later_index, (int, float)):
+            if later_index > 1e11:
+                return delta <= bars * 15 * 60 * 1000
+            if later_index > 1e8:
+                return delta <= bars * 15 * 60
+            return delta <= bars
+        return delta <= pd.Timedelta(minutes=bars * 15)
+    except (TypeError, ValueError):
+        return _event_sort_key(later_index) > _event_sort_key(earlier_index)
+
+
+def _find_latest_directional_fvg(direction, fvg_data):
+    candidates = _directional_fvgs(direction, fvg_data)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: _event_sort_key(item.get('end_index')))
+
+
+def _direction_label(direction):
+    if direction == 'bullish':
+        return 'LONG'
+    if direction == 'bearish':
+        return 'SHORT'
+    return 'NEUTRAL'
+
+
+def _format_trigger_name(trigger):
+    if not trigger:
+        return 'none'
+    trigger_type = str(trigger.get('type', 'trigger'))
+    parts = trigger_type.split('_')
+    if len(parts) >= 2:
+        name = f"{parts[0]} {parts[1].upper()}"
+    else:
+        name = trigger_type
+    quality = trigger.get('quality_score')
+    return f"{name} Q{int(quality)}" if quality is not None else name
+
+
+def _candidate_for_direction(direction, long_trigger_candidate, short_trigger_candidate):
+    if direction == 'bullish':
+        return long_trigger_candidate
+    if direction == 'bearish':
+        return short_trigger_candidate
+    return None
+
+
+def _opposite_candidate_for_direction(direction, long_trigger_candidate, short_trigger_candidate):
+    if direction == 'bullish':
+        return short_trigger_candidate
+    if direction == 'bearish':
+        return long_trigger_candidate
+    return None
+
+
+def _missing_trigger_reason(direction, sfp_data, fvg_test_data):
+    if direction == 'bullish':
+        return 'no_bullish_trigger_after_sfp_or_poi' if (sfp_data or fvg_test_data) else 'no_15m_trigger_found'
+    if direction == 'bearish':
+        return 'no_bearish_trigger_after_sfp_or_poi' if (sfp_data or fvg_test_data) else 'no_15m_trigger_found'
+    return 'no_15m_trigger_found'
+
+
+def _build_trigger_debug(
+    direction,
+    trigger_structure,
+    sfp_data,
+    fvg_test_data,
+    fvg_data,
+    premium_discount_data,
+    long_trigger_candidate=None,
+    short_trigger_candidate=None,
+    trigger_scan=None,
+):
+    state_direction = _direction_to_state_direction(direction)
+    expected_direction = state_direction or 'neutral'
+    latest_fvg = _find_latest_directional_fvg(direction, fvg_data)
+    scenario_fvg = _select_scenario_fvg(direction, fvg_test_data, fvg_data)
+    scan_long_candidate = long_trigger_candidate
+    scan_short_candidate = short_trigger_candidate
+    trigger_structure_direction = _event_direction(trigger_structure)
+    if trigger_structure_direction == 'bullish' and scan_long_candidate is None:
+        scan_long_candidate = trigger_structure
+    elif trigger_structure_direction == 'bearish' and scan_short_candidate is None:
+        scan_short_candidate = trigger_structure
+    if trigger_scan is None:
+        trigger_scan = scan_post_anchor_trigger(
+            expected_direction=_direction_label(state_direction),
+            sfp=sfp_data,
+            poi=fvg_test_data,
+            long_trigger_candidate=scan_long_candidate,
+            short_trigger_candidate=scan_short_candidate,
+            max_bars_after_sfp=MAX_TRIGGER_BARS_AFTER_SFP,
+            max_bars_after_poi=MAX_TRIGGER_BARS_AFTER_POI,
+            min_trigger_quality=MIN_TRIGGER_QUALITY,
+        )
+    trigger_scan_data = trigger_scan.to_dict() if hasattr(trigger_scan, 'to_dict') else dict(trigger_scan)
+    selected_candidate = trigger_scan_data.get('selected_trigger')
+    candidate_trigger = trigger_scan_data.get('candidate_trigger')
+    opposite_candidate = trigger_scan_data.get('opposite_trigger')
+
+    if selected_candidate is None and trigger_structure and _event_direction(trigger_structure) == state_direction:
+        # Compatibility fallback only for non-scenario calls with no explicit scan result.
+        selected_candidate = trigger_structure if trigger_scan_data.get('trigger_confirmed') else None
+    if state_direction is not None and opposite_candidate is None and trigger_structure and _event_direction(trigger_structure) not in (None, state_direction):
+        opposite_candidate = trigger_structure
+    if state_direction is None:
+        opposite_candidate = None
+    debug_candidate = selected_candidate or candidate_trigger
+
+    debug = {
+        'expected_direction': _direction_label(state_direction),
+        'selected_trigger': _trigger_candidate_snapshot(selected_candidate) if trigger_scan_data.get('trigger_confirmed') else None,
+        'candidate_trigger': _trigger_candidate_snapshot(candidate_trigger),
+        'long_trigger_candidate': _trigger_candidate_snapshot(long_trigger_candidate),
+        'short_trigger_candidate': _trigger_candidate_snapshot(short_trigger_candidate),
+        'opposite_trigger': _trigger_candidate_snapshot(opposite_candidate),
+        'trigger_candidate_type': debug_candidate.get('type') if debug_candidate else None,
+        'trigger_candidate_direction': _event_direction(debug_candidate),
+        'trigger_candidate_quality': debug_candidate.get('quality_score') if debug_candidate else None,
+        'trigger_rejected_reason': trigger_scan_data.get('rejected_reason'),
+        'trigger_index': trigger_scan_data.get('trigger_index') or (debug_candidate.get('index') if debug_candidate else None),
+        'sfp_index': trigger_scan_data.get('sfp_index'),
+        'anchor_index': trigger_scan_data.get('anchor_index'),
+        'fvg_index': (scenario_fvg or latest_fvg or {}).get('end_index') if (scenario_fvg or latest_fvg) else None,
+        'poi_index': trigger_scan_data.get('poi_index'),
+        'expected_state_direction': expected_direction,
+        'fvg_scenario_valid': bool(scenario_fvg),
+        'fvg_rejected_reason': _scenario_fvg_reject_reason(latest_fvg) if latest_fvg else None,
+        'trigger_confirmed': bool(trigger_scan_data.get('trigger_confirmed')),
+        'trigger_scan': _trigger_scan_snapshot(trigger_scan),
+    }
+
+    if state_direction is None:
+        return debug
+    if not trigger_scan_data.get('trigger_confirmed'):
+        debug['trigger_rejected_reason'] = trigger_scan_data.get('rejected_reason') or _missing_trigger_reason(state_direction, sfp_data, fvg_test_data)
+        return debug
+    if _event_direction(selected_candidate) != state_direction:
+        debug['trigger_rejected_reason'] = 'trigger_direction_conflict'
+        debug['selected_trigger'] = None
+        debug['trigger_confirmed'] = False
+        return debug
+    if int(selected_candidate.get('quality_score', 0) or 0) < MIN_TRIGGER_QUALITY:
+        debug['trigger_rejected_reason'] = 'trigger_quality_below_min'
+        debug['selected_trigger'] = None
+        debug['trigger_confirmed'] = False
+        return debug
+
+    if fvg_test_data:
+        if not scenario_fvg:
+            debug['trigger_rejected_reason'] = debug['fvg_rejected_reason'] or 'fvg_quality_below_min'
+            debug['selected_trigger'] = None
+            debug['trigger_confirmed'] = False
+            return debug
+
+    debug['trigger_rejected_reason'] = None
+    debug['trigger_confirmed'] = True
+    return debug
+
+
+def _format_trigger_debug(trigger_debug):
+    if not trigger_debug:
+        return '0'
+    reason = trigger_debug.get('trigger_rejected_reason') or 'unknown'
+    expected = trigger_debug.get('expected_direction') or 'NEUTRAL'
+    selected = trigger_debug.get('selected_trigger')
+    opposite = trigger_debug.get('opposite_trigger')
+    fvg_reason = trigger_debug.get('fvg_rejected_reason')
+    opposite_text = f" | opposite: {_format_trigger_name(opposite)}" if opposite and expected != 'NEUTRAL' else ""
+    fvg_text = f" | fvg: {fvg_reason}" if fvg_reason else ""
+
+    if expected == 'NEUTRAL':
+        candidate = trigger_debug.get('candidate_trigger')
+        candidate_text = f" | candidate: {_format_trigger_name(candidate)}" if candidate else ""
+        return f"skipped — no trade direction because HTF is Neutral{candidate_text}"
+
+    if selected and trigger_debug.get('trigger_confirmed'):
+        return f"{_format_trigger_name(selected)} confirmed after SFP/POI{opposite_text}"
+
+    if reason in ('no_bullish_trigger_after_sfp_or_poi', 'no_bearish_trigger_after_sfp_or_poi'):
+        direction_word = 'bullish' if expected == 'LONG' else 'bearish'
+        return f"waiting — no {direction_word} CHOCH/BOS after SFP/POI{opposite_text}{fvg_text}"
+
+    return f"rejected — {reason} for {expected}{opposite_text}{fvg_text}"
+
+
+def _format_trigger_scan(trigger_scan):
+    snapshot = _trigger_scan_snapshot(trigger_scan)
+    if not snapshot:
+        return '0'
+    expected = snapshot.get('expected_direction') or 'NEUTRAL'
+    selected = snapshot.get('selected_trigger')
+    reason = snapshot.get('rejected_reason')
+    waiting_for = snapshot.get('waiting_for')
+    pre_sfp = snapshot.get('pre_sfp_trigger')
+    pre_poi = snapshot.get('pre_poi_trigger')
+    opposite = snapshot.get('opposite_trigger')
+    opposite_text = f" | opposite: {_format_trigger_name(opposite)}" if opposite and expected != 'NEUTRAL' else ""
+
+    if expected == 'NEUTRAL':
+        candidate = snapshot.get('candidate_trigger')
+        candidate_text = f" | candidate: {_format_trigger_name(candidate)}" if candidate else ""
+        return f"skipped — no trade direction because HTF is Neutral{candidate_text}"
+
+    if selected and snapshot.get('trigger_confirmed'):
+        anchor = 'SFP' if snapshot.get('sfp_index') is not None else 'POI'
+        return f"confirmed — {_format_trigger_name(selected)} after {anchor}"
+
+    if reason in ('trigger_before_sfp', 'trigger_before_poi'):
+        trigger = pre_sfp if reason == 'trigger_before_sfp' else pre_poi
+        anchor = 'SFP' if reason == 'trigger_before_sfp' else 'POI'
+        return f"rejected — {_format_trigger_name(trigger)} was before {anchor}"
+
+    if reason in ('no_bullish_trigger_after_sfp_or_poi', 'no_bearish_trigger_after_sfp_or_poi'):
+        direction_word = 'bullish' if expected == 'LONG' else 'bearish'
+        return f"waiting — no {direction_word} CHOCH/BOS after SFP/POI{opposite_text}"
+
+    if reason == 'no_sfp_or_poi_anchor':
+        return f"waiting — {waiting_for or 'trigger anchor'}"
+
+    if waiting_for:
+        return f"waiting — {waiting_for}"
+
+    return f"rejected — {reason or 'unknown'}"
+
+
+def _format_scenario_scan(scenario_output):
+    snapshot = _scenario_scan_snapshot(scenario_output)
+    if not snapshot:
+        return '0'
+    selected = snapshot.get('selected_scenario')
+    reason = snapshot.get('reason')
+    if not selected:
+        return f"no valid scenario — {_humanize_scenario_reason(reason)}"
+
+    status = selected.get('status')
+    direction = selected.get('direction')
+    completed = selected.get('completed_steps', 0)
+    total = selected.get('total_steps', 10)
+    if status == 'complete':
+        return f"complete {direction} scenario | {completed}/{total} steps | A+ allowed"
+    if status == 'invalidated':
+        return f"invalidated — {_humanize_scenario_reason(selected.get('invalidated_reason') or reason)}"
+    waiting_for = _humanize_scenario_waiting(selected.get('waiting_for') or selected.get('next_expected_step') or reason)
+    return f"waiting for {waiting_for} | {completed}/{total} steps"
+
+
+def _humanize_scenario_reason(reason):
+    mapping = {
+        'htf_neutral_no_scenario': 'HTF neutral',
+        'htf_direction_conflict': 'HTF direction conflict',
+        'pd_invalid_for_direction': 'premium/discount direction conflict',
+        'waiting_for_liquidity_sweep': 'liquidity sweep / SFP',
+        'waiting_for_bullish_choch_or_bos': 'bullish CHOCH/BOS after SFP',
+        'waiting_for_bearish_choch_or_bos': 'bearish CHOCH/BOS after SFP',
+        'waiting_for_bullish_bos': 'bullish BOS',
+        'waiting_for_bearish_bos': 'bearish BOS',
+        'valid_risk_plan': 'valid risk plan',
+    }
+    return mapping.get(reason, reason or 'unknown')
+
+
+def _humanize_scenario_waiting(waiting_for):
+    mapping = {
+        'waiting_for_poi': 'POI touch',
+        'waiting_for_liquidity_sweep': 'liquidity sweep / SFP',
+        'SFP_CONFIRMED': 'liquidity sweep / SFP',
+        'CHOCH_CONFIRMED': 'CHOCH/BOS after SFP',
+        'BOS_CONFIRMED': 'BOS',
+        'FVG_CREATED': 'valid FVG',
+        'FVG_RETESTED': 'FVG retest',
+        'DISPLACEMENT_CONFIRMED': 'displacement',
+        'RISK_VALID': 'valid risk plan',
+    }
+    return mapping.get(waiting_for, _humanize_scenario_reason(waiting_for))
+
+
+def _scenario_event(event_type, direction, index, quality_score=None, source=None, payload=None):
+    return ScenarioEvent(
+        event_type=event_type,
+        direction=direction,
+        index=index,
+        quality_score=quality_score,
+        source=source,
+        payload=payload,
+    )
+
+
+def _build_scenario_events(
+    direction,
+    market_structure,
+    premium_discount_data,
+    sfp_data,
+    trigger_scan,
+    context_structure,
+    fvg_data,
+    selected_fvg_test_data,
+    risk_plan,
+    last_closed_15m,
+):
+    events = []
+    htf_trend = market_structure.get('trend') if market_structure else None
+    if htf_trend:
+        events.append(_scenario_event(
+            'HTF_CONTEXT_CONFIRMED',
+            htf_trend,
+            -2,
+            quality_score=market_structure.get('confidence') if market_structure else None,
+            source='htf_structure',
+            payload=market_structure.to_dict() if hasattr(market_structure, 'to_dict') else market_structure,
+        ))
+
+    if premium_discount_data:
+        pd_payload = premium_discount_data.to_dict() if hasattr(premium_discount_data, 'to_dict') else premium_discount_data
+        pd_index = selected_fvg_test_data.get('index') if selected_fvg_test_data else -1
+        if premium_discount_data.get('valid_for_buy', False):
+            events.append(_scenario_event('POI_TOUCHED', 'bullish', pd_index, premium_discount_data.get('zone_strength'), 'premium_discount', pd_payload))
+        if premium_discount_data.get('valid_for_sell', False):
+            events.append(_scenario_event('POI_TOUCHED', 'bearish', pd_index, premium_discount_data.get('zone_strength'), 'premium_discount', pd_payload))
+
+    if sfp_data:
+        sfp_direction = _event_direction(sfp_data)
+        events.append(_scenario_event(
+            'SFP_CONFIRMED',
+            sfp_direction,
+            sfp_data.get('index'),
+            sfp_data.get('quality_score'),
+            'sfp',
+            sfp_data,
+        ))
+
+    trigger_data = trigger_scan.to_dict() if hasattr(trigger_scan, 'to_dict') else dict(trigger_scan or {})
+    selected_trigger = trigger_data.get('selected_trigger')
+    for structure in (context_structure, selected_trigger):
+        if not structure:
+            continue
+        structure_direction = _event_direction(structure)
+        structure_type = str(structure.get('type', ''))
+        if 'choch' in structure_type:
+            events.append(_scenario_event('CHOCH_CONFIRMED', structure_direction, structure.get('index'), structure.get('quality_score'), 'structure', structure))
+        elif 'bos' in structure_type:
+            events.append(_scenario_event('BOS_CONFIRMED', structure_direction, structure.get('index'), structure.get('quality_score'), 'structure', structure))
+
+    for fvg in _latest_fvgs_by_type(fvg_data):
+        fvg_direction = 'bullish' if fvg.get('type') == 'bullish' else 'bearish' if fvg.get('type') == 'bearish' else None
+        created_index = fvg.get('end_index')
+        if created_index is not None:
+            events.append(_scenario_event('FVG_CREATED', fvg_direction, created_index, fvg.get('quality_score'), 'fvg', fvg))
+        test_index = fvg.get('test_index')
+        selected_direction = _direction_to_state_direction(direction)
+        if test_index is None and selected_fvg_test_data and fvg_direction == selected_direction:
+            test_index = selected_fvg_test_data.get('index')
+        if test_index is not None and (fvg.get('tested', False) or selected_fvg_test_data):
+            events.append(_scenario_event('FVG_RETESTED', fvg_direction, test_index, fvg.get('quality_score'), 'fvg', fvg))
+        displacement_index = fvg.get('displacement_index') or ((selected_fvg_test_data or {}).get('displacement_index') if fvg_direction == selected_direction else None)
+        if displacement_index is not None:
+            events.append(_scenario_event('DISPLACEMENT_CONFIRMED', fvg_direction, displacement_index, fvg.get('quality_score'), 'fvg', fvg))
+
+    if risk_plan:
+        risk_direction = 'bullish' if risk_plan.direction == 'LONG' else 'bearish'
+        risk_index = last_closed_15m.name if last_closed_15m is not None else None
+        risk_event_type = 'RISK_VALID' if risk_plan.valid else 'RISK_INVALID'
+        events.append(_scenario_event(
+            risk_event_type,
+            risk_direction,
+            risk_index,
+            None,
+            'risk_plan',
+            risk_plan.to_dict() if hasattr(risk_plan, 'to_dict') else risk_plan,
+        ))
+    return events
+
+
+def _latest_fvgs_by_type(fvg_data):
+    result = []
+    for fvg_type in ('bullish', 'bearish'):
+        candidates = [fvg for fvg in (fvg_data or []) if fvg.get('type') == fvg_type]
+        if candidates:
+            result.append(max(candidates, key=lambda item: _event_sort_key(item.get('end_index'))))
+    return result
 
 
 def _scenario_events_for_state_machine(
@@ -658,13 +1175,13 @@ def _scenario_events_for_state_machine(
         if test_index is not None:
             events.append((_event_sort_key(test_index), SniperEvent.FVG_RETESTED))
 
-    displacement_index = None
-    if fvg_test_data:
-        displacement_index = fvg_test_data.get('displacement_index')
-    if displacement_index is None and fvg_result:
-        displacement_index = fvg_result.get('displacement_index')
-    if displacement_index is not None:
-        events.append((_event_sort_key(displacement_index), SniperEvent.DISPLACEMENT_CONFIRMED))
+        displacement_index = None
+        if fvg_test_data:
+            displacement_index = fvg_test_data.get('displacement_index')
+        if displacement_index is None:
+            displacement_index = fvg_result.get('displacement_index')
+        if displacement_index is not None:
+            events.append((_event_sort_key(displacement_index), SniperEvent.DISPLACEMENT_CONFIRMED))
 
     ordered = sorted(events, key=lambda item: item[0])
     deduped = []
@@ -781,6 +1298,8 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
     sfp_data_in_window = None
     context_break_1h = None
     trigger_break_15m = None
+    long_trigger_candidate = None
+    short_trigger_candidate = None
 
     # 1. Ищем свинги на старшем и рабочих таймфреймах.
     # 1H берется напрямую с биржи, а не строится из 15m, чтобы контекст совпадал с биржевыми свечами.
@@ -843,7 +1362,7 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
                 sfp_data_in_window = sfp
 
         # Ищем 15m CHoCH (Триггер)
-        if not trigger_break_15m:
+        if not trigger_break_15m or not long_trigger_candidate or not short_trigger_candidate:
             swings_before_candle_h_15m = swing_highs_15m[swing_highs_15m.index < index]
             swings_before_candle_l_15m = swing_lows_15m[swing_lows_15m.index < index]
             structure_break = detect_structure_break(
@@ -856,7 +1375,13 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
                 future_candles=future_candles,
             )
             if structure_break:
-                trigger_break_15m = structure_break
+                if not trigger_break_15m:
+                    trigger_break_15m = structure_break
+                trigger_direction = _event_direction(structure_break)
+                if trigger_direction == 'bullish' and not long_trigger_candidate:
+                    long_trigger_candidate = structure_break
+                elif trigger_direction == 'bearish' and not short_trigger_candidate:
+                    short_trigger_candidate = structure_break
 
     for index, candle in window_1h.iloc[::-1].iterrows():
         if context_break_1h:
@@ -893,6 +1418,34 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         )
 
     if market_structure.trend == 'neutral' and not low_adx_override_direction:
+        neutral_trigger_scan = scan_post_anchor_trigger(
+            expected_direction='NEUTRAL',
+            sfp=sfp_data_in_window,
+            poi=None,
+            long_trigger_candidate=long_trigger_candidate,
+            short_trigger_candidate=short_trigger_candidate,
+            max_bars_after_sfp=MAX_TRIGGER_BARS_AFTER_SFP,
+            max_bars_after_poi=MAX_TRIGGER_BARS_AFTER_POI,
+            min_trigger_quality=MIN_TRIGGER_QUALITY,
+        )
+        neutral_trigger_debug = _build_trigger_debug(
+            'NEUTRAL',
+            trigger_break_15m,
+            sfp_data_in_window,
+            None,
+            [],
+            None,
+            long_trigger_candidate=long_trigger_candidate,
+            short_trigger_candidate=short_trigger_candidate,
+            trigger_scan=neutral_trigger_scan,
+        )
+        neutral_scenario_scan = scan_scenarios(
+            events=[ScenarioEvent('HTF_CONTEXT_CONFIRMED', 'neutral', -2, market_structure.confidence, 'htf_structure')],
+            expected_direction='NEUTRAL',
+            htf_structure=market_structure,
+            premium_discount=None,
+            risk_plan=None,
+        )
         return {
             'raw_score': 0,
             'total_score': 0,
@@ -909,6 +1462,12 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
                 'fvg_test_present': False,
                 'scenario_valid': False,
                 'no_trade_reason': 'neutral_htf',
+                'trigger_scan_confirmed': neutral_trigger_scan.trigger_confirmed,
+                'trigger_scan_rejected_reason': neutral_trigger_scan.rejected_reason,
+                'scenario_scan_signal_allowed': neutral_scenario_scan.signal_allowed,
+                'scenario_scan_valid': neutral_scenario_scan.scenario_valid,
+                'scenario_scan_reason': neutral_scenario_scan.reason,
+                'scenario_scan': _scenario_scan_snapshot(neutral_scenario_scan),
             },
             'breakdown': {
                 'trend': f"0 (Neutral market: {market_structure.reason})",
@@ -921,6 +1480,9 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
                 'risk_plan': '0',
                 'liquidity_map': _format_liquidity_map(liquidity_map),
                 'state_machine': '0',
+                'trigger_debug': _format_trigger_debug(neutral_trigger_debug),
+                'trigger_scan': _format_trigger_scan(neutral_trigger_scan),
+                'scenario_scan': _format_scenario_scan(neutral_scenario_scan),
                 'htf_structure': _format_market_structure(market_structure),
                 'adx': _format_adx(trend_data),
             },
@@ -930,12 +1492,18 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
             'structure_data': None,
             'context_break_1h': context_break_1h,
             'trigger_break_15m': trigger_break_15m,
+            'scenario_trigger_15m': None,
+            'long_trigger_candidate': long_trigger_candidate,
+            'short_trigger_candidate': short_trigger_candidate,
             'sfp_data': sfp_data_in_window,
             'fvg_candidates': [],
             'active_fvg': None,
             'premium_discount_data': None,
             'liquidity_map': liquidity_map,
             'risk_plan': None,
+            'trigger_debug': neutral_trigger_debug,
+            'trigger_scan': neutral_trigger_scan,
+            'scenario_scan': neutral_scenario_scan,
             'state_machine': None,
             'session': None,
             'direction': 'NEUTRAL',
@@ -949,6 +1517,7 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         rvol_series=df_15m_closed['rvol'],
         min_size_atr_ratio=0.5,
     )
+    all_fvgs = _annotate_scenario_fvgs(all_fvgs)
     
     bullish_fvg_test_indices = []
     for fvg in (f for f in all_fvgs if f['type'] == 'bullish' and not f.get('invalidated', False)):
@@ -1026,6 +1595,28 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
             }
             direction = 'NEUTRAL'
     selected_fvg_test_data = long_fvg_test_data if direction == 'LONG' else short_fvg_test_data if direction == 'SHORT' else None
+    trigger_scan = scan_post_anchor_trigger(
+        expected_direction=direction,
+        sfp=sfp_data_in_window,
+        poi=selected_fvg_test_data,
+        long_trigger_candidate=long_trigger_candidate,
+        short_trigger_candidate=short_trigger_candidate,
+        max_bars_after_sfp=MAX_TRIGGER_BARS_AFTER_SFP,
+        max_bars_after_poi=MAX_TRIGGER_BARS_AFTER_POI,
+        min_trigger_quality=MIN_TRIGGER_QUALITY,
+    )
+    scenario_trigger_15m = trigger_scan.selected_trigger
+    trigger_debug = _build_trigger_debug(
+        direction,
+        trigger_break_15m,
+        sfp_data_in_window,
+        selected_fvg_test_data,
+        all_fvgs,
+        premium_discount_data,
+        long_trigger_candidate=long_trigger_candidate,
+        short_trigger_candidate=short_trigger_candidate,
+        trigger_scan=trigger_scan,
+    )
     state_machine_status, state_machine_result = _state_machine_diagnostic(
         direction,
         market_structure,
@@ -1033,7 +1624,7 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         liquidity_map,
         sfp_data_in_window,
         context_break_1h,
-        trigger_break_15m,
+        scenario_trigger_15m,
         selected_fvg_test_data,
         all_fvgs,
         current_price,
@@ -1059,11 +1650,20 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         )
     final_score_result['breakdown']['liquidity_map'] = _format_liquidity_map(liquidity_map)
     final_score_result['breakdown']['state_machine'] = state_machine_status
+    final_score_result['breakdown']['trigger_debug'] = _format_trigger_debug(trigger_debug)
+    final_score_result['breakdown']['trigger_scan'] = _format_trigger_scan(trigger_scan)
     final_score_result['breakdown']['htf_structure'] = _format_market_structure(market_structure)
     final_score_result['breakdown']['adx'] = _format_adx(trend_data)
     final_score_result.setdefault('diagnostics', {})['state_machine_allowed'] = (
         state_machine_result.signal_allowed if state_machine_result is not None else False
     )
+    final_score_result['diagnostics']['trigger_rejected_reason'] = trigger_debug.get('trigger_rejected_reason')
+    final_score_result['diagnostics']['trigger_scan_rejected_reason'] = trigger_scan.rejected_reason
+    final_score_result['diagnostics']['trigger_scan_confirmed'] = trigger_scan.trigger_confirmed
+    final_score_result['diagnostics']['trigger_confirmed'] = trigger_scan.trigger_confirmed
+    final_score_result['diagnostics']['trigger_structure_aligned'] = bool(scenario_trigger_15m)
+    final_score_result['diagnostics']['fvg_scenario_valid'] = trigger_debug.get('fvg_scenario_valid')
+    final_score_result['diagnostics']['fvg_rejected_reason'] = trigger_debug.get('fvg_rejected_reason')
 
     risk_plan = build_risk_plan(
         direction=direction,
@@ -1073,7 +1673,7 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         fvg_data=all_fvgs,
         fvg_test_data=selected_fvg_test_data,
         sfp_data=sfp_data_in_window,
-        structure_data=context_break_1h or trigger_break_15m,
+        structure_data=context_break_1h or scenario_trigger_15m,
     ) if direction in ('LONG', 'SHORT') else None
     if risk_plan:
         final_score_result['breakdown']['risk_plan'] = _format_risk_plan(risk_plan)
@@ -1093,19 +1693,74 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         final_score_result['breakdown']['risk_plan'] = '0'
         final_score_result.setdefault('diagnostics', {})['risk_plan_valid'] = False
 
+    scenario_events = _build_scenario_events(
+        direction,
+        market_structure,
+        premium_discount_data,
+        sfp_data_in_window,
+        trigger_scan,
+        context_break_1h,
+        all_fvgs,
+        selected_fvg_test_data,
+        risk_plan,
+        last_closed_15m,
+    )
+    scenario_scan = scan_scenarios(
+        events=scenario_events,
+        expected_direction=direction,
+        htf_structure=market_structure,
+        premium_discount=premium_discount_data,
+        risk_plan=risk_plan,
+    )
+    final_score_result['breakdown']['scenario_scan'] = _format_scenario_scan(scenario_scan)
+    final_score_result['diagnostics']['scenario_scan_signal_allowed'] = scenario_scan.signal_allowed
+    final_score_result['diagnostics']['scenario_scan_valid'] = scenario_scan.scenario_valid
+    final_score_result['diagnostics']['scenario_scan_reason'] = scenario_scan.reason
+    final_score_result['diagnostics']['scenario_scan'] = _scenario_scan_snapshot(scenario_scan)
+    selected_scenario = scenario_scan.selected_scenario
+    final_score_result['diagnostics']['scenario_scan_status'] = selected_scenario.status if selected_scenario else None
+    final_score_result['diagnostics']['scenario_scan_direction'] = scenario_scan.selected_direction
+
+    raw_or_score = final_score_result.get('raw_score', final_score_result.get('total_score', 0))
+    scenario_complete = bool(
+        scenario_scan.signal_allowed
+        and scenario_scan.scenario_valid
+        and selected_scenario is not None
+        and selected_scenario.status == 'complete'
+        and risk_plan is not None
+        and risk_plan.valid
+    )
+    if raw_or_score >= 70 and not scenario_complete:
+        final_score_result['raw_score'] = raw_or_score
+        final_score_result['total_score'] = min(final_score_result.get('total_score', raw_or_score), 69)
+        final_score_result['decision'] = 'Watchlist'
+        final_score_result['no_trade_reason'] = scenario_scan.reason
+        final_score_result['diagnostics']['no_trade_reason'] = scenario_scan.reason
+        final_score_result['breakdown']['scenario'] = (
+            f"WATCHLIST (Scenario Scan gate: {scenario_scan.reason}, "
+            f"score {raw_or_score}->69)"
+        )
+
     analysis_data = {
         "trend_data": trend_data,
         "market_structure": market_structure,
         # Для А+ сетапа нам нужен уровень от 1H структуры
-        "structure_data": context_break_1h or trigger_break_15m,
+        "structure_data": context_break_1h or scenario_trigger_15m,
         "context_break_1h": context_break_1h,
         "trigger_break_15m": trigger_break_15m,
+        "scenario_trigger_15m": scenario_trigger_15m,
+        "long_trigger_candidate": long_trigger_candidate,
+        "short_trigger_candidate": short_trigger_candidate,
         "sfp_data": sfp_data_in_window,
         "fvg_candidates": all_fvgs,
         "active_fvg": selected_fvg_test_data,
         "premium_discount_data": premium_discount_data,
         "liquidity_map": liquidity_map,
         "risk_plan": risk_plan,
+        "trigger_debug": trigger_debug,
+        "trigger_scan": trigger_scan,
+        "scenario_scan": scenario_scan,
+        "scenario_events": scenario_events,
         "state_machine": state_machine_status,
         "session": None,
         "direction": direction,
@@ -1205,8 +1860,8 @@ def market_scan(report_mode="HUNT"):
             trend_strength = trend_data.get('strength', 'Н/Д') if trend_data else "Н/Д"
             
             # Добавляем строку в дашборд
-            # if coin in ['BTC', 'ETH', 'SOL']:
-            if coin in COINS_LIST:
+            if coin in ['BTC', 'ETH', 'SOL']:
+            # if coin in COINS_LIST:
                 dashboard_lines.append(_build_dashboard_block(coin, score_result, analysis_data, decision, in_kz))
             else:
                 dashboard_lines.append(
