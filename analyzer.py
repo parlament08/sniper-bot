@@ -975,19 +975,51 @@ def _format_scenario_scan(scenario_output):
         return '0'
     selected = snapshot.get('selected_scenario')
     reason = snapshot.get('reason')
+    candidate_suffix = _format_candidate_count_suffix(snapshot)
     if not selected:
-        return f"no valid scenario — {_humanize_scenario_reason(reason)}"
+        return f"no valid scenario — {_humanize_scenario_reason(reason)}{candidate_suffix}"
 
     status = selected.get('status')
     direction = selected.get('direction')
     completed = selected.get('completed_steps', 0)
     total = selected.get('total_steps', 10)
+    selected_label = _format_selected_candidate_label(selected, snapshot)
     if status == 'complete':
-        return f"complete {direction} scenario | {completed}/{total} steps | A+ allowed"
+        return f"complete {direction} scenario | {completed}/{total} steps | A+ allowed{candidate_suffix}"
     if status == 'invalidated':
-        return f"invalidated — {_humanize_scenario_reason(selected.get('invalidated_reason') or reason)}"
+        prefix = f"{selected_label} — " if selected_label else ""
+        return f"{prefix}invalidated — {_humanize_scenario_reason(selected.get('invalidated_reason') or reason)}{candidate_suffix}"
     waiting_for = _humanize_scenario_waiting(selected.get('waiting_for') or selected.get('next_expected_step') or reason)
-    return f"waiting for {waiting_for} | {completed}/{total} steps"
+    prefix = f"{selected_label} — " if selected_label else ""
+    return f"{prefix}waiting for {waiting_for} | {completed}/{total} steps{candidate_suffix}"
+
+
+def _format_selected_candidate_label(selected, snapshot):
+    if not selected.get('candidate_id') and not snapshot.get('candidate_counts'):
+        return None
+    direction = selected.get('direction') or snapshot.get('selected_direction') or 'scenario'
+    ordinal = _candidate_ordinal(selected)
+    if ordinal is None:
+        return f"selected {direction}"
+    return f"selected {direction} #{ordinal}"
+
+
+def _candidate_ordinal(selected):
+    candidate_id = str(selected.get('candidate_id') or '')
+    tail = candidate_id.rsplit('_', 1)[-1]
+    if tail.isdigit():
+        return int(tail)
+    rank = selected.get('rank')
+    return rank if isinstance(rank, int) else None
+
+
+def _format_candidate_count_suffix(snapshot):
+    counts = snapshot.get('candidate_counts') or {}
+    long_total = counts.get('long_total')
+    short_total = counts.get('short_total')
+    if long_total is None or short_total is None:
+        return ''
+    return f" | candidates {long_total}L/{short_total}S"
 
 
 def _humanize_scenario_reason(reason):
@@ -1057,10 +1089,10 @@ def _build_scenario_events(
 
     if premium_discount_data:
         pd_payload = premium_discount_data.to_dict() if hasattr(premium_discount_data, 'to_dict') else premium_discount_data
-        pd_index = selected_fvg_test_data.get('index') if selected_fvg_test_data else -1
-        if premium_discount_data.get('valid_for_buy', False):
+        pd_index = _poi_event_index(selected_fvg_test_data, last_closed_15m)
+        if pd_index is not None and premium_discount_data.get('valid_for_buy', False):
             events.append(_scenario_event('POI_TOUCHED', 'bullish', pd_index, premium_discount_data.get('zone_strength'), 'premium_discount', pd_payload))
-        if premium_discount_data.get('valid_for_sell', False):
+        if pd_index is not None and premium_discount_data.get('valid_for_sell', False):
             events.append(_scenario_event('POI_TOUCHED', 'bearish', pd_index, premium_discount_data.get('zone_strength'), 'premium_discount', pd_payload))
 
     if sfp_data:
@@ -1114,6 +1146,14 @@ def _build_scenario_events(
             risk_plan.to_dict() if hasattr(risk_plan, 'to_dict') else risk_plan,
         ))
     return events
+
+
+def _poi_event_index(selected_fvg_test_data, last_closed_15m):
+    if selected_fvg_test_data and selected_fvg_test_data.get('index') is not None:
+        return selected_fvg_test_data.get('index')
+    if last_closed_15m is not None and getattr(last_closed_15m, 'name', None) is not None:
+        return last_closed_15m.name
+    return None
 
 
 def _latest_fvgs_by_type(fvg_data):

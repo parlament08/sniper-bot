@@ -71,7 +71,7 @@ class ScenarioScannerTest(unittest.TestCase):
         self.assertEqual(scenario.waiting_for, "liquidity sweep / SFP")
         self.assertEqual(output.reason, "waiting_for_liquidity_sweep")
 
-    def test_trigger_before_sfp_waits_for_fresh_confirmation(self):
+    def test_candidate_does_not_use_pre_anchor_bos(self):
         output = scan_scenarios(
             events=[
                 event("HTF_CONTEXT_CONFIRMED", index=1),
@@ -85,11 +85,12 @@ class ScenarioScannerTest(unittest.TestCase):
 
         self.assertEqual(output.best_long_scenario.status, "waiting_for_confirmation")
         self.assertIsNone(output.best_long_scenario.invalidated_reason)
-        self.assertEqual(output.best_long_scenario.last_invalidated_component, "trigger_before_sfp")
+        self.assertIsNone(output.best_long_scenario.last_invalidated_component)
         self.assertEqual(output.best_long_scenario.waiting_for, "bullish CHOCH/BOS after SFP")
+        self.assertNotIn(2, [item.index for item in output.best_long_scenario.events_used])
         self.assertFalse(output.signal_allowed)
 
-    def test_fvg_before_bos_waits_instead_of_invalidating_context(self):
+    def test_fvg_before_bos_is_ignored_until_branch_has_bos(self):
         output = scan_scenarios(
             events=[
                 event("HTF_CONTEXT_CONFIRMED", index=1),
@@ -105,10 +106,28 @@ class ScenarioScannerTest(unittest.TestCase):
 
         self.assertEqual(output.best_long_scenario.status, "waiting_for_confirmation")
         self.assertIsNone(output.best_long_scenario.invalidated_reason)
-        self.assertEqual(output.best_long_scenario.last_invalidated_component, "fvg_before_bos")
-        self.assertEqual(output.best_long_scenario.waiting_for, "valid bullish FVG after SFP")
+        self.assertEqual(output.best_long_scenario.current_step, "bos_confirmed")
+        self.assertEqual(output.best_long_scenario.waiting_for, "bullish FVG")
 
-    def test_displacement_before_retest_waits_for_retest(self):
+    def test_poi_candidate_with_pseudo_index_ignores_unbranched_invalid_fvg(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=-2),
+                event("POI_TOUCHED", index=-1),
+                event("FVG_CREATED", index=3, payload={"invalidated": True}),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+            premium_discount={"valid_for_buy": True},
+        )
+
+        scenario = output.best_long_scenario
+        self.assertEqual(scenario.status, "waiting_for_confirmation")
+        self.assertIsNone(scenario.invalidated_reason)
+        self.assertEqual(scenario.completed_steps, 2)
+        self.assertEqual(scenario.waiting_for, "liquidity sweep / SFP")
+
+    def test_displacement_before_retest_invalidates_only_that_candidate(self):
         output = scan_scenarios(
             events=[
                 event("HTF_CONTEXT_CONFIRMED", index=1),
@@ -123,12 +142,10 @@ class ScenarioScannerTest(unittest.TestCase):
             premium_discount={"valid_for_buy": True},
         )
 
-        self.assertEqual(output.best_long_scenario.status, "waiting_for_confirmation")
-        self.assertIsNone(output.best_long_scenario.invalidated_reason)
-        self.assertEqual(output.best_long_scenario.last_invalidated_component, "displacement_before_retest")
-        self.assertEqual(output.best_long_scenario.waiting_for, "bullish FVG retest")
+        self.assertEqual(output.best_long_scenario.status, "invalidated")
+        self.assertEqual(output.best_long_scenario.invalidated_reason, "displacement_before_retest")
 
-    def test_opposite_bos_after_sfp_waits_for_expected_confirmation(self):
+    def test_opposite_bos_after_sfp_invalidates_only_that_candidate(self):
         output = scan_scenarios(
             events=[
                 event("HTF_CONTEXT_CONFIRMED", index=1),
@@ -141,10 +158,8 @@ class ScenarioScannerTest(unittest.TestCase):
             premium_discount={"valid_for_buy": True},
         )
 
-        self.assertEqual(output.best_long_scenario.status, "waiting_for_confirmation")
-        self.assertIsNone(output.best_long_scenario.invalidated_reason)
-        self.assertEqual(output.best_long_scenario.last_invalidated_component, "opposite_bos_after_sfp")
-        self.assertEqual(output.best_long_scenario.waiting_for, "bullish CHOCH/BOS after SFP")
+        self.assertEqual(output.best_long_scenario.status, "invalidated")
+        self.assertEqual(output.best_long_scenario.invalidated_reason, "opposite_bos_after_sfp")
 
     def test_htf_neutral_has_no_scenario(self):
         output = scan_scenarios(
@@ -205,7 +220,7 @@ class ScenarioScannerTest(unittest.TestCase):
         self.assertEqual(output.best_long_scenario.waiting_for, "bullish CHOCH/BOS after SFP")
         self.assertFalse(output.signal_allowed)
 
-    def test_invalidated_fvg_after_structure_waits_for_valid_fvg(self):
+    def test_invalidated_fvg_after_structure_invalidates_only_that_candidate(self):
         output = scan_scenarios(
             events=[
                 event("HTF_CONTEXT_CONFIRMED", direction="bearish", index=1),
@@ -221,10 +236,150 @@ class ScenarioScannerTest(unittest.TestCase):
         )
 
         scenario = output.best_short_scenario
-        self.assertEqual(scenario.status, "waiting_for_confirmation")
-        self.assertIsNone(scenario.invalidated_reason)
-        self.assertEqual(scenario.last_invalidated_component, "fvg_invalidated")
-        self.assertEqual(scenario.waiting_for, "valid bearish FVG after SFP")
+        self.assertEqual(scenario.status, "invalidated")
+        self.assertEqual(scenario.invalidated_reason, "fvg_invalidated")
+
+    def test_two_long_candidates_first_invalidated_second_waiting(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index="2026-01-01 09:00"),
+                event("SFP_CONFIRMED", index="2026-01-01 10:00", quality=70),
+                event("CHOCH_CONFIRMED", index="2026-01-01 10:30", quality=75),
+                event("BOS_CONFIRMED", index="2026-01-01 11:00", quality=80),
+                event("FVG_CREATED", index="2026-01-01 12:00", quality=65, payload={"invalidated": True}),
+                event("SFP_CONFIRMED", index="2026-01-01 14:00", quality=82),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+        )
+
+        self.assertEqual(len(output.long_candidates), 2)
+        self.assertEqual(output.long_candidates[0].status, "invalidated")
+        self.assertEqual(output.long_candidates[0].invalidated_reason, "fvg_invalidated")
+        self.assertEqual(output.long_candidates[1].status, "waiting_for_confirmation")
+        self.assertEqual(output.long_candidates[1].waiting_for, "bullish CHOCH/BOS after SFP")
+        self.assertIs(output.selected_scenario, output.long_candidates[1])
+
+    def test_complete_candidate_beats_waiting_candidate(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=0),
+                event("SFP_CONFIRMED", index=1),
+                event("CHOCH_CONFIRMED", index=2),
+                event("BOS_CONFIRMED", index=3),
+                event("FVG_CREATED", index=4),
+                event("FVG_RETESTED", index=5),
+                event("DISPLACEMENT_CONFIRMED", index=6),
+                event("RISK_VALID", direction=None, index=7),
+                event("SFP_CONFIRMED", index=20, quality=95),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+        )
+
+        self.assertEqual(output.selected_scenario.status, "complete")
+        self.assertTrue(output.signal_allowed)
+
+    def test_waiting_candidate_beats_invalidated_candidate_with_more_steps(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=0),
+                event("SFP_CONFIRMED", index=1),
+                event("CHOCH_CONFIRMED", index=2),
+                event("BOS_CONFIRMED", index=3),
+                event("FVG_CREATED", index=4, payload={"invalidated": True}),
+                event("SFP_CONFIRMED", index=10),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+        )
+
+        self.assertEqual(output.selected_scenario.anchor_index, 10)
+        self.assertEqual(output.selected_scenario.status, "waiting_for_confirmation")
+
+    def test_higher_quality_candidate_wins_same_status_and_steps(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=0, quality=80),
+                event("SFP_CONFIRMED", index=1, quality=65),
+                event("SFP_CONFIRMED", index=2, quality=95),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+        )
+
+        self.assertEqual(output.selected_scenario.anchor_index, 2)
+
+    def test_more_recent_candidate_wins_same_quality(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=0, quality=80),
+                event("SFP_CONFIRMED", index=1, quality=80),
+                event("SFP_CONFIRMED", index=2, quality=80),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+        )
+
+        self.assertEqual(output.selected_scenario.anchor_index, 2)
+
+    def test_htf_direction_conflict_blocks_candidate(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", direction="bullish", index=0),
+                event("SFP_CONFIRMED", direction="bearish", index=1),
+            ],
+            expected_direction="SHORT",
+            htf_structure={"trend": "bullish"},
+        )
+
+        self.assertIsNone(output.best_short_scenario)
+        self.assertEqual(output.short_candidates, [])
+        self.assertEqual(output.direction_block_reasons["SHORT"], "htf_direction_conflict")
+        self.assertEqual(output.reason, "htf_direction_conflict")
+
+    def test_pd_direction_conflict_does_not_create_anchorless_candidate(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", direction="bullish", index=0),
+                event("POI_TOUCHED", direction="bullish", index=1),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+            premium_discount={"valid_for_buy": False},
+        )
+
+        self.assertEqual(output.long_candidates, [])
+        self.assertIsNone(output.best_long_scenario)
+        self.assertEqual(output.direction_block_reasons["LONG"], "pd_invalid_for_direction")
+        self.assertEqual(output.candidate_counts["long_total"], 0)
+
+    def test_no_anchor_does_not_create_candidate(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", direction="bullish", index=0),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+        )
+
+        self.assertEqual(output.long_candidates, [])
+        self.assertIsNone(output.best_long_scenario)
+        self.assertEqual(output.candidate_counts["long_total"], 0)
+
+    def test_top_candidates_output_limit(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=0),
+                *[event("SFP_CONFIRMED", index=i, quality=60 + i) for i in range(1, 11)],
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+        )
+
+        self.assertLessEqual(len(output.top_candidates), 5)
+        self.assertEqual(output.top_candidates[0].rank, 1)
+        self.assertEqual(output.candidate_counts["long_total"], 10)
 
 
 if __name__ == "__main__":

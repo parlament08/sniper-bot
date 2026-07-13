@@ -310,6 +310,43 @@ class AnalyzerIntegrationTest(unittest.TestCase):
             "no valid scenario — HTF direction conflict",
         )
 
+    def test_premium_discount_poi_uses_last_closed_timestamp_instead_of_synthetic_index(self):
+        last_closed = pd.Series({"close": 100.0}, name=pd.Timestamp("2026-01-01 12:15:00"))
+
+        events = analyzer._build_scenario_events(
+            "LONG",
+            {"trend": "bullish", "confidence": 65},
+            {"valid_for_buy": True, "valid_for_sell": False, "zone_strength": 75},
+            None,
+            {},
+            None,
+            [],
+            None,
+            None,
+            last_closed,
+        )
+
+        poi_events = [event for event in events if event.event_type == "POI_TOUCHED"]
+        self.assertEqual(len(poi_events), 1)
+        self.assertEqual(poi_events[0].index, pd.Timestamp("2026-01-01 12:15:00"))
+        self.assertNotEqual(poi_events[0].index, -1)
+
+    def test_premium_discount_without_real_timestamp_does_not_create_poi_event(self):
+        events = analyzer._build_scenario_events(
+            "LONG",
+            {"trend": "bullish", "confidence": 65},
+            {"valid_for_buy": True, "valid_for_sell": False, "zone_strength": 75},
+            None,
+            {},
+            None,
+            [],
+            None,
+            None,
+            None,
+        )
+
+        self.assertFalse(any(event.event_type == "POI_TOUCHED" for event in events))
+
     def test_dashboard_block_shows_no_trade_reason_gates_and_sweep_label(self):
         score_result = {
             "total_score": 0,
