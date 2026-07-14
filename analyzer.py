@@ -80,7 +80,7 @@ COINS_LIST = [
     'NEAR', 'APT', 'ICP', 'FIL', 'ETC',
     'ATOM', 'ARB', 'OP', 'INJ', 'TIA',
     'SEI', 'AAVE', 'MKR', 'RUNE', 'LDO',
-    'ORDI', 'WIF', 'PEPE', 'BONK', 'FET',
+    'ORDI', 'WIF', 'FET',
     'RENDER', 'GRT', 'JUP', 'PYTH', 'ENA',
     'HYPE', 'TON', 'WLD', 'ALGO', 'SAND',
     'MANA', 'APE', 'DYDX', 'IMX', 'STX',
