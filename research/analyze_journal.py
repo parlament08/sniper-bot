@@ -211,40 +211,65 @@ def _symbol_summary(df: pd.DataFrame) -> dict:
     return dict(sorted(symbols.items()))
 
 
+def _run_summary_summary(df: pd.DataFrame) -> dict:
+    if "record_type" not in df:
+        return {"runs_total": 0}
+    run_df = df[df["record_type"] == "run_summary"].copy()
+    if run_df.empty:
+        return {"runs_total": 0}
+    return {
+        "runs_total": int(len(run_df)),
+        "symbols_total": int(pd.to_numeric(_column(run_df, "symbols_total"), errors="coerce").fillna(0).sum()),
+        "symbols_success": int(pd.to_numeric(_column(run_df, "symbols_success"), errors="coerce").fillna(0).sum()),
+        "symbols_failed": int(pd.to_numeric(_column(run_df, "symbols_failed"), errors="coerce").fillna(0).sum()),
+        "duration_seconds": _numeric_summary(run_df, "duration_seconds"),
+        "a_plus_count": int(pd.to_numeric(_column(run_df, "a_plus_count"), errors="coerce").fillna(0).sum()),
+        "active_confirmed_trigger_count": int(pd.to_numeric(_column(run_df, "active_confirmed_trigger_count"), errors="coerce").fillna(0).sum()),
+        "historical_confirmed_trigger_count": int(pd.to_numeric(_column(run_df, "historical_confirmed_trigger_count"), errors="coerce").fillna(0).sum()),
+        "scenario_valid_count": int(pd.to_numeric(_column(run_df, "scenario_valid_count"), errors="coerce").fillna(0).sum()),
+        "signal_allowed_count": int(pd.to_numeric(_column(run_df, "signal_allowed_count"), errors="coerce").fillna(0).sum()),
+    }
+
+
 def summarize(df: pd.DataFrame) -> dict:
     if df.empty:
         return {"rows": 0}
+    symbol_df = df
+    if "record_type" in df:
+        symbol_df = df[df["record_type"].fillna("symbol_scan") != "run_summary"].copy()
     return {
-        "rows": int(len(df)),
-        "symbols": sorted(df["symbol"].dropna().unique().tolist()) if "symbol" in df else [],
-        "decision_counts": _count_values(df, "decision"),
-        "no_trade_reason_counts": _count_values(df, "no_trade_reason"),
-        "score_mean": round(float(df["score"].dropna().mean()), 4) if "score" in df and not df["score"].dropna().empty else None,
-        "score_max": round(float(df["score"].dropna().max()), 4) if "score" in df and not df["score"].dropna().empty else None,
-        "score_by_symbol": _symbol_summary(df),
+        "rows": int(len(symbol_df)),
+        "records_total": int(len(df)),
+        "run_summaries": _run_summary_summary(df),
+        "symbols": sorted(symbol_df["symbol"].dropna().unique().tolist()) if "symbol" in symbol_df else [],
+        "decision_counts": _count_values(symbol_df, "decision"),
+        "no_trade_reason_counts": _count_values(symbol_df, "no_trade_reason"),
+        "score_mean": round(float(symbol_df["score"].dropna().mean()), 4) if "score" in symbol_df and not symbol_df["score"].dropna().empty else None,
+        "score_max": round(float(symbol_df["score"].dropna().max()), 4) if "score" in symbol_df and not symbol_df["score"].dropna().empty else None,
+        "score_by_symbol": _symbol_summary(symbol_df),
         "features": {
             "trend_4h": {
-                "strength_counts": _count_values(df, "features.trend_4h.strength"),
-                "adx": _numeric_summary(df, "features.trend_4h.adx"),
+                "strength_counts": _count_values(symbol_df, "features.trend_4h.strength"),
+                "adx": _numeric_summary(symbol_df, "features.trend_4h.adx"),
             },
             "market_structure_4h": {
-                "trend_counts": _count_values(df, "features.market_structure_4h.trend"),
-                "reason_counts": _count_values(df, "features.market_structure_4h.reason", limit=8),
-                "confidence": _numeric_summary(df, "features.market_structure_4h.confidence"),
+                "trend_counts": _count_values(symbol_df, "features.market_structure_4h.trend"),
+                "reason_counts": _count_values(symbol_df, "features.market_structure_4h.reason", limit=8),
+                "confidence": _numeric_summary(symbol_df, "features.market_structure_4h.confidence"),
             },
-            "context_1h": _quality_block(df, "features.context_1h"),
-            "trigger_15m": _quality_block(df, "features.trigger_15m"),
-            "scenario_trigger_15m": _quality_block(df, "features.scenario_trigger_15m"),
-            "sfp": _sfp_summary(df),
-            "premium_discount": _premium_discount_summary(df),
-            "liquidity_map": _liquidity_map_summary(df),
-            "risk_plan": _risk_plan_summary(df),
-            "trigger_debug": _trigger_debug_summary(df),
-            "trigger_scan": _trigger_scan_summary(df),
-            "scenario_scan": _scenario_scan_summary(df),
+            "context_1h": _quality_block(symbol_df, "features.context_1h"),
+            "trigger_15m": _quality_block(symbol_df, "features.trigger_15m"),
+            "scenario_trigger_15m": _quality_block(symbol_df, "features.scenario_trigger_15m"),
+            "sfp": _sfp_summary(symbol_df),
+            "premium_discount": _premium_discount_summary(symbol_df),
+            "liquidity_map": _liquidity_map_summary(symbol_df),
+            "risk_plan": _risk_plan_summary(symbol_df),
+            "trigger_debug": _trigger_debug_summary(symbol_df),
+            "trigger_scan": _trigger_scan_summary(symbol_df),
+            "scenario_scan": _scenario_scan_summary(symbol_df),
         },
-        "gates": _gate_summary(df),
-        "state_machine_counts": _count_values(df, "breakdown.state_machine", limit=10),
+        "gates": _gate_summary(symbol_df),
+        "state_machine_counts": _count_values(symbol_df, "breakdown.state_machine", limit=10),
     }
 
 

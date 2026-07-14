@@ -172,6 +172,98 @@ class ScenarioScannerTest(unittest.TestCase):
         self.assertEqual(scenario.trigger_scan["selected_trigger"], scenario.trigger_scan["confirmed_trigger"])
         self.assertEqual(scenario.trigger_scan["waiting_for"], "bullish FVG after confirmed BOS")
 
+    def test_confirmed_sfp_chain_beats_newer_poi_only_candidate(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", direction="bearish", index=1),
+                event("SFP_CONFIRMED", direction="bearish", index=3, quality=82),
+                event("EARLY_TRIGGER_CONFIRMED", direction="bearish", index=4, quality=82),
+                event(
+                    "CONFIRMED_TRIGGER_CONFIRMED",
+                    direction="bearish",
+                    index=5,
+                    quality=97,
+                    payload={"type": "bearish_bos", "index": 5, "quality_score": 97},
+                ),
+                event("POI_TOUCHED", direction="bearish", index=10, quality=90),
+            ],
+            expected_direction="SHORT",
+            htf_structure={"trend": "bearish"},
+            premium_discount={"valid_for_sell": True},
+        )
+
+        scenario = output.selected_scenario
+        self.assertEqual(scenario.anchor_type, "SFP_CONFIRMED")
+        self.assertEqual(scenario.completed_steps, 5)
+        self.assertTrue(scenario.trigger_scan["trigger_confirmed"])
+        self.assertEqual(scenario.trigger_scan["confirmed_trigger"]["type"], "bearish_bos")
+        self.assertEqual(scenario.waiting_for, "bearish FVG after confirmed BOS")
+
+    def test_progress_beats_quality_and_recency_for_living_candidates(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", direction="bearish", index=1, quality=60),
+                event("SFP_CONFIRMED", direction="bearish", index=3, quality=60),
+                event("EARLY_TRIGGER_CONFIRMED", direction="bearish", index=4, quality=60),
+                event(
+                    "CONFIRMED_TRIGGER_CONFIRMED",
+                    direction="bearish",
+                    index=5,
+                    quality=70,
+                    payload={"type": "bearish_bos", "index": 5, "quality_score": 70},
+                ),
+                event("POI_TOUCHED", direction="bearish", index=100, quality=100),
+            ],
+            expected_direction="SHORT",
+            htf_structure={"trend": "bearish"},
+            premium_discount={"valid_for_sell": True},
+        )
+
+        scenario = output.selected_scenario
+        self.assertEqual(scenario.anchor_type, "SFP_CONFIRMED")
+        self.assertEqual(scenario.completed_steps, 5)
+        self.assertTrue(scenario.trigger_scan["trigger_confirmed"])
+        self.assertGreater(output.top_candidates[1].anchor_index, scenario.anchor_index)
+
+    def test_invalidated_progressed_candidate_reports_selection_ineligible(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", direction="bearish", index=1, quality=60),
+                event("SFP_CONFIRMED", direction="bearish", index=3, quality=80),
+                event("EARLY_TRIGGER_CONFIRMED", direction="bearish", index=4, quality=82),
+                event(
+                    "CONFIRMED_TRIGGER_CONFIRMED",
+                    direction="bearish",
+                    index=5,
+                    quality=97,
+                    payload={"type": "bearish_bos", "index": 5, "quality_score": 97},
+                ),
+                event("FVG_CREATED", direction="bearish", index=6, quality=85, payload={"invalidated": True}),
+                event("POI_TOUCHED", direction="bearish", index=10, quality=90),
+            ],
+            expected_direction="SHORT",
+            htf_structure={"trend": "bearish"},
+            premium_discount={"valid_for_sell": True},
+        )
+
+        selected = output.selected_scenario
+        self.assertEqual(selected.anchor_type, "POI_TOUCHED")
+        self.assertEqual(selected.rank, 2)
+        self.assertTrue(selected.selection_eligible)
+        self.assertIsNone(selected.selection_rejected_reason)
+
+        snapshot = output.to_dict()
+        top_candidate = snapshot["top_candidates"][0]
+        self.assertEqual(top_candidate["status"], "invalidated")
+        self.assertEqual(top_candidate["completed_steps"], 6)
+        self.assertEqual(top_candidate["rank"], 1)
+        self.assertEqual(top_candidate["progress_rank"], 1)
+        self.assertFalse(top_candidate["selection_eligible"])
+        self.assertEqual(top_candidate["selection_rejected_reason"], "candidate_invalidated")
+        self.assertFalse(top_candidate["is_selected"])
+        self.assertEqual(snapshot["selected_scenario"]["rank"], 2)
+        self.assertTrue(snapshot["selected_scenario"]["selection_eligible"])
+
     def test_opposite_confirmed_trigger_after_early_is_diagnostic_only(self):
         output = scan_scenarios(
             events=[

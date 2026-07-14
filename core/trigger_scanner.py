@@ -711,15 +711,12 @@ def _confirmed_trigger_debug(
         swing_points,
     )
     rejected = []
+    historical_rejected = []
     valid_count = 0
     bos_count = 0
     choch_count = 0
+    active_candidates = []
     for candidate in confirmed_candidates or []:
-        trigger_type = str(candidate.get("type", "")).lower()
-        if "bos" in trigger_type:
-            bos_count += 1
-        if "choch" in trigger_type:
-            choch_count += 1
         reason = _confirmed_trigger_rejected_reason(
             expected_direction,
             candidate,
@@ -728,20 +725,22 @@ def _confirmed_trigger_debug(
             max_bars,
             min_trigger_quality,
         )
+        if reason == "before_early_trigger":
+            historical_rejected.append(_candidate_debug_snapshot(candidate, reason))
+            continue
+
+        active_candidates.append(candidate)
+        trigger_type = str(candidate.get("type", "")).lower()
+        if "bos" in trigger_type:
+            bos_count += 1
+        if "choch" in trigger_type:
+            choch_count += 1
         if reason is None:
             valid_count += 1
             continue
-        rejected.append({
-            "type": candidate.get("type"),
-            "index": _string_index(_event_index(candidate)),
-            "quality_score": candidate.get("quality_score"),
-            "rejected_reason": reason,
-            "body_ratio": candidate.get("body_ratio"),
-            "close_position": candidate.get("close_position"),
-            "displacement_ratio": candidate.get("displacement_ratio"),
-        })
+        rejected.append(_candidate_debug_snapshot(candidate, reason))
 
-    _attach_candidate_debug_to_checked_candles(context, confirmed_candidates, rejected)
+    _attach_candidate_debug_to_checked_candles(context, active_candidates, rejected)
     final_reason = None
     if valid_count == 0:
         final_reason = "no_confirmed_bos_after_early_trigger"
@@ -764,7 +763,20 @@ def _confirmed_trigger_debug(
         "candidate_choch_count": choch_count,
         "valid_candidate_count": valid_count,
         "rejected_candidates": rejected,
+        "historical_rejected_candidates": historical_rejected,
         "final_reason": final_reason,
+    }
+
+
+def _candidate_debug_snapshot(candidate, reason):
+    return {
+        "type": candidate.get("type"),
+        "index": _string_index(_event_index(candidate)),
+        "quality_score": candidate.get("quality_score"),
+        "rejected_reason": reason,
+        "body_ratio": candidate.get("body_ratio"),
+        "close_position": candidate.get("close_position"),
+        "displacement_ratio": candidate.get("displacement_ratio"),
     }
 
 
@@ -807,6 +819,8 @@ def _confirmed_trigger_search_context(df_15m_closed, expected_direction, early_t
         return {
             "generator_called": True,
             "candles_after_early": 0,
+            "first_candle_after_early": None,
+            "last_candle_after_early": None,
             "micro_swing_high": None,
             "micro_swing_low": None,
             "break_level": None,
@@ -826,6 +840,8 @@ def _confirmed_trigger_search_context(df_15m_closed, expected_direction, early_t
     return {
         "generator_called": True,
         "candles_after_early": int(len(after_early)),
+        "first_candle_after_early": _string_index(after_early.index[0]) if not after_early.empty else None,
+        "last_candle_after_early": _string_index(after_early.index[-1]) if not after_early.empty else None,
         "micro_swing_high": _round_optional(high_level),
         "micro_swing_low": _round_optional(low_level),
         "break_level": _round_optional(break_level),

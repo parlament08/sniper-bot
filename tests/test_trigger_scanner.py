@@ -186,6 +186,28 @@ class TriggerScannerTest(unittest.TestCase):
         self.assertEqual(result.rejected_reason, "confirmed_trigger_missing")
         self.assertEqual(result.waiting_for, "confirmed bullish BOS after early CHOCH")
 
+    def test_pre_early_confirmed_candidate_is_historical_debug_only(self):
+        result = scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": 100},
+            trigger_candidates=[
+                {"type": "bullish_choch", "index": 104, "quality_score": 92},
+                self._early("bullish_early_choch", index=108, quality=88),
+            ],
+        )
+
+        self.assertTrue(result.early_trigger_confirmed)
+        self.assertFalse(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger_debug["candidate_bos_count"], 0)
+        self.assertEqual(result.confirmed_trigger_debug["candidate_choch_count"], 0)
+        self.assertEqual(result.confirmed_trigger_debug["rejected_candidates"], [])
+        self.assertEqual(result.confirmed_trigger_debug["historical_rejected_candidates"][0]["index"], "104")
+        self.assertEqual(
+            result.confirmed_trigger_debug["historical_rejected_candidates"][0]["rejected_reason"],
+            "before_early_trigger",
+        )
+        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "no_confirmed_bos_after_early_trigger")
+
     def test_confirmed_trigger_after_early_trigger_confirms_follow_up(self):
         result = scan_post_anchor_trigger(
             expected_direction="SHORT",
@@ -364,6 +386,31 @@ class TriggerScannerTest(unittest.TestCase):
         self.assertFalse(result.trigger_confirmed)
         self.assertTrue(result.confirmed_trigger_debug["generator_called"])
         self.assertEqual(result.confirmed_trigger_debug["candles_after_early"], 0)
+        self.assertIsNone(result.confirmed_trigger_debug["first_candle_after_early"])
+        self.assertIsNone(result.confirmed_trigger_debug["last_candle_after_early"])
+        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "not_enough_candles_after_early_trigger")
+
+    def test_no_candles_after_early_keeps_old_candidate_historical(self):
+        df = self._df([
+            {"index": 100, "open": 10.0, "high": 10.2, "low": 9.8, "close": 10.0, "atr": 1.0, "rvol": 1.0},
+            {"index": 110, "open": 10.0, "high": 10.4, "low": 9.9, "close": 10.3, "atr": 1.0, "rvol": 1.4},
+        ])
+        result = scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": 100},
+            trigger_candidates=[
+                {"type": "bullish_choch", "index": 90, "quality_score": 91},
+                self._early("bullish_early_choch", index=110, quality=88),
+            ],
+            df_15m_closed=df,
+            swing_points=self._swings(highs=[{"index": 105, "high": 10.5}]),
+        )
+
+        self.assertFalse(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger_debug["candles_after_early"], 0)
+        self.assertEqual(result.confirmed_trigger_debug["candidate_choch_count"], 0)
+        self.assertEqual(result.confirmed_trigger_debug["rejected_candidates"], [])
+        self.assertEqual(result.confirmed_trigger_debug["historical_rejected_candidates"][0]["index"], "90")
         self.assertEqual(result.confirmed_trigger_debug["final_reason"], "not_enough_candles_after_early_trigger")
 
     def test_candles_after_early_without_break_level_debug_reason(self):
@@ -403,6 +450,8 @@ class TriggerScannerTest(unittest.TestCase):
 
         self.assertFalse(result.trigger_confirmed)
         self.assertEqual(result.confirmed_trigger_debug["break_level"], 10.8)
+        self.assertEqual(result.confirmed_trigger_debug["first_candle_after_early"], "115")
+        self.assertEqual(result.confirmed_trigger_debug["last_candle_after_early"], "120")
         self.assertEqual(result.confirmed_trigger_debug["candidate_bos_count"], 0)
         self.assertEqual(result.confirmed_trigger_debug["checked_candles"][-1]["breaks_level"], False)
         self.assertEqual(result.confirmed_trigger_debug["final_reason"], "no_candle_closed_beyond_break_level")

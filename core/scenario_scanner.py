@@ -56,6 +56,9 @@ class ScenarioScanResult:
     trigger_scan: Optional[dict] = None
     is_selected: bool = False
     rank: Optional[int] = None
+    progress_rank: Optional[int] = None
+    selection_eligible: bool = False
+    selection_rejected_reason: Optional[str] = None
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -202,6 +205,9 @@ def scan_scenarios(
     )
     for rank, candidate in enumerate(ranked_candidates, start=1):
         candidate.rank = rank
+        candidate.progress_rank = rank
+        candidate.selection_eligible = _is_living(candidate)
+        candidate.selection_rejected_reason = None if candidate.selection_eligible else _selection_rejected_reason(candidate)
 
     best_long = _best_candidate(long_candidates, expected_direction, htf_trend)
     best_short = _best_candidate(short_candidates, expected_direction, htf_trend)
@@ -742,6 +748,14 @@ def _is_living(candidate):
     return candidate.status in {"building", "waiting_for_confirmation", "complete"}
 
 
+def _selection_rejected_reason(candidate):
+    if candidate.status == "invalidated":
+        return "candidate_invalidated"
+    if candidate.status not in {"building", "waiting_for_confirmation", "complete"}:
+        return f"candidate_status_{candidate.status}"
+    return None
+
+
 def _candidate_counts(long_candidates, short_candidates):
     all_candidates = list(long_candidates or []) + list(short_candidates or [])
     return {
@@ -763,6 +777,10 @@ def _candidate_summary(candidate):
         "completed_steps": candidate.completed_steps,
         "quality_score": candidate.quality_score,
         "rank": candidate.rank,
+        "progress_rank": candidate.progress_rank,
+        "selection_eligible": candidate.selection_eligible,
+        "selection_rejected_reason": candidate.selection_rejected_reason,
+        "is_selected": candidate.is_selected,
     }
     if candidate.waiting_for:
         data["waiting_for"] = candidate.waiting_for
@@ -829,15 +847,41 @@ def _selection_rank(result, expected_direction, htf_trend):
     expected = 1 if expected_direction and result.direction == str(expected_direction).upper() else 0
     htf_aligned = 1 if _direction_side(result.direction) == htf_trend else 0
     risk_valid = 1 if result.risk_valid else 0
+    trigger_confirmed = 1 if _candidate_has_confirmed_trigger(result) else 0
+    early_trigger_confirmed = 1 if _candidate_has_early_trigger(result) else 0
     return (
-        status_priority,
+        1 if result.scenario_valid else 0,
+        1 if result.signal_allowed else 0,
         result.completed_steps,
+        trigger_confirmed,
+        early_trigger_confirmed,
+        status_priority,
         result.quality_score,
-        _event_sort_key(result.anchor_index),
         _event_sort_key(result.last_event_index),
+        _event_sort_key(result.anchor_index),
         htf_aligned,
         risk_valid,
         expected,
+    )
+
+
+def _candidate_has_confirmed_trigger(result):
+    trigger_scan = result.trigger_scan or {}
+    if trigger_scan.get("trigger_confirmed"):
+        return True
+    return any(
+        _normalize_event_type(event.event_type) in ("CONFIRMED_TRIGGER_CONFIRMED", "CHOCH_CONFIRMED", "BOS_CONFIRMED")
+        for event in result.events_used or []
+    )
+
+
+def _candidate_has_early_trigger(result):
+    trigger_scan = result.trigger_scan or {}
+    if trigger_scan.get("early_trigger_confirmed"):
+        return True
+    return any(
+        _normalize_event_type(event.event_type) == "EARLY_TRIGGER_CONFIRMED"
+        for event in result.events_used or []
     )
 
 

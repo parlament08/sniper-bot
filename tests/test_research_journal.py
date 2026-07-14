@@ -122,6 +122,19 @@ class ResearchJournalTest(unittest.TestCase):
                         },
                         "diagnostics": {"pd_valid": True, "trigger_structure_aligned": True, "scenario_valid": True},
                     }),
+                    json.dumps({
+                        "record_type": "run_summary",
+                        "run_id": "run-1",
+                        "symbols_total": 2,
+                        "symbols_success": 2,
+                        "symbols_failed": 0,
+                        "duration_seconds": 12.5,
+                        "a_plus_count": 0,
+                        "active_confirmed_trigger_count": 0,
+                        "historical_confirmed_trigger_count": 1,
+                        "scenario_valid_count": 1,
+                        "signal_allowed_count": 1,
+                    }),
                 ]),
                 encoding="utf-8",
             )
@@ -130,6 +143,9 @@ class ResearchJournalTest(unittest.TestCase):
             summary = summarize(df)
 
         self.assertEqual(summary["rows"], 2)
+        self.assertEqual(summary["records_total"], 3)
+        self.assertEqual(summary["run_summaries"]["runs_total"], 1)
+        self.assertEqual(summary["run_summaries"]["historical_confirmed_trigger_count"], 1)
         self.assertEqual(summary["decision_counts"]["Ignore"], 1)
         self.assertEqual(summary["decision_counts"]["Watchlist"], 1)
         self.assertEqual(summary["score_max"], 40.0)
