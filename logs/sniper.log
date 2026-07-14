@@ -398,3 +398,135 @@
 [2026-07-13 21:36:11,411] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
 [2026-07-13 21:36:11,490] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
 [2026-07-13 21:36:11,620] WARNING [sniper_bot.send_telegram_blocks:113] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 21:56:58,279] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:56:58,419] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:56:58,580] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:56:58,659] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:56:58,737] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:56:58,868] WARNING [sniper_bot.send_telegram_blocks:113] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 21:57:37,541] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:57:37,696] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:57:37,863] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:57:37,943] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:57:38,021] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:57:38,151] WARNING [sniper_bot.send_telegram_blocks:113] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 21:58:02,710] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:58:02,855] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:58:03,018] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:58:03,110] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:58:03,228] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:58:03,365] WARNING [sniper_bot.send_telegram_blocks:113] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 21:58:08,767] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:58:08,907] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:58:09,069] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:58:09,148] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:58:09,225] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 21:58:09,356] WARNING [sniper_bot.send_telegram_blocks:113] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 22:37:35,031] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:37:35,189] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:37:35,366] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:37:35,446] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:37:35,524] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:37:35,668] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 22:39:02,777] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:39:02,787] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:39:02,943] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:39:02,956] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:39:03,135] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:39:03,144] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:39:03,224] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:39:03,231] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:39:03,305] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:39:03,313] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:39:03,439] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 22:39:03,448] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 22:48:53,407] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:48:53,575] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:48:53,769] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:48:53,858] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:48:53,948] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:48:54,110] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 22:49:49,617] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:49:49,795] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:49:49,978] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:49:50,065] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:49:50,151] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:49:50,304] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 22:49:54,235] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:49:54,403] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:49:54,634] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:49:54,721] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:49:54,807] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:49:54,999] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 22:59:57,393] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:59:57,561] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:59:57,744] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:59:57,830] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:59:57,916] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 22:59:58,076] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 23:00:43,983] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:00:44,175] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:00:44,410] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:00:44,504] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:00:44,597] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:00:44,812] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 23:00:51,228] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:00:51,430] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:00:51,635] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:00:51,727] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:00:51,817] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:00:52,013] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 23:14:27,208] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:14:27,220] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:14:27,402] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:14:27,413] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:14:27,597] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:14:27,605] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:14:27,688] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:14:27,695] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:14:27,778] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:14:27,784] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:14:27,938] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 23:14:27,982] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 23:28:22,192] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:28:22,362] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:28:22,544] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:28:22,632] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:28:22,721] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:28:22,911] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 23:28:34,774] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:28:34,945] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:28:35,133] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:28:35,222] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:28:35,308] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:28:35,537] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 23:43:49,159] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:43:49,328] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:43:49,511] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:43:49,597] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:43:49,683] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:43:49,869] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-13 23:45:48,509] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:45:48,709] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:45:48,967] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:45:49,074] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:45:49,163] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-13 23:45:49,357] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-14 00:00:19,004] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:19,174] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:19,356] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:19,448] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:19,538] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:19,740] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-14 00:00:26,231] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:26,401] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:26,588] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:26,679] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:26,774] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:26,976] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-14 00:00:50,759] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:50,938] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:51,132] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:51,226] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:51,314] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-14 00:00:51,509] WARNING [sniper_bot.send_telegram_blocks:117] Dashboard block exceeds Telegram safe length; splitting it by lines.

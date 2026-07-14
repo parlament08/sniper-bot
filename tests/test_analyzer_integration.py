@@ -310,6 +310,223 @@ class AnalyzerIntegrationTest(unittest.TestCase):
             "no valid scenario — HTF direction conflict",
         )
 
+    def test_format_trigger_and_scenario_scan_show_early_trigger_progress(self):
+        trigger_scan = {
+            "expected_direction": "LONG",
+            "selected_trigger": None,
+            "early_trigger": {
+                "type": "bullish_early_choch",
+                "quality_score": 68,
+                "index": "2026-01-01 10:15:00",
+                "trigger_stage": "early",
+                "is_early": True,
+            },
+            "early_trigger_confirmed": True,
+            "trigger_confirmed": False,
+            "rejected_reason": "confirmed_trigger_missing",
+            "waiting_for": "confirmed bullish BOS after early CHOCH",
+            "sfp_index": "2026-01-01 10:00:00",
+        }
+        scenario_scan = {
+            "reason": "waiting_for_confirmed_bullish_bos",
+            "selected_scenario": {
+                "status": "waiting_for_confirmation",
+                "direction": "LONG",
+                "waiting_for": "confirmed bullish BOS after early CHOCH",
+                "completed_steps": 4,
+                "total_steps": 10,
+            },
+        }
+
+        self.assertEqual(
+            analyzer._format_trigger_scan(trigger_scan),
+            "early bullish CHOCH Q68 after SFP — waiting for confirmed BOS",
+        )
+        self.assertEqual(
+            analyzer._format_scenario_scan(scenario_scan),
+            "waiting for confirmed bullish BOS | 4/10 steps",
+        )
+
+    def test_candidate_scoped_trigger_scan_mirrors_selected_scenario(self):
+        scenario_scan = {
+            "reason": "waiting_for_confirmed_bullish_bos",
+            "selected_direction": "LONG",
+            "selected_scenario": {
+                "candidate_id": "LONG_SFP_CONFIRMED_100_1",
+                "status": "waiting_for_confirmation",
+                "direction": "LONG",
+                "trigger_scan": {
+                    "candidate_id": "LONG_SFP_CONFIRMED_100_1",
+                    "expected_direction": "LONG",
+                    "early_trigger": {"type": "bullish_early_choch", "quality_score": 88, "index": "110"},
+                    "confirmed_trigger": None,
+                    "selected_trigger": None,
+                    "sfp_index": "100",
+                    "early_trigger_confirmed": True,
+                    "trigger_confirmed": False,
+                    "rejected_reason": "confirmed_trigger_missing",
+                    "waiting_for": "confirmed bullish BOS after early CHOCH",
+                },
+            },
+        }
+
+        scoped = analyzer._candidate_scoped_trigger_scan(scenario_scan, "LONG")
+
+        self.assertEqual(scoped, scenario_scan["selected_scenario"]["trigger_scan"])
+        self.assertTrue(scoped["early_trigger_confirmed"])
+        self.assertFalse(scoped["trigger_confirmed"])
+        self.assertEqual(
+            analyzer._format_trigger_scan(scoped),
+            "early bullish CHOCH Q88 after SFP — waiting for confirmed BOS",
+        )
+
+    def test_candidate_scoped_trigger_scan_falls_back_when_no_selected_scenario(self):
+        scenario_scan = {
+            "reason": "htf_direction_conflict",
+            "selected_direction": None,
+            "selected_scenario": None,
+        }
+
+        scoped = analyzer._candidate_scoped_trigger_scan(scenario_scan, "LONG")
+
+        self.assertFalse(scoped["early_trigger_confirmed"])
+        self.assertFalse(scoped["trigger_confirmed"])
+        self.assertEqual(scoped["rejected_reason"], "htf_direction_conflict")
+
+    def test_format_trigger_and_scenario_scan_show_confirmed_after_early(self):
+        trigger_scan = {
+            "expected_direction": "LONG",
+            "selected_trigger": {"type": "bullish_bos", "quality_score": 84, "index": "120"},
+            "confirmed_trigger": {"type": "bullish_bos", "quality_score": 84, "index": "120"},
+            "early_trigger": {"type": "bullish_early_choch", "quality_score": 88, "index": "110"},
+            "sfp_index": "100",
+            "early_trigger_confirmed": True,
+            "trigger_confirmed": True,
+            "waiting_for": "bullish FVG after confirmed BOS",
+        }
+        scenario_scan = {
+            "reason": "waiting_for_bullish_fvg_after_confirmed_bos",
+            "selected_scenario": {
+                "status": "waiting_for_confirmation",
+                "direction": "LONG",
+                "current_step": "confirmed_trigger_confirmed",
+                "next_expected_step": "FVG_CREATED",
+                "waiting_for": "bullish FVG after confirmed BOS",
+                "completed_steps": 5,
+                "total_steps": 10,
+            },
+        }
+
+        self.assertEqual(
+            analyzer._format_trigger_scan(trigger_scan),
+            "confirmed bullish BOS Q84 after early CHOCH",
+        )
+        self.assertEqual(
+            analyzer._format_scenario_scan(scenario_scan),
+            "waiting for bullish FVG | 5/10 steps",
+        )
+
+    def test_format_trigger_scan_shows_confirmed_debug_rejection(self):
+        trigger_scan = {
+            "expected_direction": "SHORT",
+            "early_trigger": {"type": "bearish_early_choch", "quality_score": 96, "index": "110"},
+            "sfp_index": "100",
+            "early_trigger_confirmed": True,
+            "trigger_confirmed": False,
+            "rejected_reason": "confirmed_trigger_missing",
+            "waiting_for": "confirmed bearish BOS after early CHOCH",
+            "confirmed_trigger_debug": {
+                "candidate_bos_count": 1,
+                "candidate_choch_count": 0,
+                "final_reason": "quality_below_min",
+                "rejected_candidates": [
+                    {"type": "bearish_bos", "index": "120", "quality_score": 62, "rejected_reason": "quality_below_min"}
+                ],
+            },
+        }
+
+        self.assertEqual(
+            analyzer._format_trigger_scan(trigger_scan),
+            "early bearish CHOCH Q96 after SFP — waiting for confirmed BOS | candidates 1 rejected: quality below min",
+        )
+
+    def test_detects_bullish_early_trigger_candidate_after_anchor(self):
+        index = pd.date_range("2026-01-01 10:00:00", periods=7, freq="15min")
+        df = pd.DataFrame(
+            {
+                "open": [100.0, 100.1, 100.4, 100.3, 100.2, 101.0, 101.4],
+                "high": [100.5, 100.7, 101.2, 100.8, 100.9, 101.8, 101.9],
+                "low": [99.8, 100.0, 100.1, 100.0, 100.1, 100.8, 101.0],
+                "close": [100.2, 100.3, 100.6, 100.2, 100.4, 101.65, 101.6],
+                "atr": [1.0] * 7,
+                "rvol": [1.0, 1.0, 1.1, 1.0, 1.0, 1.35, 1.0],
+            },
+            index=index,
+        )
+
+        candidates = analyzer._detect_early_trigger_candidates(
+            df,
+            {"type": "bullish_sfp", "index": index[0]},
+            None,
+            max_bars=6,
+        )
+
+        bullish = [item for item in candidates if item["type"] == "bullish_early_choch"]
+        self.assertTrue(bullish)
+        self.assertEqual(bullish[0]["index"], index[5])
+        self.assertTrue(bullish[0]["is_early"])
+        self.assertEqual(bullish[0]["trigger_stage"], "early")
+
+    def test_early_trigger_detector_ignores_break_before_anchor(self):
+        index = pd.date_range("2026-01-01 10:00:00", periods=7, freq="15min")
+        df = pd.DataFrame(
+            {
+                "open": [100.0, 100.1, 100.4, 100.3, 100.2, 101.0, 101.1],
+                "high": [100.5, 100.7, 101.2, 100.8, 100.9, 101.1, 101.2],
+                "low": [99.8, 100.0, 100.1, 100.0, 100.1, 100.8, 100.9],
+                "close": [100.2, 100.3, 100.6, 100.2, 100.4, 101.0, 101.05],
+                "atr": [1.0] * 7,
+                "rvol": [1.0, 1.0, 1.1, 1.0, 1.0, 1.35, 1.0],
+            },
+            index=index,
+        )
+
+        candidates = analyzer._detect_early_trigger_candidates(
+            df,
+            {"type": "bullish_sfp", "index": index[5]},
+            None,
+            max_bars=2,
+        )
+
+        self.assertEqual(candidates, [])
+
+    def test_detects_bearish_early_trigger_candidate_after_anchor(self):
+        index = pd.date_range("2026-01-01 10:00:00", periods=7, freq="15min")
+        df = pd.DataFrame(
+            {
+                "open": [100.0, 99.9, 99.4, 99.7, 99.8, 99.0, 98.6],
+                "high": [100.2, 100.0, 99.6, 99.9, 99.9, 99.2, 98.9],
+                "low": [99.5, 99.3, 98.8, 99.2, 99.1, 98.2, 98.1],
+                "close": [99.8, 99.7, 99.4, 99.8, 99.6, 98.35, 98.4],
+                "atr": [1.0] * 7,
+                "rvol": [1.0, 1.0, 1.1, 1.0, 1.0, 1.35, 1.0],
+            },
+            index=index,
+        )
+
+        candidates = analyzer._detect_early_trigger_candidates(
+            df,
+            {"type": "bearish_sfp", "index": index[0]},
+            None,
+            max_bars=6,
+        )
+
+        bearish = [item for item in candidates if item["type"] == "bearish_early_choch"]
+        self.assertTrue(bearish)
+        self.assertEqual(bearish[0]["index"], index[5])
+        self.assertTrue(bearish[0]["is_early"])
+        self.assertEqual(bearish[0]["trigger_stage"], "early")
+
     def test_premium_discount_poi_uses_last_closed_timestamp_instead_of_synthetic_index(self):
         last_closed = pd.Series({"close": 100.0}, name=pd.Timestamp("2026-01-01 12:15:00"))
 

@@ -53,6 +53,7 @@ class ScenarioScanResult:
     risk_reason: Optional[str] = None
     candidate_id: Optional[str] = None
     anchor_type: Optional[str] = None
+    trigger_scan: Optional[dict] = None
     is_selected: bool = False
     rank: Optional[int] = None
 
@@ -104,8 +105,8 @@ FLOW = (
     "HTF_CONTEXT_CONFIRMED",
     "POI_TOUCHED",
     "SFP_CONFIRMED",
-    "CHOCH_CONFIRMED",
-    "BOS_CONFIRMED",
+    "EARLY_TRIGGER_CONFIRMED",
+    "CONFIRMED_TRIGGER_CONFIRMED",
     "FVG_CREATED",
     "FVG_RETESTED",
     "DISPLACEMENT_CONFIRMED",
@@ -117,6 +118,8 @@ STEP_LABELS = {
     "HTF_CONTEXT_CONFIRMED": "htf_context_confirmed",
     "POI_TOUCHED": "poi_touched",
     "SFP_CONFIRMED": "liquidity_sweep_confirmed",
+    "EARLY_TRIGGER_CONFIRMED": "early_trigger_confirmed",
+    "CONFIRMED_TRIGGER_CONFIRMED": "confirmed_trigger_confirmed",
     "CHOCH_CONFIRMED": "choch_confirmed",
     "BOS_CONFIRMED": "bos_confirmed",
     "FVG_CREATED": "fvg_created",
@@ -129,13 +132,15 @@ STEP_LABELS = {
 WAITING_TEXT = {
     "POI_TOUCHED": "waiting_for_poi",
     "SFP_CONFIRMED": "liquidity sweep / SFP",
-    "CHOCH_CONFIRMED": "bullish CHOCH/BOS after SFP",
-    "BOS_CONFIRMED": "bullish BOS",
+    "EARLY_TRIGGER_CONFIRMED": "bullish CHOCH/BOS after SFP",
+    "CONFIRMED_TRIGGER_CONFIRMED": "confirmed bullish BOS after early CHOCH",
     "FVG_CREATED": "bullish FVG",
     "FVG_RETESTED": "bullish FVG retest",
     "DISPLACEMENT_CONFIRMED": "bullish displacement",
     "RISK_VALID": "risk plan",
 }
+
+CONFIRMED_TRIGGER_MIN_QUALITY = 70
 
 
 def scan_scenarios(
@@ -302,8 +307,16 @@ def _scan_direction(
     used: list[ScenarioEvent] = []
     completed = 0
     sfp_index = None
-    choch_seen = False
-    bos_seen = False
+    has_early_trigger_event = any(
+        _normalize_event_type(event.event_type) == "EARLY_TRIGGER_CONFIRMED"
+        and _normalize_side(event.direction) == scenario_side
+        for event in events
+    )
+    early_trigger_seen = False
+    early_trigger_index = None
+    confirmed_trigger_seen = False
+    opposite_trigger_event = None
+    rejected_confirmed_candidates = []
     fvg_seen = False
     retest_seen = False
     risk_valid = False
@@ -346,32 +359,42 @@ def _scan_direction(
                 sfp_index = event.index
             continue
 
-        if event_type in ("CHOCH_CONFIRMED", "BOS_CONFIRMED") and side == scenario_side and completed < 3:
+        if event_type in ("EARLY_TRIGGER_CONFIRMED", "CHOCH_CONFIRMED", "BOS_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED") and side == scenario_side and completed < 3:
             last_invalidated_component = "trigger_before_sfp"
             continue
 
-        if event_type == "BOS_CONFIRMED" and side == opposite_side and completed >= 3:
+        if event_type in ("BOS_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED") and side == opposite_side and completed >= 3:
+            if early_trigger_seen:
+                opposite_trigger_event = event
+                rejected_confirmed_candidates.append(_rejected_confirmed_candidate(event, "direction_conflict"))
+                continue
             return _finalize_candidate(_invalid_result(direction, "opposite_bos_after_sfp", used + [event]), anchor_event, candidate_sequence)
 
-        if event_type == "BOS_CONFIRMED" and side == scenario_side and strict_bos_after_choch and not choch_seen:
-            return _finalize_candidate(_invalid_result(direction, "bos_before_choch", used + [event]), anchor_event, candidate_sequence)
-
-        if event_type == "CHOCH_CONFIRMED" and side == scenario_side:
+        if event_type == "EARLY_TRIGGER_CONFIRMED" and side == scenario_side:
             if completed < 4:
                 used.append(event)
                 completed = max(completed, 4)
-            choch_seen = True
+            early_trigger_seen = True
+            early_trigger_index = event.index
             continue
 
-        if event_type == "BOS_CONFIRMED" and side == scenario_side:
+        if event_type in ("CHOCH_CONFIRMED", "BOS_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED") and side == scenario_side:
+            if has_early_trigger_event and not early_trigger_seen:
+                last_invalidated_component = "confirmed_trigger_before_early"
+                rejected_confirmed_candidates.append(_rejected_confirmed_candidate(event, "before_early_trigger"))
+                continue
+            if has_early_trigger_event and float(event.quality_score or 0.0) < CONFIRMED_TRIGGER_MIN_QUALITY:
+                last_invalidated_component = "confirmed_trigger_quality_below_min"
+                rejected_confirmed_candidates.append(_rejected_confirmed_candidate(event, "quality_below_min"))
+                continue
             if completed < 5:
-                used.append(event)
+                used.append(_with_type(event, "CONFIRMED_TRIGGER_CONFIRMED"))
                 completed = max(completed, 5)
-            bos_seen = True
+            confirmed_trigger_seen = True
             continue
 
         if event_type == "FVG_CREATED" and side == scenario_side:
-            if not bos_seen:
+            if not confirmed_trigger_seen:
                 continue
             if _payload_bool(event, "invalidated"):
                 return _finalize_candidate(_invalid_result(direction, "fvg_invalidated", used + [event]), anchor_event, candidate_sequence)
@@ -382,7 +405,7 @@ def _scan_direction(
             continue
 
         if event_type == "FVG_RETESTED" and side == scenario_side:
-            if not bos_seen:
+            if not confirmed_trigger_seen:
                 continue
             if not fvg_seen:
                 return _finalize_candidate(_invalid_result(direction, "retest_before_fvg", used + [event]), anchor_event, candidate_sequence)
@@ -393,7 +416,7 @@ def _scan_direction(
             continue
 
         if event_type == "DISPLACEMENT_CONFIRMED" and side == scenario_side:
-            if not bos_seen:
+            if not confirmed_trigger_seen:
                 continue
             if not retest_seen:
                 return _finalize_candidate(_invalid_result(direction, "displacement_before_retest", used + [event]), anchor_event, candidate_sequence)
@@ -434,14 +457,22 @@ def _scan_direction(
 
     if completed == 0:
         return _finalize_candidate(_partial_result(
+        direction,
+        "not_started",
+        used,
+        completed,
+        risk_valid=risk_valid,
+        risk_reason=risk_reason,
+        last_invalidated_component=last_invalidated_component,
+        opposite_trigger_event=opposite_trigger_event,
+        confirmed_trigger_debug=_confirmed_trigger_debug(
             direction,
-            "not_started",
-            used,
-            completed,
-            risk_valid=risk_valid,
-            risk_reason=risk_reason,
-            last_invalidated_component=last_invalidated_component,
-        ), anchor_event, candidate_sequence)
+            early_trigger_index,
+            events,
+            rejected_confirmed_candidates,
+            confirmed_trigger_seen,
+        ),
+    ), anchor_event, candidate_sequence)
     if completed >= len(FLOW):
         return _finalize_candidate(_complete_result(direction, used, risk_valid=risk_valid, risk_reason=risk_reason), anchor_event, candidate_sequence)
     return _finalize_candidate(_partial_result(
@@ -453,6 +484,14 @@ def _scan_direction(
         risk_reason=risk_reason,
         anchor_index=sfp_index,
         last_invalidated_component=last_invalidated_component,
+        opposite_trigger_event=opposite_trigger_event,
+        confirmed_trigger_debug=_confirmed_trigger_debug(
+            direction,
+            early_trigger_index,
+            events,
+            rejected_confirmed_candidates,
+            confirmed_trigger_seen,
+        ),
     ), anchor_event, candidate_sequence)
 
 
@@ -466,11 +505,18 @@ def _partial_result(
     risk_reason=None,
     anchor_index=None,
     last_invalidated_component=None,
+    opposite_trigger_event=None,
+    confirmed_trigger_debug=None,
 ) -> ScenarioScanResult:
     next_step = FLOW[completed] if completed < len(FLOW) else None
     missing = list(FLOW[completed:])
     current_step = STEP_LABELS[FLOW[completed - 1]] if completed > 0 else "not_started"
     waiting_for = _waiting_for(direction, next_step, last_invalidated_component)
+    trigger_scan_extra = {}
+    if opposite_trigger_event is not None:
+        trigger_scan_extra["opposite_trigger"] = _event_payload_or_snapshot(opposite_trigger_event, stage="confirmed")
+    if confirmed_trigger_debug is not None:
+        trigger_scan_extra["confirmed_trigger_debug"] = confirmed_trigger_debug
     return ScenarioScanResult(
         direction=direction,
         status=status,
@@ -490,6 +536,7 @@ def _partial_result(
         last_event_index=_last_index(used),
         risk_valid=risk_valid,
         risk_reason=risk_reason,
+        trigger_scan=trigger_scan_extra or None,
     )
 
 
@@ -558,12 +605,123 @@ def _finalize_candidate(result, anchor_event, sequence):
     else:
         result.candidate_id = _candidate_id(result.direction, "BASE", result.anchor_index, sequence)
     result.quality_score = _candidate_quality(result)
+    result.trigger_scan = _candidate_trigger_scan(result)
     return result
+
+
+def _candidate_trigger_scan(result: ScenarioScanResult) -> dict:
+    extra_scan = dict(result.trigger_scan or {})
+    early_event = _first_used_event(result.events_used, ("EARLY_TRIGGER_CONFIRMED",))
+    confirmed_event = _first_used_event(result.events_used, ("CONFIRMED_TRIGGER_CONFIRMED", "CHOCH_CONFIRMED", "BOS_CONFIRMED"))
+    sfp_event = _first_used_event(result.events_used, ("SFP_CONFIRMED", "LIQUIDITY_SWEEP_CONFIRMED"))
+    early_trigger = _event_payload_or_snapshot(early_event, stage="early")
+    confirmed_trigger = _event_payload_or_snapshot(confirmed_event, stage="confirmed")
+    opposite_trigger = extra_scan.get("opposite_trigger")
+    confirmed_trigger_debug = extra_scan.get("confirmed_trigger_debug")
+
+    rejected_reason = result.invalidated_reason
+    waiting_for = result.waiting_for
+    if result.status != "invalidated":
+        if sfp_event is None and result.next_expected_step == "SFP_CONFIRMED":
+            rejected_reason = "waiting_for_sfp"
+            waiting_for = "liquidity sweep / SFP"
+        elif early_trigger and not confirmed_trigger:
+            rejected_reason = "confirmed_trigger_missing"
+        elif not confirmed_trigger and result.next_expected_step in ("EARLY_TRIGGER_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED"):
+            rejected_reason = _missing_after_reason(result.direction)
+        elif confirmed_trigger and result.next_expected_step == "FVG_CREATED":
+            waiting_for = f"{_direction_side(result.direction)} FVG after confirmed BOS"
+
+    trigger_confirmed = confirmed_trigger is not None
+    return {
+        "candidate_id": result.candidate_id,
+        "anchor_type": result.anchor_type,
+        "anchor_index": _string_index(result.anchor_index),
+        "expected_direction": result.direction,
+        "direction": result.direction,
+        "selected_trigger": confirmed_trigger if trigger_confirmed else None,
+        "confirmed_trigger": confirmed_trigger,
+        "early_trigger": early_trigger,
+        "opposite_trigger": opposite_trigger,
+        "sfp_index": _string_index(sfp_event.index) if sfp_event else None,
+        "poi_index": _string_index(_first_index(result.events_used, ("POI_TOUCHED",))),
+        "trigger_index": _string_index(confirmed_event.index) if confirmed_event else None,
+        "early_trigger_confirmed": early_trigger is not None,
+        "trigger_confirmed": trigger_confirmed,
+        "rejected_reason": rejected_reason,
+        "waiting_for": waiting_for,
+        "confirmed_trigger_debug": confirmed_trigger_debug,
+    }
 
 
 def _candidate_id(direction, anchor_type, anchor_index, sequence):
     index = str(anchor_index).replace(" ", "T") if anchor_index is not None else "none"
     return f"{direction}_{anchor_type}_{index}_{sequence}"
+
+
+def _confirmed_trigger_debug(direction, early_trigger_index, events, rejected_candidates, confirmed_trigger_seen):
+    if early_trigger_index is None:
+        return None
+    carried_debug = _carried_confirmed_trigger_debug(direction, early_trigger_index, events)
+    if carried_debug:
+        debug = dict(carried_debug)
+        if rejected_candidates:
+            existing_rejected = list(debug.get("rejected_candidates") or [])
+            debug["rejected_candidates"] = existing_rejected + list(rejected_candidates or [])
+            if not confirmed_trigger_seen and not debug.get("final_reason"):
+                debug["final_reason"] = debug["rejected_candidates"][0].get("rejected_reason")
+        return debug
+    scenario_side = _direction_side(direction)
+    confirmed_events = [
+        event for event in events or []
+        if _normalize_event_type(event.event_type) in ("CHOCH_CONFIRMED", "BOS_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED")
+        and _normalize_side(event.direction) == scenario_side
+    ]
+    final_reason = None
+    if not confirmed_trigger_seen:
+        final_reason = "no_confirmed_bos_after_early_trigger"
+        if rejected_candidates:
+            final_reason = rejected_candidates[0].get("rejected_reason") or final_reason
+    return {
+        "early_trigger_index": _string_index(early_trigger_index),
+        "search_window_start": _string_index(early_trigger_index),
+        "search_window_end": None,
+        "expected_direction": direction,
+        "candidate_bos_count": sum(1 for event in confirmed_events if "bos" in str(_event_type_from_payload(event)).lower()),
+        "candidate_choch_count": sum(1 for event in confirmed_events if "choch" in str(_event_type_from_payload(event)).lower()),
+        "rejected_candidates": list(rejected_candidates or []),
+        "final_reason": final_reason,
+    }
+
+
+def _carried_confirmed_trigger_debug(direction, early_trigger_index, events):
+    scenario_side = _direction_side(direction)
+    for event in events or []:
+        if _normalize_event_type(event.event_type) != "EARLY_TRIGGER_CONFIRMED":
+            continue
+        if _normalize_side(event.direction) != scenario_side:
+            continue
+        if _event_sort_key(event.index) != _event_sort_key(early_trigger_index):
+            continue
+        payload = event.payload or {}
+        debug = payload.get("confirmed_trigger_debug")
+        if debug:
+            return debug
+    return None
+
+
+def _rejected_confirmed_candidate(event, reason):
+    return {
+        "type": _event_type_from_payload(event),
+        "index": _string_index(event.index),
+        "quality_score": event.quality_score,
+        "rejected_reason": reason,
+    }
+
+
+def _event_type_from_payload(event):
+    payload = event.payload or {}
+    return payload.get("type") or _trigger_type_from_event(event, "confirmed")
 
 
 def _candidate_quality(result):
@@ -715,6 +873,10 @@ def _reason_from_waiting(waiting_for):
         "liquidity sweep / SFP": "waiting_for_liquidity_sweep",
         "bullish CHOCH/BOS after SFP": "waiting_for_bullish_choch_or_bos",
         "bearish CHOCH/BOS after SFP": "waiting_for_bearish_choch_or_bos",
+        "confirmed bullish BOS after early CHOCH": "waiting_for_confirmed_bullish_bos",
+        "confirmed bearish BOS after early CHOCH": "waiting_for_confirmed_bearish_bos",
+        "bullish FVG after confirmed BOS": "waiting_for_bullish_fvg_after_confirmed_bos",
+        "bearish FVG after confirmed BOS": "waiting_for_bearish_fvg_after_confirmed_bos",
         "bullish BOS": "waiting_for_bullish_bos",
         "bearish BOS": "waiting_for_bearish_bos",
     }
@@ -727,6 +889,8 @@ def _waiting_for(direction, next_step, last_invalidated_component=None):
     side = _direction_side(direction)
     if next_step == "FVG_CREATED" and last_invalidated_component in {"fvg_invalidated", "fvg_before_bos"}:
         return f"valid {side} FVG after SFP"
+    if next_step == "FVG_CREATED":
+        return f"{side} FVG after confirmed BOS"
     if next_step == "RISK_VALID" and last_invalidated_component:
         return "valid risk plan"
     text = WAITING_TEXT.get(next_step, next_step.lower())
@@ -741,6 +905,8 @@ def _completed_count(events):
         event_type = _normalize_event_type(event.event_type)
         if event_type == "LIQUIDITY_SWEEP_CONFIRMED":
             event_type = "SFP_CONFIRMED"
+        if event_type in ("CHOCH_CONFIRMED", "BOS_CONFIRMED"):
+            event_type = "CONFIRMED_TRIGGER_CONFIRMED"
         if event_type in FLOW:
             completed = max(completed, FLOW.index(event_type) + 1)
     if any(_normalize_event_type(event.event_type) == "RISK_VALID" for event in events or []):
@@ -858,6 +1024,50 @@ def _first_index(events, event_types):
         if _normalize_event_type(event.event_type) in wanted:
             return event.index
     return None
+
+
+def _first_used_event(events, event_types):
+    wanted = set(event_types)
+    for event in events or []:
+        if _normalize_event_type(event.event_type) in wanted:
+            return event
+    return None
+
+
+def _event_payload_or_snapshot(event, stage):
+    if event is None:
+        return None
+    payload = dict(event.payload or {})
+    if not payload:
+        payload = {
+            "type": _trigger_type_from_event(event, stage),
+            "direction": event.direction,
+            "index": event.index,
+            "quality_score": event.quality_score,
+        }
+    payload.setdefault("index", event.index)
+    payload.setdefault("quality_score", event.quality_score)
+    if payload.get("index") is not None:
+        payload["index"] = _string_index(payload.get("index"))
+    payload["trigger_stage"] = stage
+    payload["is_early"] = stage == "early"
+    payload["is_confirmed"] = stage == "confirmed"
+    return payload
+
+
+def _trigger_type_from_event(event, stage):
+    side = _normalize_side(event.direction) or "trigger"
+    if stage == "early":
+        return f"{side}_early_choch"
+    return f"{side}_bos"
+
+
+def _missing_after_reason(direction):
+    return "no_bullish_trigger_after_sfp_or_poi" if direction == "LONG" else "no_bearish_trigger_after_sfp_or_poi"
+
+
+def _string_index(index):
+    return str(index) if index is not None else None
 
 
 def _last_index(events):

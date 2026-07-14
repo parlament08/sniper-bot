@@ -55,6 +55,10 @@ MIN_SCENARIO_FVG_QUALITY = 70
 MAX_SCENARIO_FVG_AGE = 64
 MAX_SCENARIO_FVG_RETESTS = 3
 MIN_TRIGGER_QUALITY = 70
+MIN_EARLY_TRIGGER_QUALITY = 55
+MIN_EARLY_TRIGGER_BODY_RATIO = 0.45
+MIN_EARLY_TRIGGER_DISPLACEMENT_ATR = 0.5
+MIN_EARLY_TRIGGER_RVOL = 1.2
 TRIGGER_LINK_WINDOW_BARS = 5
 MAX_TRIGGER_BARS_AFTER_SFP = 24
 MAX_TRIGGER_BARS_AFTER_POI = 24
@@ -354,6 +358,10 @@ def _event_snapshot(event):
         'rejection_strength': event.get('rejection_strength'),
         'volume_confirmed': event.get('volume_confirmed'),
         'absorption_warning': event.get('absorption_warning'),
+        'trigger_stage': event.get('trigger_stage'),
+        'is_early': event.get('is_early'),
+        'is_confirmed': event.get('is_confirmed'),
+        'reason': event.get('reason'),
     }
 
 
@@ -373,6 +381,8 @@ def _trigger_scan_snapshot(trigger_scan):
     return {
         'expected_direction': data.get('expected_direction'),
         'selected_trigger': _trigger_candidate_snapshot(data.get('selected_trigger')),
+        'confirmed_trigger': _trigger_candidate_snapshot(data.get('confirmed_trigger')),
+        'early_trigger': _trigger_candidate_snapshot(data.get('early_trigger')),
         'pre_sfp_trigger': _trigger_candidate_snapshot(data.get('pre_sfp_trigger')),
         'post_sfp_trigger': _trigger_candidate_snapshot(data.get('post_sfp_trigger')),
         'pre_poi_trigger': _trigger_candidate_snapshot(data.get('pre_poi_trigger')),
@@ -384,8 +394,10 @@ def _trigger_scan_snapshot(trigger_scan):
         'anchor_index': str(data.get('anchor_index')) if data.get('anchor_index') is not None else None,
         'trigger_index': str(data.get('trigger_index')) if data.get('trigger_index') is not None else None,
         'trigger_confirmed': data.get('trigger_confirmed'),
+        'early_trigger_confirmed': data.get('early_trigger_confirmed'),
         'rejected_reason': data.get('rejected_reason'),
         'waiting_for': data.get('waiting_for'),
+        'confirmed_trigger_debug': data.get('confirmed_trigger_debug'),
     }
 
 
@@ -395,6 +407,33 @@ def _scenario_scan_snapshot(scenario_output):
     if hasattr(scenario_output, 'to_dict'):
         return scenario_output.to_dict()
     return dict(scenario_output)
+
+
+def _candidate_scoped_trigger_scan(scenario_output, expected_direction=None):
+    snapshot = _scenario_scan_snapshot(scenario_output)
+    if not snapshot:
+        return None
+    selected = snapshot.get('selected_scenario')
+    if selected:
+        trigger_scan = selected.get('trigger_scan')
+        if trigger_scan:
+            return trigger_scan
+    return {
+        'expected_direction': expected_direction or snapshot.get('selected_direction') or 'NEUTRAL',
+        'selected_trigger': None,
+        'confirmed_trigger': None,
+        'early_trigger': None,
+        'candidate_trigger': None,
+        'opposite_trigger': None,
+        'sfp_index': None,
+        'poi_index': None,
+        'anchor_index': None,
+        'trigger_index': None,
+        'early_trigger_confirmed': False,
+        'trigger_confirmed': False,
+        'rejected_reason': snapshot.get('reason') or 'no_valid_scenario',
+        'waiting_for': None,
+    }
 
 
 def _liquidity_level_snapshot(level):
@@ -624,6 +663,121 @@ def _detect_recent_structure_events(df, swing_highs, swing_lows, timeframe_minut
     return events[-limit:]
 
 
+def _detect_early_trigger_candidates(df_15m_closed, sfp_data, poi_data, max_bars=24):
+    anchor_index = _early_anchor_index(sfp_data, poi_data)
+    if anchor_index is None or df_15m_closed is None or df_15m_closed.empty:
+        return []
+
+    micro_highs, micro_lows = find_swings(df_15m_closed, left_bars=2, right_bars=1)
+    anchor_sort = _event_sort_key(anchor_index)
+    window = df_15m_closed[_event_sort_key_index(df_15m_closed.index) > anchor_sort].head(max_bars)
+    candidates = []
+    for index, candle in window.iterrows():
+        bullish = _build_early_trigger_candidate("bullish", candle, index, micro_highs, micro_lows, anchor_sort)
+        bearish = _build_early_trigger_candidate("bearish", candle, index, micro_highs, micro_lows, anchor_sort)
+        if bullish:
+            candidates.append(bullish)
+        if bearish:
+            candidates.append(bearish)
+    return candidates
+
+
+def _event_sort_key_index(index):
+    return pd.Index([_event_sort_key(item) for item in index])
+
+
+def _early_anchor_index(sfp_data, poi_data):
+    sfp_index = sfp_data.get('index') if sfp_data else None
+    if sfp_index is not None:
+        return sfp_index
+    return poi_data.get('index') if poi_data else None
+
+
+def _build_early_trigger_candidate(direction, candle, index, micro_highs, micro_lows, anchor_sort):
+    candle_range = float(candle.get('high', 0.0) or 0.0) - float(candle.get('low', 0.0) or 0.0)
+    if candle_range <= 0:
+        return None
+    open_price = float(candle.get('open', 0.0) or 0.0)
+    close_price = float(candle.get('close', 0.0) or 0.0)
+    high_price = float(candle.get('high', 0.0) or 0.0)
+    low_price = float(candle.get('low', 0.0) or 0.0)
+    body_ratio = abs(close_price - open_price) / candle_range
+    atr = float(candle.get('atr', 0.0) or 0.0)
+    displacement_ratio = abs(close_price - open_price) / atr if atr > 0 else 0.0
+    close_position = (close_price - low_price) / candle_range
+    rvol = float(candle.get('rvol', 0.0) or 0.0)
+    absorption_warning = bool(rvol >= 1.8 and body_ratio < 0.35)
+
+    if body_ratio < MIN_EARLY_TRIGGER_BODY_RATIO:
+        return None
+    if displacement_ratio < MIN_EARLY_TRIGGER_DISPLACEMENT_ATR:
+        return None
+    if absorption_warning:
+        return None
+
+    if direction == "bullish":
+        level = _latest_micro_level(micro_highs, "high", index, anchor_sort)
+        if level is None or close_price <= level or close_position < 0.6:
+            return None
+        trigger_type = "bullish_early_choch"
+        micro_break_confirmed = True
+    else:
+        level = _latest_micro_level(micro_lows, "low", index, anchor_sort)
+        if level is None or close_price >= level or close_position > 0.4:
+            return None
+        trigger_type = "bearish_early_choch"
+        micro_break_confirmed = True
+
+    if rvol < MIN_EARLY_TRIGGER_RVOL and not micro_break_confirmed:
+        return None
+
+    quality = _early_trigger_quality(body_ratio, displacement_ratio, rvol, close_position, direction)
+    if quality < MIN_EARLY_TRIGGER_QUALITY:
+        return None
+
+    return {
+        "type": trigger_type,
+        "direction": direction,
+        "index": index,
+        "level": round(float(level), 8),
+        "quality_score": quality,
+        "body_ratio": round(body_ratio, 4),
+        "displacement_ratio": round(displacement_ratio, 4),
+        "close_position": round(close_position, 4),
+        "rvol": round(rvol, 4),
+        "absorption_warning": absorption_warning,
+        "micro_break_confirmed": micro_break_confirmed,
+        "trigger_stage": "early",
+        "is_early": True,
+        "is_confirmed": False,
+        "reason": f"micro swing {'high' if direction == 'bullish' else 'low'} break after SFP/POI",
+    }
+
+
+def _latest_micro_level(swings, column, index, anchor_sort):
+    if swings is None or swings.empty:
+        return None
+    eligible = swings[
+        (_event_sort_key_index(swings.index) > anchor_sort)
+        & (_event_sort_key_index(swings.index) < _event_sort_key(index))
+    ]
+    if eligible.empty:
+        return None
+    return float(eligible.iloc[-1][column])
+
+
+def _early_trigger_quality(body_ratio, displacement_ratio, rvol, close_position, direction):
+    quality = 40
+    quality += min(body_ratio * 20, 20)
+    quality += min(displacement_ratio * 15, 20)
+    quality += min(rvol * 5, 10)
+    if direction == "bullish":
+        quality += max(0.0, close_position - 0.5) * 20
+    else:
+        quality += max(0.0, 0.5 - close_position) * 20
+    return int(round(max(0, min(100, quality))))
+
+
 def _structure_for_state_machine(direction, market_structure, context_structure, trigger_structure):
     state_direction = _direction_to_state_direction(direction)
     if state_direction is None:
@@ -773,7 +927,11 @@ def _format_trigger_name(trigger):
         return 'none'
     trigger_type = str(trigger.get('type', 'trigger'))
     parts = trigger_type.split('_')
-    if len(parts) >= 2:
+    if len(parts) >= 3 and parts[1] == 'early':
+        name = f"{parts[0]} {parts[2].upper()}"
+    elif len(parts) >= 3 and parts[1] == 'micro':
+        name = f"{parts[0]} MICRO"
+    elif len(parts) >= 2:
         name = f"{parts[0]} {parts[1].upper()}"
     else:
         name = trigger_type
@@ -840,6 +998,8 @@ def _build_trigger_debug(
         )
     trigger_scan_data = trigger_scan.to_dict() if hasattr(trigger_scan, 'to_dict') else dict(trigger_scan)
     selected_candidate = trigger_scan_data.get('selected_trigger')
+    confirmed_candidate = trigger_scan_data.get('confirmed_trigger')
+    early_candidate = trigger_scan_data.get('early_trigger')
     candidate_trigger = trigger_scan_data.get('candidate_trigger')
     opposite_candidate = trigger_scan_data.get('opposite_trigger')
 
@@ -855,6 +1015,8 @@ def _build_trigger_debug(
     debug = {
         'expected_direction': _direction_label(state_direction),
         'selected_trigger': _trigger_candidate_snapshot(selected_candidate) if trigger_scan_data.get('trigger_confirmed') else None,
+        'confirmed_trigger': _trigger_candidate_snapshot(confirmed_candidate),
+        'early_trigger': _trigger_candidate_snapshot(early_candidate),
         'candidate_trigger': _trigger_candidate_snapshot(candidate_trigger),
         'long_trigger_candidate': _trigger_candidate_snapshot(long_trigger_candidate),
         'short_trigger_candidate': _trigger_candidate_snapshot(short_trigger_candidate),
@@ -872,6 +1034,7 @@ def _build_trigger_debug(
         'fvg_scenario_valid': bool(scenario_fvg),
         'fvg_rejected_reason': _scenario_fvg_reject_reason(latest_fvg) if latest_fvg else None,
         'trigger_confirmed': bool(trigger_scan_data.get('trigger_confirmed')),
+        'early_trigger_confirmed': bool(trigger_scan_data.get('early_trigger_confirmed')),
         'trigger_scan': _trigger_scan_snapshot(trigger_scan),
     }
 
@@ -909,6 +1072,7 @@ def _format_trigger_debug(trigger_debug):
     reason = trigger_debug.get('trigger_rejected_reason') or 'unknown'
     expected = trigger_debug.get('expected_direction') or 'NEUTRAL'
     selected = trigger_debug.get('selected_trigger')
+    early = trigger_debug.get('early_trigger')
     opposite = trigger_debug.get('opposite_trigger')
     fvg_reason = trigger_debug.get('fvg_rejected_reason')
     opposite_text = f" | opposite: {_format_trigger_name(opposite)}" if opposite and expected != 'NEUTRAL' else ""
@@ -921,6 +1085,9 @@ def _format_trigger_debug(trigger_debug):
 
     if selected and trigger_debug.get('trigger_confirmed'):
         return f"{_format_trigger_name(selected)} confirmed after SFP/POI{opposite_text}"
+
+    if early and trigger_debug.get('early_trigger_confirmed'):
+        return f"early {_format_trigger_name(early)} after SFP/POI — waiting for confirmed BOS{opposite_text}{fvg_text}"
 
     if reason in ('no_bullish_trigger_after_sfp_or_poi', 'no_bearish_trigger_after_sfp_or_poi'):
         direction_word = 'bullish' if expected == 'LONG' else 'bearish'
@@ -935,6 +1102,7 @@ def _format_trigger_scan(trigger_scan):
         return '0'
     expected = snapshot.get('expected_direction') or 'NEUTRAL'
     selected = snapshot.get('selected_trigger')
+    early = snapshot.get('early_trigger')
     reason = snapshot.get('rejected_reason')
     waiting_for = snapshot.get('waiting_for')
     pre_sfp = snapshot.get('pre_sfp_trigger')
@@ -948,8 +1116,15 @@ def _format_trigger_scan(trigger_scan):
         return f"skipped — no trade direction because HTF is Neutral{candidate_text}"
 
     if selected and snapshot.get('trigger_confirmed'):
+        if early:
+            return f"confirmed {_format_trigger_name(selected)} after early CHOCH"
         anchor = 'SFP' if snapshot.get('sfp_index') is not None else 'POI'
         return f"confirmed — {_format_trigger_name(selected)} after {anchor}"
+
+    if early and snapshot.get('early_trigger_confirmed'):
+        anchor = 'SFP' if snapshot.get('sfp_index') is not None else 'POI'
+        debug_suffix = _format_confirmed_trigger_debug_suffix(snapshot.get('confirmed_trigger_debug'))
+        return f"early {_format_trigger_name(early)} after {anchor} — waiting for confirmed BOS{debug_suffix}"
 
     if reason in ('trigger_before_sfp', 'trigger_before_poi'):
         trigger = pre_sfp if reason == 'trigger_before_sfp' else pre_poi
@@ -967,6 +1142,34 @@ def _format_trigger_scan(trigger_scan):
         return f"waiting — {waiting_for}"
 
     return f"rejected — {reason or 'unknown'}"
+
+
+def _format_confirmed_trigger_debug_suffix(debug):
+    if not debug:
+        return ""
+    candidate_count = int(debug.get('candidate_bos_count') or 0) + int(debug.get('candidate_choch_count') or 0)
+    final_reason = debug.get('final_reason')
+    if candidate_count <= 0:
+        if final_reason:
+            return f" | {_humanize_confirmed_debug_reason(final_reason)}"
+        return " | no confirmed BOS after early trigger"
+    if not final_reason:
+        return f" | candidates {candidate_count}"
+    return f" | candidates {candidate_count} rejected: {_humanize_confirmed_debug_reason(final_reason)}"
+
+
+def _humanize_confirmed_debug_reason(reason):
+    mapping = {
+        'quality_below_min': 'quality below min',
+        'before_early_trigger': 'before early trigger',
+        'direction_conflict': 'direction conflict',
+        'outside_confirmation_window': 'outside window',
+        'no_confirmed_bos_after_early_trigger': 'no confirmed BOS after early trigger',
+        'not_enough_candles_after_early_trigger': 'not enough candles after early trigger',
+        'no_confirmed_break_level_after_early_trigger': 'no break level after early trigger',
+        'no_candle_closed_beyond_break_level': 'no candle closed beyond break level',
+    }
+    return mapping.get(reason, reason or 'unknown')
 
 
 def _format_scenario_scan(scenario_output):
@@ -1030,6 +1233,10 @@ def _humanize_scenario_reason(reason):
         'waiting_for_liquidity_sweep': 'liquidity sweep / SFP',
         'waiting_for_bullish_choch_or_bos': 'bullish CHOCH/BOS after SFP',
         'waiting_for_bearish_choch_or_bos': 'bearish CHOCH/BOS after SFP',
+        'waiting_for_confirmed_bullish_bos': 'confirmed bullish BOS',
+        'waiting_for_confirmed_bearish_bos': 'confirmed bearish BOS',
+        'waiting_for_bullish_fvg_after_confirmed_bos': 'bullish FVG',
+        'waiting_for_bearish_fvg_after_confirmed_bos': 'bearish FVG',
         'waiting_for_bullish_bos': 'bullish BOS',
         'waiting_for_bearish_bos': 'bearish BOS',
         'valid_risk_plan': 'valid risk plan',
@@ -1041,9 +1248,15 @@ def _humanize_scenario_waiting(waiting_for):
     mapping = {
         'waiting_for_poi': 'POI touch',
         'waiting_for_liquidity_sweep': 'liquidity sweep / SFP',
+        'confirmed bullish BOS after early CHOCH': 'confirmed bullish BOS',
+        'confirmed bearish BOS after early CHOCH': 'confirmed bearish BOS',
+        'bullish FVG after confirmed BOS': 'bullish FVG',
+        'bearish FVG after confirmed BOS': 'bearish FVG',
         'SFP_CONFIRMED': 'liquidity sweep / SFP',
         'CHOCH_CONFIRMED': 'CHOCH/BOS after SFP',
         'BOS_CONFIRMED': 'BOS',
+        'EARLY_TRIGGER_CONFIRMED': 'CHoCH/BOS after SFP',
+        'CONFIRMED_TRIGGER_CONFIRMED': 'confirmed BOS',
         'FVG_CREATED': 'valid FVG',
         'FVG_RETESTED': 'FVG retest',
         'DISPLACEMENT_CONFIRMED': 'displacement',
@@ -1107,6 +1320,19 @@ def _build_scenario_events(
         ))
 
     trigger_data = trigger_scan.to_dict() if hasattr(trigger_scan, 'to_dict') else dict(trigger_scan or {})
+    early_trigger = trigger_data.get('early_trigger')
+    if early_trigger:
+        early_trigger_payload = dict(early_trigger)
+        if trigger_data.get('confirmed_trigger_debug') is not None:
+            early_trigger_payload['confirmed_trigger_debug'] = trigger_data.get('confirmed_trigger_debug')
+        events.append(_scenario_event(
+            'EARLY_TRIGGER_CONFIRMED',
+            _event_direction(early_trigger),
+            early_trigger.get('index'),
+            early_trigger.get('quality_score'),
+            'trigger_scan',
+            early_trigger_payload,
+        ))
     selected_trigger = trigger_data.get('selected_trigger')
     for structure in (context_structure, selected_trigger):
         if not structure:
@@ -1114,9 +1340,9 @@ def _build_scenario_events(
         structure_direction = _event_direction(structure)
         structure_type = str(structure.get('type', ''))
         if 'choch' in structure_type:
-            events.append(_scenario_event('CHOCH_CONFIRMED', structure_direction, structure.get('index'), structure.get('quality_score'), 'structure', structure))
+            events.append(_scenario_event('CONFIRMED_TRIGGER_CONFIRMED', structure_direction, structure.get('index'), structure.get('quality_score'), 'structure', structure))
         elif 'bos' in structure_type:
-            events.append(_scenario_event('BOS_CONFIRMED', structure_direction, structure.get('index'), structure.get('quality_score'), 'structure', structure))
+            events.append(_scenario_event('CONFIRMED_TRIGGER_CONFIRMED', structure_direction, structure.get('index'), structure.get('quality_score'), 'structure', structure))
 
     for fvg in _latest_fvgs_by_type(fvg_data):
         fvg_direction = 'bullish' if fvg.get('type') == 'bullish' else 'bearish' if fvg.get('type') == 'bearish' else None
@@ -1363,6 +1589,16 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         timeframe_minutes=240,
         right_bars=2,
         config=bos_config,
+    )
+    recent_15m_structure_events = _detect_recent_structure_events(
+        df_15m_closed,
+        swing_highs_15m,
+        swing_lows_15m,
+        timeframe_minutes=15,
+        right_bars=3,
+        config=bos_config,
+        lookback=MAX_TRIGGER_BARS_AFTER_SFP + MAX_TRIGGER_BARS_AFTER_POI,
+        limit=12,
     )
 
     # Итерируемся по окну С КОНЦА, чтобы найти ПОСЛЕДНИЕ (самые релевантные) события SFP и BOS
@@ -1635,15 +1871,25 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
             }
             direction = 'NEUTRAL'
     selected_fvg_test_data = long_fvg_test_data if direction == 'LONG' else short_fvg_test_data if direction == 'SHORT' else None
+    early_trigger_candidates = _detect_early_trigger_candidates(
+        df_15m_closed,
+        sfp_data_in_window,
+        selected_fvg_test_data,
+        max_bars=max(MAX_TRIGGER_BARS_AFTER_SFP, MAX_TRIGGER_BARS_AFTER_POI),
+    )
+    trigger_candidates = list(recent_15m_structure_events) + list(early_trigger_candidates)
     trigger_scan = scan_post_anchor_trigger(
         expected_direction=direction,
         sfp=sfp_data_in_window,
         poi=selected_fvg_test_data,
         long_trigger_candidate=long_trigger_candidate,
         short_trigger_candidate=short_trigger_candidate,
+        trigger_candidates=trigger_candidates,
+        df_15m_closed=df_15m_closed,
         max_bars_after_sfp=MAX_TRIGGER_BARS_AFTER_SFP,
         max_bars_after_poi=MAX_TRIGGER_BARS_AFTER_POI,
         min_trigger_quality=MIN_TRIGGER_QUALITY,
+        min_early_trigger_quality=MIN_EARLY_TRIGGER_QUALITY,
     )
     scenario_trigger_15m = trigger_scan.selected_trigger
     trigger_debug = _build_trigger_debug(
@@ -1700,6 +1946,7 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
     final_score_result['diagnostics']['trigger_rejected_reason'] = trigger_debug.get('trigger_rejected_reason')
     final_score_result['diagnostics']['trigger_scan_rejected_reason'] = trigger_scan.rejected_reason
     final_score_result['diagnostics']['trigger_scan_confirmed'] = trigger_scan.trigger_confirmed
+    final_score_result['diagnostics']['early_trigger_confirmed'] = trigger_scan.early_trigger_confirmed
     final_score_result['diagnostics']['trigger_confirmed'] = trigger_scan.trigger_confirmed
     final_score_result['diagnostics']['trigger_structure_aligned'] = bool(scenario_trigger_15m)
     final_score_result['diagnostics']['fvg_scenario_valid'] = trigger_debug.get('fvg_scenario_valid')
@@ -1758,6 +2005,13 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
     final_score_result['diagnostics']['scenario_scan_reason'] = scenario_scan.reason
     final_score_result['diagnostics']['scenario_scan'] = _scenario_scan_snapshot(scenario_scan)
     selected_scenario = scenario_scan.selected_scenario
+    scoped_trigger_scan = _candidate_scoped_trigger_scan(scenario_scan, direction)
+    scoped_trigger_snapshot = _trigger_scan_snapshot(scoped_trigger_scan) or {}
+    final_score_result['breakdown']['trigger_scan'] = _format_trigger_scan(scoped_trigger_scan)
+    final_score_result['diagnostics']['trigger_scan_rejected_reason'] = scoped_trigger_snapshot.get('rejected_reason')
+    final_score_result['diagnostics']['trigger_scan_confirmed'] = bool(scoped_trigger_snapshot.get('trigger_confirmed'))
+    final_score_result['diagnostics']['early_trigger_confirmed'] = bool(scoped_trigger_snapshot.get('early_trigger_confirmed'))
+    final_score_result['diagnostics']['trigger_confirmed'] = bool(scoped_trigger_snapshot.get('trigger_confirmed'))
     final_score_result['diagnostics']['scenario_scan_status'] = selected_scenario.status if selected_scenario else None
     final_score_result['diagnostics']['scenario_scan_direction'] = scenario_scan.selected_direction
 
@@ -1791,6 +2045,8 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         "scenario_trigger_15m": scenario_trigger_15m,
         "long_trigger_candidate": long_trigger_candidate,
         "short_trigger_candidate": short_trigger_candidate,
+        "recent_15m_structure_events": recent_15m_structure_events,
+        "early_trigger_candidates": early_trigger_candidates,
         "sfp_data": sfp_data_in_window,
         "fvg_candidates": all_fvgs,
         "active_fvg": selected_fvg_test_data,
@@ -1798,7 +2054,8 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         "liquidity_map": liquidity_map,
         "risk_plan": risk_plan,
         "trigger_debug": trigger_debug,
-        "trigger_scan": trigger_scan,
+        "trigger_scan": scoped_trigger_scan,
+        "global_trigger_scan": trigger_scan,
         "scenario_scan": scenario_scan,
         "scenario_events": scenario_events,
         "state_machine": state_machine_status,

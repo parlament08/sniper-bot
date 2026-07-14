@@ -52,9 +52,53 @@ class ScenarioScannerTest(unittest.TestCase):
         scenario = output.selected_scenario
         self.assertEqual(scenario.status, "waiting_for_confirmation")
         self.assertEqual(scenario.current_step, "liquidity_sweep_confirmed")
-        self.assertEqual(scenario.next_expected_step, "CHOCH_CONFIRMED")
+        self.assertEqual(scenario.next_expected_step, "EARLY_TRIGGER_CONFIRMED")
         self.assertEqual(scenario.waiting_for, "bullish CHOCH/BOS after SFP")
         self.assertFalse(output.signal_allowed)
+
+    def test_early_trigger_progresses_living_scenario_without_signal_allowed(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=1),
+                event("POI_TOUCHED", index=2),
+                event("SFP_CONFIRMED", index=3),
+                event("EARLY_TRIGGER_CONFIRMED", index=4, quality=68),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+            premium_discount={"valid_for_buy": True},
+        )
+
+        scenario = output.selected_scenario
+        self.assertEqual(scenario.status, "waiting_for_confirmation")
+        self.assertEqual(scenario.current_step, "early_trigger_confirmed")
+        self.assertEqual(scenario.next_expected_step, "CONFIRMED_TRIGGER_CONFIRMED")
+        self.assertEqual(scenario.completed_steps, 4)
+        self.assertEqual(scenario.waiting_for, "confirmed bullish BOS after early CHOCH")
+        self.assertFalse(scenario.signal_allowed)
+        self.assertFalse(scenario.scenario_valid)
+
+    def test_confirmed_trigger_before_early_does_not_complete_trigger_step(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=1),
+                event("POI_TOUCHED", index=2),
+                event("SFP_CONFIRMED", index=3),
+                event("CONFIRMED_TRIGGER_CONFIRMED", index=4, quality=90),
+                event("EARLY_TRIGGER_CONFIRMED", index=5, quality=70),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+            premium_discount={"valid_for_buy": True},
+        )
+
+        scenario = output.selected_scenario
+        self.assertEqual(scenario.status, "waiting_for_confirmation")
+        self.assertEqual(scenario.current_step, "early_trigger_confirmed")
+        self.assertEqual(scenario.next_expected_step, "CONFIRMED_TRIGGER_CONFIRMED")
+        self.assertEqual(scenario.completed_steps, 4)
+        self.assertEqual(scenario.last_invalidated_component, "confirmed_trigger_before_early")
+        self.assertEqual(scenario.waiting_for, "confirmed bullish BOS after early CHOCH")
 
     def test_waiting_for_liquidity_sweep_uses_human_text_but_stable_reason(self):
         output = scan_scenarios(
@@ -70,6 +114,166 @@ class ScenarioScannerTest(unittest.TestCase):
         scenario = output.selected_scenario
         self.assertEqual(scenario.waiting_for, "liquidity sweep / SFP")
         self.assertEqual(output.reason, "waiting_for_liquidity_sweep")
+        self.assertIsNotNone(scenario.trigger_scan)
+        self.assertIsNone(scenario.trigger_scan["early_trigger"])
+        self.assertFalse(scenario.trigger_scan["early_trigger_confirmed"])
+        self.assertFalse(scenario.trigger_scan["trigger_confirmed"])
+        self.assertEqual(scenario.trigger_scan["rejected_reason"], "waiting_for_sfp")
+        self.assertEqual(scenario.trigger_scan["waiting_for"], "liquidity sweep / SFP")
+
+    def test_sfp_candidate_trigger_scan_includes_scoped_early_trigger(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=1),
+                event("POI_TOUCHED", index=2),
+                event("SFP_CONFIRMED", index=3),
+                event(
+                    "EARLY_TRIGGER_CONFIRMED",
+                    index=4,
+                    quality=88,
+                    payload={"type": "bullish_early_choch", "index": 4, "quality_score": 88},
+                ),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+            premium_discount={"valid_for_buy": True},
+        )
+
+        scenario = output.selected_scenario
+        self.assertEqual(scenario.current_step, "early_trigger_confirmed")
+        self.assertEqual(scenario.completed_steps, 4)
+        self.assertTrue(scenario.trigger_scan["early_trigger_confirmed"])
+        self.assertFalse(scenario.trigger_scan["trigger_confirmed"])
+        self.assertEqual(scenario.trigger_scan["early_trigger"]["type"], "bullish_early_choch")
+        self.assertEqual(scenario.trigger_scan["waiting_for"], "confirmed bullish BOS after early CHOCH")
+
+    def test_confirmed_trigger_after_early_moves_scenario_to_fvg_wait(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=1),
+                event("POI_TOUCHED", index=2),
+                event("SFP_CONFIRMED", index=3),
+                event("EARLY_TRIGGER_CONFIRMED", index=4, quality=88, payload={"type": "bullish_early_choch", "index": 4, "quality_score": 88}),
+                event("CONFIRMED_TRIGGER_CONFIRMED", index=5, quality=84, payload={"type": "bullish_bos", "index": 5, "quality_score": 84}),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+            premium_discount={"valid_for_buy": True},
+        )
+
+        scenario = output.selected_scenario
+        self.assertEqual(scenario.current_step, "confirmed_trigger_confirmed")
+        self.assertEqual(scenario.next_expected_step, "FVG_CREATED")
+        self.assertEqual(scenario.completed_steps, 5)
+        self.assertEqual(scenario.waiting_for, "bullish FVG after confirmed BOS")
+        self.assertTrue(scenario.trigger_scan["early_trigger_confirmed"])
+        self.assertTrue(scenario.trigger_scan["trigger_confirmed"])
+        self.assertEqual(scenario.trigger_scan["confirmed_trigger"]["type"], "bullish_bos")
+        self.assertEqual(scenario.trigger_scan["selected_trigger"], scenario.trigger_scan["confirmed_trigger"])
+        self.assertEqual(scenario.trigger_scan["waiting_for"], "bullish FVG after confirmed BOS")
+
+    def test_opposite_confirmed_trigger_after_early_is_diagnostic_only(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=1),
+                event("POI_TOUCHED", index=2),
+                event("SFP_CONFIRMED", index=3),
+                event("EARLY_TRIGGER_CONFIRMED", index=4, quality=88),
+                event("CONFIRMED_TRIGGER_CONFIRMED", direction="bearish", index=5, quality=92),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+            premium_discount={"valid_for_buy": True},
+        )
+
+        scenario = output.selected_scenario
+        self.assertEqual(scenario.current_step, "early_trigger_confirmed")
+        self.assertEqual(scenario.next_expected_step, "CONFIRMED_TRIGGER_CONFIRMED")
+        self.assertFalse(scenario.trigger_scan["trigger_confirmed"])
+        self.assertIsNone(scenario.trigger_scan["confirmed_trigger"])
+        self.assertIsNotNone(scenario.trigger_scan["opposite_trigger"])
+        self.assertEqual(scenario.waiting_for, "confirmed bullish BOS after early CHOCH")
+
+    def test_low_quality_confirmed_trigger_after_early_has_debug_rejection(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=1),
+                event("POI_TOUCHED", index=2),
+                event("SFP_CONFIRMED", index=3),
+                event("EARLY_TRIGGER_CONFIRMED", index=4, quality=88),
+                event("CONFIRMED_TRIGGER_CONFIRMED", index=5, quality=62, payload={"type": "bullish_bos", "index": 5, "quality_score": 62}),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+            premium_discount={"valid_for_buy": True},
+        )
+
+        scenario = output.selected_scenario
+        debug = scenario.trigger_scan["confirmed_trigger_debug"]
+        self.assertEqual(scenario.current_step, "early_trigger_confirmed")
+        self.assertFalse(scenario.trigger_scan["trigger_confirmed"])
+        self.assertEqual(debug["candidate_bos_count"], 1)
+        self.assertEqual(debug["final_reason"], "quality_below_min")
+        self.assertEqual(debug["rejected_candidates"][0]["rejected_reason"], "quality_below_min")
+
+    def test_carried_confirmed_trigger_debug_survives_candidate_scan(self):
+        carried_debug = {
+            "generator_called": True,
+            "early_trigger_index": "4",
+            "search_window_start": "4",
+            "search_window_end": "28",
+            "candles_after_early": 2,
+            "expected_direction": "LONG",
+            "micro_swing_high": 10.8,
+            "micro_swing_low": None,
+            "break_level": 10.8,
+            "checked_candles": [
+                {
+                    "index": "5",
+                    "close": 10.6,
+                    "high": 10.7,
+                    "low": 10.2,
+                    "body_ratio": 0.5,
+                    "close_position": 0.8,
+                    "displacement_ratio": 0.6,
+                    "breaks_level": False,
+                    "direction_ok": True,
+                    "candidate_created": False,
+                }
+            ],
+            "candidate_bos_count": 0,
+            "candidate_choch_count": 0,
+            "rejected_candidates": [],
+            "final_reason": "no_candle_closed_beyond_break_level",
+        }
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=1),
+                event("POI_TOUCHED", index=2),
+                event("SFP_CONFIRMED", index=3),
+                event(
+                    "EARLY_TRIGGER_CONFIRMED",
+                    index=4,
+                    quality=88,
+                    payload={
+                        "type": "bullish_early_choch",
+                        "index": 4,
+                        "quality_score": 88,
+                        "confirmed_trigger_debug": carried_debug,
+                    },
+                ),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+            premium_discount={"valid_for_buy": True},
+        )
+
+        scenario = output.selected_scenario
+        debug = scenario.trigger_scan["confirmed_trigger_debug"]
+        self.assertTrue(debug["generator_called"])
+        self.assertEqual(debug["candles_after_early"], 2)
+        self.assertEqual(debug["checked_candles"][0]["index"], "5")
+        self.assertEqual(debug["final_reason"], "no_candle_closed_beyond_break_level")
 
     def test_candidate_does_not_use_pre_anchor_bos(self):
         output = scan_scenarios(
@@ -106,8 +310,8 @@ class ScenarioScannerTest(unittest.TestCase):
 
         self.assertEqual(output.best_long_scenario.status, "waiting_for_confirmation")
         self.assertIsNone(output.best_long_scenario.invalidated_reason)
-        self.assertEqual(output.best_long_scenario.current_step, "bos_confirmed")
-        self.assertEqual(output.best_long_scenario.waiting_for, "bullish FVG")
+        self.assertEqual(output.best_long_scenario.current_step, "confirmed_trigger_confirmed")
+        self.assertEqual(output.best_long_scenario.waiting_for, "bullish FVG after confirmed BOS")
 
     def test_poi_candidate_with_pseudo_index_ignores_unbranched_invalid_fvg(self):
         output = scan_scenarios(
@@ -216,7 +420,7 @@ class ScenarioScannerTest(unittest.TestCase):
         )
 
         self.assertEqual(output.best_long_scenario.status, "waiting_for_confirmation")
-        self.assertEqual(output.best_long_scenario.next_expected_step, "CHOCH_CONFIRMED")
+        self.assertEqual(output.best_long_scenario.next_expected_step, "EARLY_TRIGGER_CONFIRMED")
         self.assertEqual(output.best_long_scenario.waiting_for, "bullish CHOCH/BOS after SFP")
         self.assertFalse(output.signal_allowed)
 
