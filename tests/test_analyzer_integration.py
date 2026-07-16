@@ -8,6 +8,7 @@ os.environ.setdefault("GEMINI_API_KEY", "test-key")
 
 import analyzer
 from core.risk_plan import RiskPlan
+from core.scenario_scanner import ScenarioEvent, ScenarioScanResult, ScenarioScannerOutput
 from core.structure import MarketStructure
 
 
@@ -120,7 +121,7 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertIn(pd.Timedelta(hours=1), rvol_time_steps)
         self.assertIn(pd.Timedelta(minutes=15), rvol_time_steps)
 
-    def test_prepare_caps_high_score_when_state_machine_gate_fails(self):
+    def test_prepare_does_not_cap_high_score_when_diagnostic_state_machine_gate_fails(self):
         def fake_fetch(coin, timeframe, limit):
             freq = "4h" if timeframe == "4h" else "1h" if timeframe == "1h" else "15min"
             return self._df(freq=freq)
@@ -174,6 +175,37 @@ class AnalyzerIntegrationTest(unittest.TestCase):
             stop_model="structural_invalidation",
             target_model="nearest_liquidity",
         )
+        complete_scenario = ScenarioScanResult(
+            direction="LONG",
+            status="complete",
+            current_step="signal_allowed",
+            next_expected_step=None,
+            signal_allowed=True,
+            scenario_valid=True,
+            completion_ratio=1.0,
+            completed_steps=10,
+            total_steps=10,
+            quality_score=92,
+            risk_valid=True,
+            candidate_id="LONG_SFP_2026-01-01T10:00:00",
+            events_used=[
+                ScenarioEvent("FVG_CREATED", "LONG", pd.Timestamp("2026-01-01 10:30:00")),
+                ScenarioEvent("FVG_RETESTED", "LONG", pd.Timestamp("2026-01-01 10:45:00")),
+                ScenarioEvent("DISPLACEMENT_CONFIRMED", "LONG", pd.Timestamp("2026-01-01 11:00:00")),
+            ],
+        )
+        complete_scan = ScenarioScannerOutput(
+            best_long_scenario=complete_scenario,
+            best_short_scenario=None,
+            selected_scenario=complete_scenario,
+            selected_direction="LONG",
+            signal_allowed=True,
+            scenario_valid=True,
+            reason="signal_allowed",
+            long_candidates=[complete_scenario],
+            top_candidates=[complete_scenario],
+            selected_scenario_id=complete_scenario.candidate_id,
+        )
 
         with patch("analyzer.fetch_candles", side_effect=fake_fetch), \
             patch("analyzer.calculate_ema", side_effect=lambda df, period: pd.Series(100.0, index=df.index)), \
@@ -191,15 +223,17 @@ class AnalyzerIntegrationTest(unittest.TestCase):
             patch("analyzer._resolve_premium_discount", return_value={"valid_for_buy": True, "valid_for_sell": False, "zone": "discount"}), \
             patch("analyzer.calculate_setup_score", side_effect=[high_score.copy(), low_score.copy()]), \
             patch("analyzer._state_machine_diagnostic", return_value=("waiting_for_liquidity_sweep C25", blocked_state)), \
+            patch("analyzer.scan_scenarios", return_value=complete_scan), \
             patch("analyzer.build_risk_plan", return_value=valid_risk):
             score_result, _ = analyzer.prepare_and_analyze("BTC", {})
 
-        self.assertEqual(score_result["total_score"], 69)
-        self.assertEqual(score_result["decision"], "Watchlist")
-        self.assertEqual(score_result["no_trade_reason"], "waiting_for_liquidity_sweep")
-        self.assertEqual(score_result["diagnostics"]["scenario_scan_reason"], "waiting_for_liquidity_sweep")
+        self.assertEqual(score_result["total_score"], 92)
+        self.assertEqual(score_result["decision"], "A+")
+        self.assertNotIn("no_trade_reason", score_result)
+        self.assertEqual(score_result["diagnostics"]["scenario_scan_reason"], "signal_allowed")
+        self.assertFalse(score_result["diagnostics"]["state_machine_allowed"])
         self.assertTrue(score_result["diagnostics"]["risk_geometry_valid"])
-        self.assertFalse(score_result["diagnostics"]["scenario_risk_valid"])
+        self.assertTrue(score_result["diagnostics"]["scenario_risk_valid"])
 
     def test_prepare_caps_high_score_when_risk_plan_is_invalid(self):
         def fake_fetch(coin, timeframe, limit):
@@ -345,6 +379,49 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertIn("fvg_retested", gate["failed_gates"])
         self.assertFalse(score_result["diagnostics"]["a_plus_delivery_allowed"])
 
+    def test_a_plus_delivery_gate_can_bypass_kill_zone_only_for_complete_setup(self):
+        score_result = {
+            "total_score": 90,
+            "diagnostics": {
+                "scenario_scan_valid": True,
+                "scenario_scan_signal_allowed": True,
+                "trigger_confirmed": True,
+                "scenario_risk_valid": True,
+            },
+        }
+        analysis_data = {
+            "scenario_scan": {
+                "selected_scenario": {
+                    "scenario_valid": True,
+                    "signal_allowed": True,
+                    "risk_valid": True,
+                    "events_used": [
+                        {"event_type": "FVG_CREATED"},
+                        {"event_type": "FVG_RETESTED"},
+                        {"event_type": "DISPLACEMENT_CONFIRMED"},
+                    ],
+                }
+            }
+        }
+
+        with patch.object(analyzer, "SEND_A_PLUS_OUTSIDE_KZ", True):
+            gate = analyzer._a_plus_delivery_gate(score_result, analysis_data, in_kill_zone=False)
+        self.assertTrue(gate["allowed"])
+        self.assertTrue(gate["kill_zone_bypassed"])
+        self.assertFalse(gate["gates"]["in_kill_zone"])
+        self.assertTrue(gate["gates"]["kill_zone_gate"])
+
+        with patch.object(analyzer, "SEND_A_PLUS_OUTSIDE_KZ", False):
+            gate = analyzer._a_plus_delivery_gate(score_result, analysis_data, in_kill_zone=False)
+        self.assertFalse(gate["allowed"])
+        self.assertIn("kill_zone_gate", gate["failed_gates"])
+
+        analysis_data["scenario_scan"]["selected_scenario"]["events_used"] = [{"event_type": "FVG_CREATED"}]
+        with patch.object(analyzer, "SEND_A_PLUS_OUTSIDE_KZ", True):
+            gate = analyzer._a_plus_delivery_gate(score_result, analysis_data, in_kill_zone=False)
+        self.assertFalse(gate["allowed"])
+        self.assertIn("fvg_retested", gate["failed_gates"])
+
     def test_run_summary_separates_active_and_historical_confirmed_triggers(self):
         record = analyzer._build_run_summary_record(
             run_id="run-1",
@@ -413,7 +490,415 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertEqual(record["invalidated_scenario_count"], 1)
         self.assertEqual(record["selection_ineligible_count"], 1)
         self.assertEqual(record["fvg_created_count"], 1)
+
+    def test_run_summary_watchlist_count_uses_final_decision(self):
+        record = analyzer._build_run_summary_record(
+            run_id="run-2",
+            started_at="2026-01-01T00:00:00Z",
+            finished_at="2026-01-01T00:01:00Z",
+            duration_seconds=60,
+            report_mode="HUNT",
+            session={},
+            symbol_results=[
+                {
+                    "symbol": "AAA",
+                    "success": True,
+                    "decision": "Ignore",
+                    "context_decision": "Watchlist",
+                    "final_decision": "Ignore",
+                    "diagnostics": {},
+                    "analysis_data": {},
+                },
+                {
+                    "symbol": "BBB",
+                    "success": True,
+                    "decision": "Watchlist",
+                    "context_decision": "A+",
+                    "final_decision": "Watchlist",
+                    "diagnostics": {},
+                    "analysis_data": {},
+                },
+            ],
+            errors=[],
+        )
+
+        self.assertEqual(record["watchlist_count"], 1)
+        self.assertEqual(record["context_watchlist_count"], 1)
+        self.assertEqual(record["ignore_count"], 1)
         self.assertEqual(record["app_version"], analyzer.APP_VERSION)
+
+    def test_build_metadata_includes_commit_config_hash_and_build_time(self):
+        metadata = analyzer._build_metadata()
+
+        self.assertEqual(metadata["app_version"], analyzer.APP_VERSION)
+        self.assertIn("git_commit", metadata)
+        self.assertRegex(metadata["config_hash"], r"^[0-9a-f]{16}$")
+        self.assertTrue(metadata["build_time"])
+
+    def test_analysis_error_includes_exception_traceback(self):
+        try:
+            raise KeyError(0)
+        except Exception as exc:
+            error = analyzer._analysis_error("LTC", "risk_plan", exc, "run-err")
+
+        self.assertEqual(error["symbol"], "LTC")
+        self.assertEqual(error["stage"], "risk_plan")
+        self.assertEqual(error["exception_type"], "KeyError")
+        self.assertIn("0", error["exception_message"])
+        self.assertIn("KeyError", error["traceback"])
+        self.assertEqual(error["run_id"], "run-err")
+
+    def test_run_summary_reports_status_coverage_and_audit_eligibility(self):
+        with patch.object(analyzer, "COINS_LIST", ["AAA", "BBB"]):
+            success_record = analyzer._build_run_summary_record(
+                run_id="run-success",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:01:00Z",
+                duration_seconds=60,
+                report_mode="HUNT",
+                session={},
+                symbol_results=[
+                    {"symbol": "AAA", "success": True, "decision": "Ignore", "diagnostics": {}, "analysis_data": {}},
+                    {"symbol": "BBB", "success": True, "decision": "Ignore", "diagnostics": {}, "analysis_data": {}},
+                ],
+                errors=[],
+            )
+            partial_record = analyzer._build_run_summary_record(
+                run_id="run-partial",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:01:00Z",
+                duration_seconds=60,
+                report_mode="HUNT",
+                session={},
+                symbol_results=[
+                    {"symbol": "AAA", "success": True, "decision": "Ignore", "diagnostics": {}, "analysis_data": {}},
+                    {
+                        "symbol": "BBB",
+                        "success": False,
+                        "error": analyzer._analysis_error("BBB", "prepare_and_analyze", "NoAnalysisData", "run-partial"),
+                    },
+                ],
+                errors=[analyzer._analysis_error("BBB", "prepare_and_analyze", "NoAnalysisData", "run-partial")],
+            )
+            failed_record = analyzer._build_run_summary_record(
+                run_id="run-failed",
+                started_at="2026-01-01T00:00:00Z",
+                finished_at="2026-01-01T00:01:00Z",
+                duration_seconds=60,
+                report_mode="HUNT",
+                session={},
+                symbol_results=[
+                    {
+                        "symbol": "AAA",
+                        "success": False,
+                        "error": analyzer._analysis_error("AAA", "symbol_analysis", "NoAnalysisData", "run-failed"),
+                    },
+                    {
+                        "symbol": "BBB",
+                        "success": False,
+                        "error": analyzer._analysis_error("BBB", "symbol_analysis", "NoAnalysisData", "run-failed"),
+                    },
+                ],
+                errors=[
+                    analyzer._analysis_error("AAA", "symbol_analysis", "NoAnalysisData", "run-failed"),
+                    analyzer._analysis_error("BBB", "symbol_analysis", "NoAnalysisData", "run-failed"),
+                ],
+            )
+
+        self.assertEqual(success_record["run_status"], "SUCCESS")
+        self.assertEqual(success_record["coverage_percent"], 100.0)
+        self.assertTrue(success_record["audit_eligible"])
+        self.assertEqual(partial_record["run_status"], "PARTIAL_SUCCESS")
+        self.assertEqual(partial_record["coverage_percent"], 50.0)
+        self.assertFalse(partial_record["audit_eligible"])
+        self.assertEqual(failed_record["run_status"], "FAILED")
+        self.assertEqual(failed_record["coverage_percent"], 0.0)
+        self.assertFalse(failed_record["audit_eligible"])
+
+    def test_telegram_delivery_record_contains_attempt_status(self):
+        record = analyzer._build_telegram_delivery_record(
+            run_id="run-tg",
+            message_type="A_PLUS",
+            attempted=True,
+            sent=False,
+            error="rate_limited",
+            status_code=429,
+            message_length=512,
+            in_kill_zone=False,
+            outside_kz_delivery_enabled=True,
+            kill_zone_bypassed=True,
+        )
+
+        self.assertEqual(record["record_type"], "telegram_delivery")
+        self.assertEqual(record["run_id"], "run-tg")
+        self.assertEqual(record["message_type"], "A_PLUS")
+        self.assertTrue(record["attempted"])
+        self.assertFalse(record["sent"])
+        self.assertEqual(record["error"], "rate_limited")
+        self.assertEqual(record["status_code"], 429)
+        self.assertFalse(record["in_kill_zone"])
+        self.assertTrue(record["outside_kz_delivery_enabled"])
+        self.assertTrue(record["kill_zone_bypassed"])
+
+    def test_event_snapshot_includes_timing_metadata(self):
+        event = {
+            "type": "bullish_bos",
+            "index": pd.Timestamp("2026-01-01 10:00:00"),
+            "detected_at": pd.Timestamp("2026-01-01 10:15:00"),
+            "historical_only": True,
+        }
+
+        snapshot = analyzer._event_snapshot(event)
+
+        self.assertEqual(snapshot["event_time"], "2026-01-01 10:00:00")
+        self.assertEqual(snapshot["detected_at"], "2026-01-01 10:15:00")
+        self.assertEqual(snapshot["detection_delay_seconds"], 900.0)
+        self.assertTrue(snapshot["is_reconstructed"])
+
+    def test_scenario_transition_record_is_written_once_per_state_change(self):
+        analyzer._SCENARIO_TRANSITION_STATE.clear()
+        candidate = ScenarioScanResult(
+            direction="LONG",
+            status="waiting_for_confirmation",
+            current_step="early_trigger_confirmed",
+            next_expected_step="CONFIRMED_TRIGGER_CONFIRMED",
+            signal_allowed=False,
+            scenario_valid=False,
+            completion_ratio=0.4,
+            completed_steps=4,
+            total_steps=10,
+            quality_score=80,
+            candidate_id="LONG_SFP_1",
+            events_used=[
+                ScenarioEvent(
+                    "EARLY_TRIGGER_CONFIRMED",
+                    "LONG",
+                    pd.Timestamp("2026-01-01 10:15:00"),
+                    payload={"detected_at": pd.Timestamp("2026-01-01 10:30:00")},
+                )
+            ],
+        )
+        scan = ScenarioScannerOutput(
+            best_long_scenario=candidate,
+            best_short_scenario=None,
+            selected_scenario=candidate,
+            selected_direction="LONG",
+            signal_allowed=False,
+            scenario_valid=False,
+            reason="waiting_for_confirmed_bullish_bos",
+            top_candidates=[candidate],
+            selected_scenario_id=candidate.candidate_id,
+        )
+
+        first = analyzer._build_scenario_transition_records("run-1", "2026-01-01T10:30:00Z", "SOL", scan)
+        second = analyzer._build_scenario_transition_records("run-1", "2026-01-01T10:45:00Z", "SOL", scan)
+        candidate.next_expected_step = "FVG_CREATED"
+        candidate.current_step = "confirmed_trigger_confirmed"
+        candidate.events_used.append(
+            ScenarioEvent("CONFIRMED_TRIGGER_CONFIRMED", "LONG", pd.Timestamp("2026-01-01 10:45:00"))
+        )
+        third = analyzer._build_scenario_transition_records("run-1", "2026-01-01T10:45:00Z", "SOL", scan)
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["record_type"], "scenario_transition")
+        self.assertIsNone(first[0]["from_state"])
+        self.assertEqual(first[0]["to_state"], "WAITING_FOR_CONFIRMED_TRIGGER_CONFIRMED")
+        self.assertEqual(first[0]["event_type"], "EARLY_TRIGGER_CONFIRMED")
+        self.assertEqual(first[0]["event_time"], "2026-01-01 10:15:00")
+        self.assertEqual(first[0]["detected_at"], "2026-01-01 10:30:00")
+        self.assertEqual(second, [])
+        self.assertEqual(len(third), 1)
+        self.assertEqual(third[0]["from_state"], "WAITING_FOR_CONFIRMED_TRIGGER_CONFIRMED")
+        self.assertEqual(third[0]["to_state"], "WAITING_FOR_FVG_CREATED")
+        analyzer._SCENARIO_TRANSITION_STATE.clear()
+
+    def test_scenario_transition_invalidation_contains_component_and_reason(self):
+        analyzer._SCENARIO_TRANSITION_STATE.clear()
+        candidate = ScenarioScanResult(
+            direction="SHORT",
+            status="invalidated",
+            current_step="invalidated",
+            next_expected_step=None,
+            signal_allowed=False,
+            scenario_valid=False,
+            completion_ratio=0.3,
+            completed_steps=3,
+            total_steps=10,
+            quality_score=70,
+            candidate_id="SHORT_POI_1",
+            invalidated_reason="opposite_confirmed_bos",
+            last_invalidated_component="structure",
+            events_used=[ScenarioEvent("BOS_CONFIRMED", "LONG", pd.Timestamp("2026-01-01 11:00:00"))],
+        )
+        scan = ScenarioScannerOutput(
+            best_long_scenario=None,
+            best_short_scenario=candidate,
+            selected_scenario=candidate,
+            selected_direction="SHORT",
+            signal_allowed=False,
+            scenario_valid=False,
+            reason="opposite_confirmed_bos",
+            top_candidates=[candidate],
+            selected_scenario_id=candidate.candidate_id,
+        )
+
+        records = analyzer._build_scenario_transition_records("run-2", "2026-01-01T11:00:00Z", "XRP", scan)
+
+        self.assertEqual(records[0]["to_state"], "INVALIDATED")
+        self.assertEqual(records[0]["invalidation_component"], "structure")
+        self.assertEqual(records[0]["invalidated_reason"], "opposite_confirmed_bos")
+        analyzer._SCENARIO_TRANSITION_STATE.clear()
+
+    def test_risk_plan_provenance_mismatch_downgrades_to_not_available(self):
+        candidate = ScenarioScanResult(
+            direction="LONG",
+            status="waiting_for_confirmation",
+            current_step="pd_location_valid",
+            next_expected_step="SFP_CONFIRMED",
+            signal_allowed=False,
+            scenario_valid=False,
+            completion_ratio=0.2,
+            completed_steps=2,
+            total_steps=10,
+            quality_score=70,
+            candidate_id="SCENARIO_LONG_PD_LOCATION_VALID_NEW",
+        )
+        stale_risk = RiskPlan(
+            direction="LONG",
+            entry=100.0,
+            stop_loss=99.0,
+            invalidation_level=99.0,
+            target_1=103.0,
+            target_2=None,
+            risk_per_unit=1.0,
+            rr_to_target_1=3.0,
+            rr_to_target_2=None,
+            stop_distance_percent=1.0,
+            entry_distance_from_poi_atr=0.1,
+            valid=True,
+            reason="Risk plan valid",
+            entry_model="fvg_midpoint",
+            stop_model="fvg_invalid",
+            target_model="liquidity",
+            source_candidate_id="SCENARIO_LONG_PD_LOCATION_VALID_OLD",
+        )
+
+        guarded = analyzer._risk_plan_for_selected_candidate(stale_risk, candidate, "LONG")
+
+        self.assertFalse(guarded.valid)
+        self.assertEqual(guarded.risk_plan_status, "not_available")
+        self.assertEqual(guarded.reason, "candidate_provenance_mismatch")
+        self.assertEqual(guarded.source_candidate_id, candidate.candidate_id)
+
+    def test_runtime_update_count_increments_for_stable_candidate_between_scans(self):
+        analyzer._SCENARIO_RUNTIME_STATE.clear()
+        first_candidate = ScenarioScanResult(
+            direction="LONG",
+            status="waiting_for_confirmation",
+            current_step="pd_location_valid",
+            next_expected_step="SFP_CONFIRMED",
+            signal_allowed=False,
+            scenario_valid=False,
+            completion_ratio=0.2,
+            completed_steps=2,
+            total_steps=10,
+            quality_score=70,
+            candidate_id="SCENARIO_LONG_PD_LOCATION_VALID_STABLE",
+            anchor_index=pd.Timestamp("2026-07-16 16:45:00"),
+            last_event_index=pd.Timestamp("2026-07-16 16:45:00"),
+            trigger_scan={"candidate_id": "SCENARIO_LONG_PD_LOCATION_VALID_STABLE"},
+        )
+        first_scan = ScenarioScannerOutput(
+            best_long_scenario=first_candidate,
+            best_short_scenario=None,
+            selected_scenario=first_candidate,
+            selected_direction="LONG",
+            signal_allowed=False,
+            scenario_valid=False,
+            reason="liquidity_sweep_confirmed",
+            top_candidates=[first_candidate],
+            selected_scenario_id=first_candidate.candidate_id,
+        )
+        second_candidate = ScenarioScanResult(
+            direction="LONG",
+            status="waiting_for_confirmation",
+            current_step="pd_location_valid",
+            next_expected_step="SFP_CONFIRMED",
+            signal_allowed=False,
+            scenario_valid=False,
+            completion_ratio=0.2,
+            completed_steps=2,
+            total_steps=10,
+            quality_score=70,
+            candidate_id=first_candidate.candidate_id,
+            anchor_index=pd.Timestamp("2026-07-16 17:00:00"),
+            last_event_index=pd.Timestamp("2026-07-16 17:00:00"),
+            trigger_scan={"candidate_id": first_candidate.candidate_id},
+        )
+        second_scan = ScenarioScannerOutput(
+            best_long_scenario=second_candidate,
+            best_short_scenario=None,
+            selected_scenario=second_candidate,
+            selected_direction="LONG",
+            signal_allowed=False,
+            scenario_valid=False,
+            reason="liquidity_sweep_confirmed",
+            top_candidates=[second_candidate],
+            selected_scenario_id=second_candidate.candidate_id,
+        )
+
+        analyzer._apply_runtime_update_counts("RENDER", first_scan)
+        self.assertEqual(first_candidate.runtime_update_count, 0)
+        self.assertEqual(first_candidate.market_age_bars, 0)
+        self.assertEqual(first_candidate.trigger_scan["runtime_update_count"], 0)
+
+        analyzer._apply_runtime_update_counts("RENDER", second_scan)
+        self.assertEqual(second_candidate.runtime_update_count, 1)
+        self.assertEqual(second_candidate.market_age_bars, 1)
+        self.assertEqual(second_candidate.trigger_scan["runtime_update_count"], 1)
+        self.assertEqual(second_candidate.trigger_scan["market_age_bars"], 1)
+        empty_scan = ScenarioScannerOutput(
+            best_long_scenario=None,
+            best_short_scenario=None,
+            selected_scenario=None,
+            selected_direction=None,
+            signal_allowed=False,
+            scenario_valid=False,
+            reason="pd_block",
+        )
+        analyzer._apply_runtime_update_counts("RENDER", empty_scan)
+
+        reentry_candidate = ScenarioScanResult(
+            direction="LONG",
+            status="waiting_for_confirmation",
+            current_step="pd_location_valid",
+            next_expected_step="SFP_CONFIRMED",
+            signal_allowed=False,
+            scenario_valid=False,
+            completion_ratio=0.2,
+            completed_steps=2,
+            total_steps=10,
+            quality_score=70,
+            candidate_id=first_candidate.candidate_id,
+            anchor_index=pd.Timestamp("2026-07-16 17:30:00"),
+            last_event_index=pd.Timestamp("2026-07-16 17:30:00"),
+            trigger_scan={"candidate_id": first_candidate.candidate_id},
+        )
+        reentry_scan = ScenarioScannerOutput(
+            best_long_scenario=reentry_candidate,
+            best_short_scenario=None,
+            selected_scenario=reentry_candidate,
+            selected_direction="LONG",
+            signal_allowed=False,
+            scenario_valid=False,
+            reason="liquidity_sweep_confirmed",
+            top_candidates=[reentry_candidate],
+            selected_scenario_id=reentry_candidate.candidate_id,
+        )
+        analyzer._apply_runtime_update_counts("RENDER", reentry_scan)
+        self.assertEqual(reentry_candidate.runtime_update_count, 0)
+        self.assertEqual(reentry_candidate.market_age_bars, 0)
+        analyzer._SCENARIO_RUNTIME_STATE.clear()
 
     def test_format_scenario_scan_humanizes_waiting_and_no_valid_reasons(self):
         waiting_scan = {
@@ -657,7 +1142,7 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertTrue(bearish[0]["is_early"])
         self.assertEqual(bearish[0]["trigger_stage"], "early")
 
-    def test_premium_discount_poi_uses_last_closed_timestamp_instead_of_synthetic_index(self):
+    def test_premium_discount_location_uses_last_closed_timestamp_instead_of_synthetic_index(self):
         last_closed = pd.Series({"close": 100.0}, name=pd.Timestamp("2026-01-01 12:15:00"))
 
         events = analyzer._build_scenario_events(
@@ -673,12 +1158,14 @@ class AnalyzerIntegrationTest(unittest.TestCase):
             last_closed,
         )
 
-        poi_events = [event for event in events if event.event_type == "POI_TOUCHED"]
-        self.assertEqual(len(poi_events), 1)
-        self.assertEqual(poi_events[0].index, pd.Timestamp("2026-01-01 12:15:00"))
-        self.assertNotEqual(poi_events[0].index, -1)
+        pd_events = [event for event in events if event.event_type == "PD_LOCATION_VALID"]
+        self.assertEqual(len(pd_events), 1)
+        self.assertEqual(pd_events[0].index, pd.Timestamp("2026-01-01 12:15:00"))
+        self.assertNotEqual(pd_events[0].index, -1)
+        self.assertFalse(any(event.event_type == "POI_TOUCHED" for event in events))
+        self.assertEqual(pd_events[0].source, "premium_discount")
 
-    def test_premium_discount_without_real_timestamp_does_not_create_poi_event(self):
+    def test_premium_discount_without_real_timestamp_does_not_create_location_event(self):
         events = analyzer._build_scenario_events(
             "LONG",
             {"trend": "bullish", "confidence": 65},
@@ -692,6 +1179,7 @@ class AnalyzerIntegrationTest(unittest.TestCase):
             None,
         )
 
+        self.assertFalse(any(event.event_type == "PD_LOCATION_VALID" for event in events))
         self.assertFalse(any(event.event_type == "POI_TOUCHED" for event in events))
 
     def test_trigger_scan_chain_adds_scenario_scoped_sfp_anchor(self):
@@ -742,6 +1230,56 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertEqual(scenario.completed_steps, 5)
         self.assertTrue(scenario.trigger_scan["trigger_confirmed"])
         self.assertEqual(scenario.trigger_scan["confirmed_trigger"]["type"], "bearish_bos")
+
+    def test_fvg_events_include_candidate_and_confirmed_trigger_provenance(self):
+        last_closed = pd.Series({"close": 100.0}, name=pd.Timestamp("2026-01-01 12:00:00"))
+        trigger_scan = {
+            "selected_trigger": {
+                "type": "bullish_bos",
+                "index": pd.Timestamp("2026-01-01 10:30:00"),
+                "quality_score": 90,
+                "candidate_id": "LONG_SFP_1",
+                "event_id": "bos-1",
+            },
+            "confirmed_trigger": {
+                "type": "bullish_bos",
+                "index": pd.Timestamp("2026-01-01 10:30:00"),
+                "quality_score": 90,
+                "candidate_id": "LONG_SFP_1",
+                "event_id": "bos-1",
+            },
+            "early_trigger": {"type": "bullish_early_choch", "index": pd.Timestamp("2026-01-01 10:00:00")},
+            "sfp_index": pd.Timestamp("2026-01-01 09:45:00"),
+        }
+
+        events = analyzer._build_scenario_events(
+            "LONG",
+            {"trend": "bullish", "confidence": 80},
+            {"valid_for_buy": True, "valid_for_sell": False, "zone_strength": 75},
+            None,
+            trigger_scan,
+            None,
+            [{
+                "type": "bullish",
+                "end_index": pd.Timestamp("2026-01-01 10:45:00"),
+                "test_index": pd.Timestamp("2026-01-01 11:00:00"),
+                "displacement_index": pd.Timestamp("2026-01-01 11:15:00"),
+                "quality_score": 82,
+                "tested": True,
+            }],
+            {"index": pd.Timestamp("2026-01-01 11:00:00")},
+            None,
+            last_closed,
+        )
+
+        fvg_created = next(event for event in events if event.event_type == "FVG_CREATED")
+        fvg_retested = next(event for event in events if event.event_type == "FVG_RETESTED")
+        displacement = next(event for event in events if event.event_type == "DISPLACEMENT_CONFIRMED")
+        self.assertEqual(fvg_created.payload["source_candidate_id"], "LONG_SFP_1")
+        self.assertEqual(fvg_created.payload["source_confirmed_trigger_id"], "bos-1")
+        self.assertEqual(fvg_created.payload["created_index"], pd.Timestamp("2026-01-01 10:45:00"))
+        self.assertEqual(fvg_retested.payload["retested_index"], pd.Timestamp("2026-01-01 11:00:00"))
+        self.assertEqual(displacement.payload["displacement_stage"], "post_retest")
 
     def test_dashboard_block_shows_no_trade_reason_gates_and_sweep_label(self):
         score_result = {

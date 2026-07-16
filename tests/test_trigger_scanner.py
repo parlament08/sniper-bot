@@ -19,6 +19,9 @@ class TriggerScannerTest(unittest.TestCase):
     def _df(self, rows):
         return pd.DataFrame(rows).set_index("index")
 
+    def _ts_df(self, rows):
+        return pd.DataFrame(rows).set_index(pd.Index([row.pop("index") for row in rows], name="index"))
+
     def _swings(self, highs=None, lows=None):
         high_rows = highs or []
         low_rows = lows or []
@@ -206,7 +209,7 @@ class TriggerScannerTest(unittest.TestCase):
             result.confirmed_trigger_debug["historical_rejected_candidates"][0]["rejected_reason"],
             "before_early_trigger",
         )
-        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "no_confirmed_bos_after_early_trigger")
+        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "no_candle_closed_beyond_break_level")
 
     def test_confirmed_trigger_after_early_trigger_confirms_follow_up(self):
         result = scan_post_anchor_trigger(
@@ -252,7 +255,7 @@ class TriggerScannerTest(unittest.TestCase):
         self.assertFalse(result.trigger_confirmed)
         self.assertEqual(result.confirmed_trigger_debug["candidate_bos_count"], 0)
         self.assertEqual(result.confirmed_trigger_debug["candidate_choch_count"], 0)
-        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "no_confirmed_bos_after_early_trigger")
+        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "no_candle_closed_beyond_break_level")
 
     def test_short_early_trigger_after_sfp_waits_for_confirmed_trigger(self):
         result = scan_post_anchor_trigger(
@@ -431,7 +434,7 @@ class TriggerScannerTest(unittest.TestCase):
         self.assertTrue(result.confirmed_trigger_debug["generator_called"])
         self.assertEqual(result.confirmed_trigger_debug["candles_after_early"], 1)
         self.assertIsNone(result.confirmed_trigger_debug["break_level"])
-        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "no_confirmed_break_level_after_early_trigger")
+        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "no_break_level_available")
 
     def test_candles_after_early_without_close_beyond_level_debug_reason(self):
         df = self._df([
@@ -473,6 +476,182 @@ class TriggerScannerTest(unittest.TestCase):
 
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate["type"], "bullish_bos")
+
+    def test_candidate_scoped_sfp_early_choch_valid_bos_confirms(self):
+        candidate_id = "SCENARIO_LONG_POI_100_discount"
+        df = self._df([
+            {"index": 100, "open": 10.0, "high": 10.1, "low": 9.8, "close": 10.0, "atr": 1.0, "rvol": 1.0},
+            {"index": 110, "open": 10.0, "high": 10.4, "low": 9.9, "close": 10.3, "atr": 1.0, "rvol": 1.4},
+            {"index": 115, "open": 10.2, "high": 10.5, "low": 10.0, "close": 10.2, "atr": 1.0, "rvol": 1.0},
+            {"index": 120, "open": 10.4, "high": 12.0, "low": 10.3, "close": 11.8, "atr": 1.0, "rvol": 2.0},
+        ])
+        early = self._early("bullish_early_choch", index=110, quality=88)
+        early["candidate_id"] = candidate_id
+
+        result = scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": 100},
+            trigger_candidates=[early],
+            df_15m_closed=df,
+            swing_points=self._swings(highs=[{"index": 115, "high": 10.5}]),
+            selected_candidate_id=candidate_id,
+        )
+
+        self.assertTrue(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger["candidate_id"], candidate_id)
+        self.assertEqual(result.confirmed_trigger_debug["candidate_id"], candidate_id)
+        self.assertEqual(result.confirmed_trigger_debug["confirmed_search_start"], "110")
+        self.assertEqual(result.confirmed_trigger_debug["candles_after_early"], 2)
+        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "confirmed_bos_found")
+        self.assertEqual(result.confirmed_trigger_debug["bos_diagnostics"]["bos_candidates_total"], 1)
+        self.assertEqual(result.confirmed_trigger_debug["bos_diagnostics"]["confirmed"], 1)
+
+    def test_candidate_scoped_wick_only_break_does_not_confirm(self):
+        candidate_id = "SCENARIO_LONG_WICK_ONLY"
+        df = self._df([
+            {"index": 100, "open": 10.0, "high": 10.1, "low": 9.8, "close": 10.0, "atr": 1.0, "rvol": 1.0},
+            {"index": 110, "open": 10.0, "high": 10.4, "low": 9.9, "close": 10.3, "atr": 1.0, "rvol": 1.4},
+            {"index": 115, "open": 10.2, "high": 10.5, "low": 10.0, "close": 10.2, "atr": 1.0, "rvol": 1.0},
+            {"index": 120, "open": 10.4, "high": 11.2, "low": 10.3, "close": 10.45, "atr": 1.0, "rvol": 2.0},
+        ])
+        early = self._early("bullish_early_choch", index=110, quality=88)
+        early["candidate_id"] = candidate_id
+
+        result = scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": 100},
+            trigger_candidates=[early],
+            df_15m_closed=df,
+            swing_points=self._swings(highs=[{"index": 115, "high": 10.5}]),
+            selected_candidate_id=candidate_id,
+        )
+
+        self.assertFalse(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger_debug["candidate_bos_count"], 0)
+        self.assertFalse(result.confirmed_trigger_debug["checked_candles"][-1]["breaks_level"])
+        self.assertTrue(result.confirmed_trigger_debug["checked_candles"][-1]["wick_breaks_level"])
+        self.assertEqual(result.confirmed_trigger_debug["bos_diagnostics"]["rejected"]["wick_only"], 1)
+        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "no_candle_closed_beyond_break_level")
+
+    def test_candidate_scoped_weak_bos_rejected_with_quality_reason(self):
+        candidate_id = "SCENARIO_LONG_WEAK_BOS"
+        early = self._early("bullish_early_choch", index=110, quality=88)
+        early["candidate_id"] = candidate_id
+
+        result = scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": 100},
+            trigger_candidates=[
+                early,
+                {
+                    "candidate_id": candidate_id,
+                    "type": "bullish_bos",
+                    "index": 120,
+                    "quality_score": 60,
+                    "close_position": 0.4,
+                    "displacement_ratio": 0.3,
+                },
+            ],
+            selected_candidate_id=candidate_id,
+        )
+
+        self.assertFalse(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger_debug["candidate_bos_count"], 1)
+        self.assertEqual(result.confirmed_trigger_debug["rejected_candidates"][0]["rejected_reason"], "quality_below_min")
+        diagnostics = result.confirmed_trigger_debug["bos_diagnostics"]
+        self.assertEqual(diagnostics["bos_candidates_total"], 1)
+        self.assertEqual(diagnostics["confirmed"], 0)
+        self.assertEqual(diagnostics["rejected"]["quality_below_min"], 1)
+        self.assertEqual(diagnostics["rejected"]["weak_close"], 1)
+        self.assertEqual(diagnostics["rejected"]["weak_displacement"], 1)
+        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "quality_below_min")
+
+    def test_candidate_scoped_opposite_bos_invalidates_confirmed_scan(self):
+        candidate_id = "SCENARIO_LONG_OPPOSITE_BOS"
+        early = self._early("bullish_early_choch", index=110, quality=88)
+        early["candidate_id"] = candidate_id
+
+        result = scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": 100},
+            trigger_candidates=[
+                early,
+                {"candidate_id": candidate_id, "type": "bearish_bos", "index": 120, "quality_score": 90},
+            ],
+            selected_candidate_id=candidate_id,
+        )
+
+        self.assertFalse(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger_debug["rejected_candidates"][0]["rejected_reason"], "opposite_structure_invalidated_candidate")
+        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "opposite_structure_invalidated_candidate")
+
+    def test_old_bos_before_new_early_choch_is_historical_only(self):
+        candidate_id = "SCENARIO_LONG_OLD_BOS"
+        early = self._early("bullish_early_choch", index=110, quality=88)
+        early["candidate_id"] = candidate_id
+
+        result = scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": 100},
+            trigger_candidates=[
+                {"candidate_id": candidate_id, "type": "bullish_bos", "index": 105, "quality_score": 95},
+                early,
+            ],
+            selected_candidate_id=candidate_id,
+        )
+
+        self.assertTrue(result.early_trigger_confirmed)
+        self.assertFalse(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger_debug["candidate_bos_count"], 0)
+        self.assertEqual(result.confirmed_trigger_debug["historical_rejected_candidates"][0]["rejected_reason"], "before_early_trigger")
+
+    def test_timezone_aware_index_confirmed_scan(self):
+        candidate_id = "SCENARIO_TZ_AWARE"
+        early_index = pd.Timestamp("2026-01-01 10:15:00", tz="UTC")
+        df = self._ts_df([
+            {"index": pd.Timestamp("2026-01-01 10:00:00", tz="UTC"), "open": 10.0, "high": 10.1, "low": 9.8, "close": 10.0, "atr": 1.0, "rvol": 1.0},
+            {"index": early_index, "open": 10.0, "high": 10.4, "low": 9.9, "close": 10.3, "atr": 1.0, "rvol": 1.4},
+            {"index": pd.Timestamp("2026-01-01 10:30:00", tz="UTC"), "open": 10.2, "high": 10.5, "low": 10.0, "close": 10.2, "atr": 1.0, "rvol": 1.0},
+            {"index": pd.Timestamp("2026-01-01 10:45:00", tz="UTC"), "open": 10.4, "high": 12.0, "low": 10.3, "close": 11.8, "atr": 1.0, "rvol": 2.0},
+        ])
+        early = self._early("bullish_early_choch", index=early_index, quality=88)
+        early["candidate_id"] = candidate_id
+
+        result = scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": pd.Timestamp("2026-01-01 10:00:00", tz="UTC")},
+            trigger_candidates=[early],
+            df_15m_closed=df,
+            swing_points=self._swings(highs=[{"index": pd.Timestamp("2026-01-01 10:30:00", tz="UTC"), "high": 10.5}]),
+            selected_candidate_id=candidate_id,
+        )
+
+        self.assertTrue(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger_debug["first_candle_after_early"], "2026-01-01 10:30:00+00:00")
+
+    def test_timezone_naive_index_confirmed_scan(self):
+        candidate_id = "SCENARIO_TZ_NAIVE"
+        early_index = pd.Timestamp("2026-01-01 10:15:00")
+        df = self._ts_df([
+            {"index": pd.Timestamp("2026-01-01 10:00:00"), "open": 10.0, "high": 10.1, "low": 9.8, "close": 10.0, "atr": 1.0, "rvol": 1.0},
+            {"index": early_index, "open": 10.0, "high": 10.4, "low": 9.9, "close": 10.3, "atr": 1.0, "rvol": 1.4},
+            {"index": pd.Timestamp("2026-01-01 10:30:00"), "open": 10.2, "high": 10.5, "low": 10.0, "close": 10.2, "atr": 1.0, "rvol": 1.0},
+            {"index": pd.Timestamp("2026-01-01 10:45:00"), "open": 10.4, "high": 12.0, "low": 10.3, "close": 11.8, "atr": 1.0, "rvol": 2.0},
+        ])
+        early = self._early("bullish_early_choch", index=early_index, quality=88)
+        early["candidate_id"] = candidate_id
+
+        result = scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": pd.Timestamp("2026-01-01 10:00:00")},
+            trigger_candidates=[early],
+            df_15m_closed=df,
+            swing_points=self._swings(highs=[{"index": pd.Timestamp("2026-01-01 10:30:00"), "high": 10.5}]),
+            selected_candidate_id=candidate_id,
+        )
+
+        self.assertTrue(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger_debug["first_candle_after_early"], "2026-01-01 10:30:00")
 
 
 if __name__ == "__main__":

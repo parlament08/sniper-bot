@@ -201,6 +201,47 @@ def _premium_discount_is_shallow(premium_discount_data) -> bool:
     return _pd_get(premium_discount_data, 'zone_depth') == 'shallow'
 
 
+def _score_component(component, points, event):
+    event = event or {}
+    active = _event_score_active(event)
+    return {
+        "component": component,
+        "points": int(points or 0),
+        "candidate_id": _pd_get(event, "candidate_id"),
+        "event_id": _event_id(event),
+        "event_index": _pd_get(event, "index", _pd_get(event, "end_index")),
+        "event_direction": _event_direction_from_payload(event),
+        "active": active,
+        "score_eligible": active and int(points or 0) > 0,
+    }
+
+
+def _event_score_active(event):
+    return not bool(_pd_get(event or {}, 'historical_only', False) or _pd_get(event or {}, 'invalidated', False))
+
+
+def _event_id(event):
+    if not event:
+        return None
+    event_type = _pd_get(event, "type", _pd_get(event, "component"))
+    event_index = _pd_get(event, "index", _pd_get(event, "end_index"))
+    if event_type is None and event_index is None:
+        return None
+    return f"{event_type or 'event'}:{event_index}"
+
+
+def _event_direction_from_payload(event):
+    event_type = str(_pd_get(event, "type", "") or "").lower()
+    direction = _pd_get(event, "direction")
+    if direction:
+        return str(direction).upper() if str(direction).upper() in ("LONG", "SHORT") else direction
+    if "bullish" in event_type:
+        return "LONG"
+    if "bearish" in event_type:
+        return "SHORT"
+    return None
+
+
 def _infer_no_trade_reason(
     *,
     pd_valid: bool,
@@ -300,6 +341,7 @@ def calculate_setup_score(
         Dict: Словарь с итоговым счетом, решением и детализацией начисленных баллов.
     """
     score = 0
+    score_components = []
     breakdown = {
         'trend': '0',
         'structure': '0',
@@ -335,9 +377,11 @@ def calculate_setup_score(
         if is_with_trend:
             if trend_data.get('strength') == 'strong':
                 score += 25
+                score_components.append(_score_component("trend", 25, None))
                 breakdown['trend'] = '+25 (Сильный тренд, совпадает с направлением)'
             else:  # 'flat'
                 score += 10
+                score_components.append(_score_component("trend", 10, None))
                 breakdown['trend'] = '+10 (Цена по тренду, слабый импульс/откат)'
         else:
             # ЖЕСТКИЙ ФИЛЬТР:
@@ -352,7 +396,7 @@ def calculate_setup_score(
     # Определяем наличие и тип структурных событий на обоих ТФ
     is_context_aligned = False
     context_struct_label = ''
-    if context_structure_data:
+    if context_structure_data and _event_score_active(context_structure_data):
         if (trade_direction == 'long' and 'bullish' in context_structure_data.get('type', '')) or \
            (trade_direction == 'short' and 'bearish' in context_structure_data.get('type', '')):
             is_context_aligned = True
@@ -360,7 +404,7 @@ def calculate_setup_score(
 
     is_trigger_aligned = False
     trigger_struct_label = ''
-    if trigger_structure_data:
+    if trigger_structure_data and _event_score_active(trigger_structure_data):
         if (trade_direction == 'long' and 'bullish' in trigger_structure_data.get('type', '')) or \
            (trade_direction == 'short' and 'bearish' in trigger_structure_data.get('type', '')):
             is_trigger_aligned = True
@@ -431,13 +475,15 @@ def calculate_setup_score(
         structure_desc = f"+5 (15m {trigger_struct_label}, без POI/SFP confirmation)"
 
     score += score_structure
+    if score_structure > 0:
+        score_components.append(_score_component("structure", score_structure, trigger_structure_data if is_trigger_aligned else context_structure_data))
     breakdown['structure'] = structure_desc
 
     # 3. Ликвидность (+20 баллов)
     # Баллы за SFP начисляются только если он НЕ был использован для подтверждения CHoCH,
     # чтобы избежать двойного скоринга одного и того же события.
     sfp_used_for_confirmation = (confirmation_reason == "after SFP")
-    if sfp_data_in_window and not sfp_used_for_confirmation:
+    if sfp_data_in_window and _event_score_active(sfp_data_in_window) and not sfp_used_for_confirmation:
         is_sfp_aligned = (trade_direction == 'long' and 'bullish' in sfp_data_in_window.get('type', '')) or \
                          (trade_direction == 'short' and 'bearish' in sfp_data_in_window.get('type', ''))
         
@@ -445,6 +491,7 @@ def calculate_setup_score(
             sfp_score = _sfp_liquidity_score(sfp_data_in_window)
             if sfp_score > 0:
                 score += sfp_score
+                score_components.append(_score_component("liquidity", sfp_score, sfp_data_in_window))
                 breakdown['liquidity'] = f"+{sfp_score} ({_sfp_label(sfp_data_in_window)} на {_sfp_source_label(sfp_data_in_window)})"
             else:
                 breakdown['liquidity'] = f"0 ({_sfp_label(sfp_data_in_window)} слабый захват)"
@@ -457,7 +504,7 @@ def calculate_setup_score(
         matching_fvgs = []
         # Проверяем, что хотя бы одна релевантная зона не пробита
         for fvg in fvg_data:
-            if fvg.get('invalidated', False):
+            if fvg.get('invalidated', False) or not _event_score_active(fvg):
                 continue
 
             if trade_direction == 'long' and fvg.get('type') == 'bullish':
@@ -479,6 +526,7 @@ def calculate_setup_score(
             wick_text = ", wick violation only / Q penalty" if active_fvg.get('wick_violated') else ""
             if fvg_score > 0:
                 score += fvg_score
+                score_components.append(_score_component("fvg", fvg_score, active_fvg))
                 location_text = "цена внутри зоны" if active_fvg_inside else "свежий ретест, зона удержана"
                 breakdown['fvg'] = f"+{fvg_score} (Тест FVG {quality_text}{age_text}{retest_text}, {location_text}{wick_text})"
             else:
@@ -490,7 +538,7 @@ def calculate_setup_score(
     breakdown['volume'] = '0 (Нет подтверждения аномальным объемом)'
     
     # Приоритет 1: Объем на свече SFP (сбор ликвидности)
-    is_sfp_aligned = sfp_data_in_window and (
+    is_sfp_aligned = sfp_data_in_window and _event_score_active(sfp_data_in_window) and (
         (trade_direction == 'long' and 'bullish' in sfp_data_in_window.get('type', '')) or
         (trade_direction == 'short' and 'bearish' in sfp_data_in_window.get('type', ''))
     )
@@ -501,6 +549,7 @@ def calculate_setup_score(
         and not _has_absorption_warning(sfp_data_in_window)
     ):
         score += 10
+        score_components.append(_score_component("volume", 10, sfp_data_in_window))
         breakdown['volume'] = f"+10 (Сильный SFP volume confirmation: {_rvol_text(sfp_data_in_window)}, {_quality_text(sfp_data_in_window)})"
     elif is_sfp_aligned and _has_absorption_warning(sfp_data_in_window):
         breakdown['volume'] = f"0 ({_rvol_text(sfp_data_in_window)} высокий, но слабое закрытие / absorption warning)"
@@ -509,11 +558,11 @@ def calculate_setup_score(
     
     # Приоритет 2: Объем на свече слома структуры (BOS/CHoCH)
     # Сначала проверяем более важный 15m триггер
-    is_trigger_aligned = trigger_structure_data and (
+    is_trigger_aligned = trigger_structure_data and _event_score_active(trigger_structure_data) and (
         (trade_direction == 'long' and 'bullish' in trigger_structure_data.get('type', '')) or
         (trade_direction == 'short' and 'bearish' in trigger_structure_data.get('type', ''))
     )
-    is_context_aligned = context_structure_data and (
+    is_context_aligned = context_structure_data and _event_score_active(context_structure_data) and (
         (trade_direction == 'long' and 'bullish' in context_structure_data.get('type', '')) or
         (trade_direction == 'short' and 'bearish' in context_structure_data.get('type', ''))
     )
@@ -524,6 +573,7 @@ def calculate_setup_score(
 
     if not is_sfp_aligned and should_prioritize_context_volume and context_volume_score > 0:
         score += context_volume_score
+        score_components.append(_score_component("volume", context_volume_score, context_structure_data))
         breakdown['volume'] = f"+{context_volume_score} (1H BOS volume: {_rvol_text(context_structure_data)}, {_quality_text(context_structure_data)})"
     elif not is_sfp_aligned and should_prioritize_context_volume and _has_absorption_warning(context_structure_data):
         breakdown['volume'] = f"0 ({_rvol_text(context_structure_data)} высокий на 1H, но possible absorption)"
@@ -535,6 +585,7 @@ def calculate_setup_score(
         breakdown['volume'] = f"0 ({_rvol_text(context_structure_data)} есть, но 1H структура {_quality_text(context_structure_data)} < Q90)"
     elif not is_sfp_aligned and is_trigger_aligned and trigger_volume_score > 0:
         score += trigger_volume_score
+        score_components.append(_score_component("volume", trigger_volume_score, trigger_structure_data))
         if trigger_volume_score == 10:
             breakdown['volume'] = f"+10 (15m trigger volume с POI/SFP: {_rvol_text(trigger_structure_data)}, {_quality_text(trigger_structure_data)})"
         else:
@@ -551,6 +602,7 @@ def calculate_setup_score(
     elif not is_sfp_aligned:
         if is_context_aligned and context_volume_score > 0:
             score += context_volume_score
+            score_components.append(_score_component("volume", context_volume_score, context_structure_data))
             breakdown['volume'] = f"+{context_volume_score} (1H BOS volume: {_rvol_text(context_structure_data)}, {_quality_text(context_structure_data)})"
         elif is_context_aligned and _has_absorption_warning(context_structure_data):
             breakdown['volume'] = f"0 ({_rvol_text(context_structure_data)} высокий на 1H, но possible absorption)"
@@ -562,9 +614,12 @@ def calculate_setup_score(
         m_score = macro_data.get('score', 0)
         m_reason = macro_data.get('reason', 'Нет данных')
         score += m_score
+        if m_score:
+            score_components.append(_score_component("macro", m_score, macro_data))
         breakdown['macro'] = f"+{m_score} ({m_reason})" if m_score > 0 else f"0 ({m_reason})"
 
     raw_score = score
+    score_components_total = sum(item["points"] for item in score_components if item.get("score_eligible"))
     pd_shallow = pd_valid and _premium_discount_is_shallow(premium_discount_data)
     scenario_valid = bool(
         is_trigger_aligned
@@ -638,5 +693,8 @@ def calculate_setup_score(
         'decision': decision,
         'no_trade_reason': no_trade_reason,
         'diagnostics': diagnostics,
-        'breakdown': breakdown
+        'breakdown': breakdown,
+        'score_components': score_components,
+        'score_components_total': score_components_total,
+        'score_consistent': score_components_total == raw_score,
     }

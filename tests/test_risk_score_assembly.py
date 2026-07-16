@@ -77,6 +77,9 @@ class RiskScoreAssemblyTest(unittest.TestCase):
         self.assertEqual(result['total_score'], 100)
         self.assertEqual(result['decision'], 'A+')
         self.assertIn('OK', result['breakdown']['scenario'])
+        self.assertTrue(result['score_consistent'])
+        self.assertEqual(result['score_components_total'], result['raw_score'])
+        self.assertTrue(all(item['score_eligible'] for item in result['score_components']))
 
     def test_high_score_without_trigger_scenario_is_watchlist_only(self):
         result = calculate_setup_score(
@@ -103,6 +106,50 @@ class RiskScoreAssemblyTest(unittest.TestCase):
         self.assertEqual(result['total_score'], 69)
         self.assertEqual(result['decision'], 'Watchlist')
         self.assertIn('Scenario Gate', result['breakdown']['scenario'])
+
+    def test_opposite_trigger_event_does_not_add_structure_points(self):
+        result = calculate_setup_score(
+            trade_direction='long',
+            current_price=100.0,
+            trend_data=None,
+            context_structure_data=None,
+            trigger_structure_data={
+                'type': 'bearish_bos',
+                'index': 10,
+                'quality_score': 95,
+                'candidate_id': 'SHORT_CANDIDATE',
+            },
+            sfp_data_in_window=None,
+            fvg_test_data=None,
+            fvg_data=[],
+            macro_data=None,
+            premium_discount_data=self._premium_discount(),
+        )
+
+        self.assertEqual(result['raw_score'], 0)
+        self.assertEqual(result['score_components_total'], 0)
+        self.assertTrue(result['score_consistent'])
+
+    def test_historical_sfp_is_not_score_eligible(self):
+        sfp = self._sfp()
+        sfp['historical_only'] = True
+        sfp['candidate_id'] = 'OLD_CANDIDATE'
+        result = calculate_setup_score(
+            trade_direction='long',
+            current_price=100.0,
+            trend_data=None,
+            context_structure_data=None,
+            trigger_structure_data=None,
+            sfp_data_in_window=sfp,
+            fvg_test_data=None,
+            fvg_data=[],
+            macro_data=None,
+            premium_discount_data=self._premium_discount(),
+        )
+
+        self.assertEqual(result['raw_score'], 0)
+        self.assertEqual(result['score_components_total'], 0)
+        self.assertTrue(result['score_consistent'])
 
 
 if __name__ == '__main__':

@@ -1,5 +1,8 @@
 FROM python:3.10-slim
 
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
+
 # Устанавливаем рабочую директорию
 WORKDIR /app
 

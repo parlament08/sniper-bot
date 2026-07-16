@@ -2,7 +2,9 @@ import os
 import time
 import json
 import uuid
+import hashlib
 import subprocess
+import traceback as traceback_module
 import requests
 import pandas as pd
 import google.generativeai as genai
@@ -27,9 +29,10 @@ from core.structure import (
 from core.indicators import calculate_ema, calculate_atr, calculate_rvol, calculate_adx, evaluate_trend
 from core.journal import write_scan_record
 from core.liquidity import build_liquidity_map
+from core.payload import payload_to_dict
 from core.premium_discount import evaluate_premium_discount
 from core.risk import calculate_setup_score, format_setup_direction, resolve_session_decision, select_best_setup
-from core.risk_plan import build_risk_plan
+from core.risk_plan import RiskPlan, build_risk_plan
 from core.session import DEFAULT_TIMEZONE, evaluate_session, next_quarter_close
 from core.scenario_scanner import ScenarioEvent, scan_scenarios
 from core.state_machine import SniperEvent, SniperStateMachine
@@ -50,10 +53,12 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 TELEGRAM_MAX_MESSAGE_LENGTH = 3900
 SEND_DIAGNOSTIC_OUTSIDE_KZ = os.environ.get("SEND_DIAGNOSTIC_OUTSIDE_KZ", "false").lower() == "true"
+SEND_A_PLUS_OUTSIDE_KZ = os.environ.get("SEND_A_PLUS_OUTSIDE_KZ", "true").lower() == "true"
 TELEGRAM_REPORT_DETAIL = os.environ.get("TELEGRAM_REPORT_DETAIL", "compact").lower()
 SCAN_JOURNAL_ENABLED = os.environ.get("SCAN_JOURNAL_ENABLED", "true").lower() == "true"
 APP_VERSION = os.environ.get("APP_VERSION", "v1.0.0-rc2")
 GIT_COMMIT = os.environ.get("GIT_COMMIT")
+BUILD_TIME = os.environ.get("BUILD_TIME") or pd.Timestamp.now(tz=DEFAULT_TIMEZONE).isoformat()
 A_PLUS_DELIVERY_THRESHOLD = int(os.environ.get("A_PLUS_DELIVERY_THRESHOLD", "85"))
 MIN_SCENARIO_FVG_QUALITY = 70
 MAX_SCENARIO_FVG_AGE = 64
@@ -66,6 +71,8 @@ MIN_EARLY_TRIGGER_RVOL = 1.2
 TRIGGER_LINK_WINDOW_BARS = 5
 MAX_TRIGGER_BARS_AFTER_SFP = 24
 MAX_TRIGGER_BARS_AFTER_POI = 24
+if not GIT_COMMIT or GIT_COMMIT == "unknown":
+    logger.warning("GIT_COMMIT is not configured")
 
 A_PLUS_NARRATOR_INSTRUCTION = """
 Ты — профессиональный финансовый диктор. Оформи этот JSON с А+ сетапом в красивый HTML для Telegram с тегами <b> и <code>. Ничего не выдумывай от себя.
@@ -86,26 +93,51 @@ COINS_LIST = [
     'MANA', 'APE', 'DYDX', 'IMX', 'STX',
 ]
 last_alert_time = {coin: 0 for coin in COINS_LIST}
+_SCENARIO_TRANSITION_STATE = {}
+_SCENARIO_RUNTIME_STATE = {}
 
-def send_telegram_alert(text):
+def send_telegram_alert(text, *, run_id=None, message_type="UNKNOWN", delivery_context=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
+    sent = False
+    error = None
+    status_code = None
     try:
         res = requests.post(url, data=payload, timeout=10)
+        status_code = res.status_code
         if res.status_code != 200:
+            error = res.text
             logger.error(f"Ошибка Telegram API: {res.text}")
+        else:
+            sent = True
     except Exception as e:
+        error = str(e)
         logger.error(f"Не удалось отправить пуш в Telegram: {e}")
+    _record_telegram_delivery(
+        run_id=run_id,
+        message_type=message_type,
+        attempted=True,
+        sent=sent,
+        error=error,
+        status_code=status_code,
+        message_length=len(text or ""),
+        **(delivery_context or {}),
+    )
+    return {"attempted": True, "sent": sent, "error": error, "status_code": status_code}
 
 
-def send_telegram_blocks(header_lines, body_blocks, max_length=TELEGRAM_MAX_MESSAGE_LENGTH):
+def send_telegram_blocks(header_lines, body_blocks, max_length=TELEGRAM_MAX_MESSAGE_LENGTH, *, run_id=None, message_type="DASHBOARD"):
     header = "\n".join(header_lines)
     current_blocks = []
 
     def flush():
         if not current_blocks:
             return
-        send_telegram_alert("\n".join([header] + current_blocks))
+        message = "\n".join([header] + current_blocks)
+        if run_id is None and message_type == "DASHBOARD":
+            send_telegram_alert(message)
+        else:
+            send_telegram_alert(message, run_id=run_id, message_type=message_type)
         current_blocks.clear()
 
     for block in body_blocks:
@@ -332,6 +364,8 @@ def _build_dashboard_block(coin, score_result, analysis_data, decision, in_kz):
 def _format_risk_plan(risk_plan):
     if not risk_plan:
         return '0'
+    if risk_plan.get('risk_plan_status') == 'not_available':
+        return f"WAIT ({risk_plan.get('reason') or 'entry model not formed'})"
     validity = 'OK' if risk_plan.get('valid') else 'BLOCK'
     target_2 = risk_plan.get('target_2')
     rr2_text = f" / T2 {risk_plan.get('rr_to_target_2'):.2f}R" if target_2 is not None and risk_plan.get('rr_to_target_2') is not None else ""
@@ -341,6 +375,30 @@ def _format_risk_plan(risk_plan):
         f"SL {risk_plan.get('stop_distance_percent'):.2f}%, "
         f"{risk_plan.get('reason')})"
     )
+
+
+def _event_timing_fields(event):
+    event_index = event.get('index') if event else None
+    detected_at = event.get('detected_at') or event.get('created_at') or event.get('scan_time')
+    event_time = event.get('event_time') or event_index
+    delay_seconds = None
+    if event_time is not None and detected_at is not None:
+        try:
+            event_ts = pd.Timestamp(event_time)
+            detected_ts = pd.Timestamp(detected_at)
+            if event_ts.tzinfo is not None and detected_ts.tzinfo is None:
+                detected_ts = detected_ts.tz_localize(event_ts.tzinfo)
+            elif event_ts.tzinfo is None and detected_ts.tzinfo is not None:
+                event_ts = event_ts.tz_localize(detected_ts.tzinfo)
+            delay_seconds = max(0.0, (detected_ts - event_ts).total_seconds())
+        except Exception:
+            delay_seconds = None
+    return {
+        'event_time': str(event_time) if event_time is not None else None,
+        'detected_at': str(detected_at) if detected_at is not None else None,
+        'detection_delay_seconds': delay_seconds,
+        'is_reconstructed': bool(event.get('is_reconstructed') or event.get('historical_only')),
+    }
 
 
 def _event_snapshot(event):
@@ -366,6 +424,7 @@ def _event_snapshot(event):
         'is_early': event.get('is_early'),
         'is_confirmed': event.get('is_confirmed'),
         'reason': event.get('reason'),
+        **_event_timing_fields(event),
     }
 
 
@@ -395,6 +454,7 @@ def _trigger_scan_snapshot(trigger_scan):
         'opposite_trigger': _trigger_candidate_snapshot(data.get('opposite_trigger')),
         'sfp_index': str(data.get('sfp_index')) if data.get('sfp_index') is not None else None,
         'poi_index': str(data.get('poi_index')) if data.get('poi_index') is not None else None,
+        'pd_location_index': str(data.get('pd_location_index')) if data.get('pd_location_index') is not None else None,
         'anchor_index': str(data.get('anchor_index')) if data.get('anchor_index') is not None else None,
         'trigger_index': str(data.get('trigger_index')) if data.get('trigger_index') is not None else None,
         'trigger_confirmed': data.get('trigger_confirmed'),
@@ -458,10 +518,98 @@ def _git_commit_short():
         return None
 
 
+def _config_hash():
+    payload = {
+        "a_plus_delivery_threshold": A_PLUS_DELIVERY_THRESHOLD,
+        "min_scenario_fvg_quality": MIN_SCENARIO_FVG_QUALITY,
+        "max_scenario_fvg_age": MAX_SCENARIO_FVG_AGE,
+        "max_scenario_fvg_retests": MAX_SCENARIO_FVG_RETESTS,
+        "min_trigger_quality": MIN_TRIGGER_QUALITY,
+        "min_early_trigger_quality": MIN_EARLY_TRIGGER_QUALITY,
+        "min_early_trigger_body_ratio": MIN_EARLY_TRIGGER_BODY_RATIO,
+        "min_early_trigger_displacement_atr": MIN_EARLY_TRIGGER_DISPLACEMENT_ATR,
+        "min_early_trigger_rvol": MIN_EARLY_TRIGGER_RVOL,
+        "trigger_link_window_bars": TRIGGER_LINK_WINDOW_BARS,
+        "max_trigger_bars_after_sfp": MAX_TRIGGER_BARS_AFTER_SFP,
+        "max_trigger_bars_after_poi": MAX_TRIGGER_BARS_AFTER_POI,
+        "telegram_report_detail": TELEGRAM_REPORT_DETAIL,
+        "send_diagnostic_outside_kz": SEND_DIAGNOSTIC_OUTSIDE_KZ,
+        "send_a_plus_outside_kz": SEND_A_PLUS_OUTSIDE_KZ,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
 def _build_metadata():
     return {
         "app_version": APP_VERSION,
         "git_commit": _git_commit_short(),
+        "config_hash": _config_hash(),
+        "build_time": BUILD_TIME,
+    }
+
+
+def _build_telegram_delivery_record(
+    *,
+    run_id,
+    message_type,
+    attempted,
+    sent,
+    error,
+    status_code=None,
+    message_length=None,
+    in_kill_zone=None,
+    outside_kz_delivery_enabled=None,
+    kill_zone_bypassed=None,
+):
+    record = {
+        **_build_metadata(),
+        "record_type": "telegram_delivery",
+        "run_id": run_id,
+        "timestamp": pd.Timestamp.now(tz=DEFAULT_TIMEZONE).isoformat(),
+        "message_type": message_type,
+        "attempted": bool(attempted),
+        "sent": bool(sent),
+        "error": error,
+        "status_code": status_code,
+        "message_length": message_length,
+    }
+    if message_type == "A_PLUS":
+        record.update({
+            "in_kill_zone": in_kill_zone,
+            "outside_kz_delivery_enabled": outside_kz_delivery_enabled,
+            "kill_zone_bypassed": kill_zone_bypassed,
+        })
+    return record
+
+
+def _record_telegram_delivery(**kwargs):
+    if not SCAN_JOURNAL_ENABLED:
+        return None
+    try:
+        return write_scan_record(_build_telegram_delivery_record(**kwargs))
+    except Exception as journal_error:
+        logger.error(f"Не удалось записать telegram delivery journal: {journal_error}")
+        return None
+
+
+def _analysis_error(symbol, stage, exc, run_id):
+    if isinstance(exc, BaseException):
+        return {
+            "symbol": symbol,
+            "stage": stage,
+            "exception_type": type(exc).__name__,
+            "exception_message": str(exc),
+            "traceback": "".join(traceback_module.format_exception(type(exc), exc, exc.__traceback__)),
+            "run_id": run_id,
+        }
+    return {
+        "symbol": symbol,
+        "stage": stage,
+        "exception_type": str(exc),
+        "exception_message": str(exc),
+        "traceback": None,
+        "run_id": run_id,
     }
 
 
@@ -494,8 +642,11 @@ def _a_plus_delivery_gate(score_result, analysis_data, in_kill_zone):
     diagnostics = (score_result or {}).setdefault("diagnostics", {})
     selected = _selected_scenario_snapshot(analysis_data) or {}
     event_types = _selected_scenario_event_types(analysis_data)
+    kill_zone_gate = bool(in_kill_zone) or SEND_A_PLUS_OUTSIDE_KZ
     gates = {
         "in_kill_zone": bool(in_kill_zone),
+        "outside_kz_delivery_enabled": SEND_A_PLUS_OUTSIDE_KZ,
+        "kill_zone_gate": kill_zone_gate,
         "score_threshold": float((score_result or {}).get("total_score", 0) or 0) >= A_PLUS_DELIVERY_THRESHOLD,
         "scenario_valid": bool(diagnostics.get("scenario_scan_valid") or selected.get("scenario_valid")),
         "signal_allowed": bool(diagnostics.get("scenario_scan_signal_allowed") or selected.get("signal_allowed")),
@@ -505,11 +656,23 @@ def _a_plus_delivery_gate(score_result, analysis_data, in_kill_zone):
         "displacement_confirmed": "DISPLACEMENT_CONFIRMED" in event_types,
         "scenario_risk_valid": bool(diagnostics.get("scenario_risk_valid") or selected.get("risk_valid")),
     }
+    required_gate_names = [
+        "kill_zone_gate",
+        "score_threshold",
+        "scenario_valid",
+        "signal_allowed",
+        "trigger_confirmed",
+        "fvg_created",
+        "fvg_retested",
+        "displacement_confirmed",
+        "scenario_risk_valid",
+    ]
     return {
-        "allowed": all(gates.values()),
+        "allowed": all(gates[name] for name in required_gate_names),
         "threshold": A_PLUS_DELIVERY_THRESHOLD,
+        "kill_zone_bypassed": bool(not in_kill_zone and SEND_A_PLUS_OUTSIDE_KZ and kill_zone_gate),
         "gates": gates,
-        "failed_gates": [name for name, passed in gates.items() if not passed],
+        "failed_gates": [name for name in required_gate_names if not gates[name]],
     }
 
 
@@ -558,8 +721,15 @@ def _build_scan_journal_record(run_id, timestamp, symbol, session, score_result,
         },
         'session': session.to_dict() if hasattr(session, 'to_dict') else session,
         'decision': score_result.get('decision'),
+        'context_decision': score_result.get('context_decision'),
+        'scenario_status': score_result.get('scenario_status'),
+        'execution_status': score_result.get('execution_status'),
+        'final_decision': score_result.get('final_decision') or score_result.get('decision'),
         'score': score_result.get('total_score'),
         'raw_score': score_result.get('raw_score'),
+        'score_components': score_result.get('score_components'),
+        'score_components_total': score_result.get('score_components_total'),
+        'score_consistent': score_result.get('score_consistent'),
         'direction': analysis_data.get('direction'),
         'no_trade_reason': score_result.get('no_trade_reason'),
         'features': {
@@ -595,6 +765,159 @@ def _build_scan_journal_record(run_id, timestamp, symbol, session, score_result,
     }
 
 
+def _scenario_transition_state(candidate):
+    if not candidate:
+        return None
+    status = getattr(candidate, "status", None)
+    if status == "invalidated":
+        return "INVALIDATED"
+    if status == "complete":
+        return "SIGNAL_ALLOWED"
+    next_step = getattr(candidate, "next_expected_step", None)
+    if next_step:
+        return f"WAITING_FOR_{str(next_step).upper()}"
+    current_step = getattr(candidate, "current_step", None)
+    return str(current_step or status or "UNKNOWN").upper()
+
+
+def _last_scenario_event(candidate):
+    events = list(getattr(candidate, "events_used", None) or [])
+    return events[-1] if events else None
+
+
+def _scenario_event_field(event, field, default=None):
+    if event is None:
+        return default
+    if isinstance(event, dict):
+        return event.get(field, default)
+    return getattr(event, field, default)
+
+
+def _scenario_event_payload(event):
+    payload = _scenario_event_field(event, "payload", None)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _build_scenario_transition_records(run_id, timestamp, symbol, scenario_scan, *, detected_at=None):
+    if scenario_scan is None:
+        return []
+    detected_at = detected_at or timestamp
+    candidates = []
+    for item in [
+        getattr(scenario_scan, "selected_scenario", None),
+        *(getattr(scenario_scan, "top_candidates", None) or []),
+        *(getattr(scenario_scan, "long_candidates", None) or []),
+        *(getattr(scenario_scan, "short_candidates", None) or []),
+    ]:
+        if item is not None:
+            candidates.append(item)
+
+    records = []
+    seen = set()
+    for candidate in candidates:
+        candidate_id = getattr(candidate, "candidate_id", None)
+        if not candidate_id or candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        to_state = _scenario_transition_state(candidate)
+        cache_key = (symbol, candidate_id)
+        from_state = _SCENARIO_TRANSITION_STATE.get(cache_key)
+        if from_state == to_state:
+            continue
+        _SCENARIO_TRANSITION_STATE[cache_key] = to_state
+
+        event = _last_scenario_event(candidate)
+        payload = _scenario_event_payload(event)
+        event_time = _scenario_event_field(event, "index", getattr(candidate, "last_event_index", None))
+        event_detected_at = payload.get("detected_at") or detected_at
+        records.append({
+            **_build_metadata(),
+            "record_type": "scenario_transition",
+            "run_id": run_id,
+            "timestamp": timestamp,
+            "symbol": symbol,
+            "candidate_id": candidate_id,
+            "from_state": from_state,
+            "to_state": to_state,
+            "event_type": _scenario_event_field(event, "event_type", None),
+            "event_time": str(event_time) if event_time is not None else None,
+            "detected_at": str(event_detected_at) if event_detected_at is not None else None,
+            "is_reconstructed": bool(payload.get("is_reconstructed") or payload.get("historical_only")),
+            "invalidation_component": getattr(candidate, "last_invalidated_component", None),
+            "invalidated_reason": getattr(candidate, "invalidated_reason", None),
+        })
+    return records
+
+
+def _apply_runtime_update_counts(symbol, scenario_scan):
+    if scenario_scan is None:
+        return scenario_scan
+    candidates = []
+    for item in [
+        getattr(scenario_scan, "selected_scenario", None),
+        *(getattr(scenario_scan, "top_candidates", None) or []),
+        *(getattr(scenario_scan, "long_candidates", None) or []),
+        *(getattr(scenario_scan, "short_candidates", None) or []),
+    ]:
+        if item is not None:
+            candidates.append(item)
+
+    seen = set()
+    for candidate in candidates:
+        candidate_id = getattr(candidate, "candidate_id", None)
+        if not candidate_id or candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        cache_key = (symbol, candidate_id)
+        lifecycle = _SCENARIO_RUNTIME_STATE.get(cache_key)
+        if lifecycle is None:
+            runtime_update_count = int(getattr(candidate, "runtime_update_count", 0) or 0)
+            first_index = (
+                getattr(candidate, "anchor_first_touch_index", None)
+                or getattr(candidate, "candidate_created_at", None)
+                or getattr(candidate, "anchor_index", None)
+            )
+        else:
+            runtime_update_count = int(lifecycle.get("runtime_update_count", 0) or 0) + 1
+            first_index = lifecycle.get("first_index") or getattr(candidate, "anchor_index", None)
+        last_index = getattr(candidate, "last_event_index", None) or getattr(candidate, "anchor_last_touch_index", None) or getattr(candidate, "anchor_index", None)
+        market_age_bars = max(
+            int(getattr(candidate, "market_age_bars", 0) or 0),
+            _market_age_bars_between(first_index, last_index),
+        )
+        _SCENARIO_RUNTIME_STATE[cache_key] = {
+            "runtime_update_count": runtime_update_count,
+            "first_index": first_index,
+            "last_index": last_index,
+        }
+        candidate.runtime_update_count = runtime_update_count
+        candidate.market_age_bars = market_age_bars
+        candidate.age_bars = market_age_bars
+        if isinstance(getattr(candidate, "trigger_scan", None), dict):
+            candidate.trigger_scan["runtime_update_count"] = runtime_update_count
+            candidate.trigger_scan["market_age_bars"] = market_age_bars
+            candidate.trigger_scan["age_bars"] = market_age_bars
+    for cache_key in list(_SCENARIO_RUNTIME_STATE.keys()):
+        if cache_key[0] == symbol and cache_key[1] not in seen:
+            del _SCENARIO_RUNTIME_STATE[cache_key]
+    return scenario_scan
+
+
+def _market_age_bars_between(first_index, last_index):
+    if first_index is None or last_index is None:
+        return 0
+    if isinstance(first_index, (int, float)) and isinstance(last_index, (int, float)):
+        return max(0, int(float(last_index) - float(first_index)))
+    try:
+        first_ts = pd.Timestamp(first_index)
+        last_ts = pd.Timestamp(last_index)
+    except Exception:
+        return 0
+    if last_ts < first_ts:
+        return 0
+    return max(0, int((last_ts - first_ts) / pd.Timedelta(minutes=15)))
+
+
 def _build_run_summary_record(
     *,
     run_id,
@@ -607,7 +930,22 @@ def _build_run_summary_record(
     errors,
 ):
     successful = [item for item in symbol_results if item.get("success")]
-    decisions = [item.get("decision") for item in successful]
+    universe_total = len(COINS_LIST)
+    symbols_success = len(successful)
+    symbols_failed = len(errors)
+    coverage_percent = round((symbols_success / universe_total) * 100, 2) if universe_total else 0.0
+    if symbols_success == universe_total and symbols_failed == 0:
+        run_status = "SUCCESS"
+    elif symbols_success > 0:
+        run_status = "PARTIAL_SUCCESS"
+    else:
+        run_status = "FAILED"
+    audit_eligible = run_status == "SUCCESS" and all(
+        (item.get("error") or {}).get("exception_type") != "NoAnalysisData"
+        for item in symbol_results
+    )
+    decisions = [item.get("final_decision") or item.get("decision") for item in successful]
+    context_decisions = [item.get("context_decision") for item in successful]
     diagnostics = [item.get("diagnostics") or {} for item in successful]
     analysis_items = [item.get("analysis_data") or {} for item in successful]
     scenario_scans = [
@@ -635,11 +973,15 @@ def _build_run_summary_record(
         "duration_seconds": round(float(duration_seconds or 0.0), 2),
         "report_mode": report_mode,
         "session": session.to_dict() if hasattr(session, "to_dict") else session,
-        "symbols_total": len(COINS_LIST),
-        "symbols_success": len(successful),
-        "symbols_failed": len(errors),
+        "symbols_total": universe_total,
+        "symbols_success": symbols_success,
+        "symbols_failed": symbols_failed,
+        "run_status": run_status,
+        "coverage_percent": coverage_percent,
+        "audit_eligible": audit_eligible,
         "ignore_count": sum(1 for decision in decisions if decision == "Ignore"),
-        "watchlist_count": sum(1 for decision in decisions if decision in ("Watchlist", "A+ WATCH ONLY")),
+        "watchlist_count": sum(1 for decision in decisions if decision == "Watchlist"),
+        "context_watchlist_count": sum(1 for decision in context_decisions if decision in ("Watchlist", "A+ WATCH ONLY")),
         "a_plus_count": sum(1 for decision in decisions if decision == "A+"),
         "sfp_present_count": sum(1 for diag in diagnostics if diag.get("sfp_present")),
         "early_trigger_count": sum(1 for diag in diagnostics if diag.get("early_trigger_confirmed")),
@@ -1319,11 +1661,15 @@ def _humanize_confirmed_debug_reason(reason):
         'quality_below_min': 'quality below min',
         'before_early_trigger': 'before early trigger',
         'direction_conflict': 'direction conflict',
+        'candidate_scope_mismatch': 'candidate scope mismatch',
         'outside_confirmation_window': 'outside window',
+        'confirmed_bos_found': 'confirmed BOS found',
         'no_confirmed_bos_after_early_trigger': 'no confirmed BOS after early trigger',
         'not_enough_candles_after_early_trigger': 'not enough candles after early trigger',
+        'no_break_level_available': 'no break level after early trigger',
         'no_confirmed_break_level_after_early_trigger': 'no break level after early trigger',
         'no_candle_closed_beyond_break_level': 'no candle closed beyond break level',
+        'opposite_structure_invalidated_candidate': 'opposite structure invalidated candidate',
     }
     return mapping.get(reason, reason or 'unknown')
 
@@ -1432,6 +1778,33 @@ def _scenario_event(event_type, direction, index, quality_score=None, source=Non
     )
 
 
+def _structure_event_id(event):
+    if not event:
+        return None
+    return event.get('event_id') or event.get('id') or f"{str(event.get('type') or 'structure').upper()}:{event.get('index')}"
+
+
+def _fvg_pipeline_payload(fvg, selected_trigger, selected_fvg_test_data, fvg_direction, selected_direction, *, test_index=None, displacement_index=None):
+    payload = payload_to_dict(fvg)
+    payload.setdefault('created_index', payload.get('end_index'))
+    payload.setdefault('retested_index', test_index)
+    payload.setdefault('invalidated_index', payload.get('invalidated_index'))
+    if fvg_direction == selected_direction and selected_trigger:
+        payload.setdefault('source_candidate_id', selected_trigger.get('candidate_id'))
+        payload.setdefault('source_confirmed_trigger_id', _structure_event_id(selected_trigger))
+        payload.setdefault('source_confirmed_trigger_index', selected_trigger.get('index'))
+    elif fvg_direction == selected_direction and selected_fvg_test_data:
+        payload.setdefault('source_candidate_id', selected_fvg_test_data.get('source_candidate_id'))
+        payload.setdefault('source_confirmed_trigger_id', selected_fvg_test_data.get('source_confirmed_trigger_id'))
+        payload.setdefault('source_confirmed_trigger_index', selected_fvg_test_data.get('source_confirmed_trigger_index'))
+    if displacement_index is not None:
+        if test_index is not None and _event_sort_key(displacement_index) > _event_sort_key(test_index):
+            payload.setdefault('displacement_stage', 'post_retest')
+        else:
+            payload.setdefault('displacement_stage', 'bos_displacement')
+    return payload
+
+
 def _build_scenario_events(
     direction,
     market_structure,
@@ -1459,10 +1832,16 @@ def _build_scenario_events(
     if premium_discount_data:
         pd_payload = premium_discount_data.to_dict() if hasattr(premium_discount_data, 'to_dict') else premium_discount_data
         pd_index = _poi_event_index(selected_fvg_test_data, last_closed_15m)
+        pd_payload = payload_to_dict(pd_payload)
+        pd_payload.setdefault('source', 'premium_discount')
+        pd_payload.setdefault('pd_location_id', _pd_location_id(pd_payload))
+        pd_payload.setdefault('zone_depth_initial', pd_payload.get('zone_depth'))
+        pd_payload['zone_depth_current'] = pd_payload.get('zone_depth')
+        pd_payload['zone_strength_current'] = pd_payload.get('zone_strength')
         if pd_index is not None and premium_discount_data.get('valid_for_buy', False):
-            events.append(_scenario_event('POI_TOUCHED', 'bullish', pd_index, premium_discount_data.get('zone_strength'), 'premium_discount', pd_payload))
+            events.append(_scenario_event('PD_LOCATION_VALID', 'bullish', pd_index, premium_discount_data.get('zone_strength'), 'premium_discount', pd_payload))
         if pd_index is not None and premium_discount_data.get('valid_for_sell', False):
-            events.append(_scenario_event('POI_TOUCHED', 'bearish', pd_index, premium_discount_data.get('zone_strength'), 'premium_discount', pd_payload))
+            events.append(_scenario_event('PD_LOCATION_VALID', 'bearish', pd_index, premium_discount_data.get('zone_strength'), 'premium_discount', pd_payload))
 
     if sfp_data:
         sfp_direction = _event_direction(sfp_data)
@@ -1525,17 +1904,46 @@ def _build_scenario_events(
     for fvg in _latest_fvgs_by_type(fvg_data):
         fvg_direction = 'bullish' if fvg.get('type') == 'bullish' else 'bearish' if fvg.get('type') == 'bearish' else None
         created_index = fvg.get('end_index')
-        if created_index is not None:
-            events.append(_scenario_event('FVG_CREATED', fvg_direction, created_index, fvg.get('quality_score'), 'fvg', fvg))
-        test_index = fvg.get('test_index')
         selected_direction = _direction_to_state_direction(direction)
+        if created_index is not None:
+            events.append(_scenario_event(
+                'FVG_CREATED',
+                fvg_direction,
+                created_index,
+                fvg.get('quality_score'),
+                'fvg',
+                _fvg_pipeline_payload(fvg, selected_trigger, selected_fvg_test_data, fvg_direction, selected_direction),
+            ))
+        test_index = fvg.get('test_index')
         if test_index is None and selected_fvg_test_data and fvg_direction == selected_direction:
             test_index = selected_fvg_test_data.get('index')
         if test_index is not None and (fvg.get('tested', False) or selected_fvg_test_data):
-            events.append(_scenario_event('FVG_RETESTED', fvg_direction, test_index, fvg.get('quality_score'), 'fvg', fvg))
+            events.append(_scenario_event(
+                'FVG_RETESTED',
+                fvg_direction,
+                test_index,
+                fvg.get('quality_score'),
+                'fvg',
+                _fvg_pipeline_payload(fvg, selected_trigger, selected_fvg_test_data, fvg_direction, selected_direction, test_index=test_index),
+            ))
         displacement_index = fvg.get('displacement_index') or ((selected_fvg_test_data or {}).get('displacement_index') if fvg_direction == selected_direction else None)
         if displacement_index is not None:
-            events.append(_scenario_event('DISPLACEMENT_CONFIRMED', fvg_direction, displacement_index, fvg.get('quality_score'), 'fvg', fvg))
+            events.append(_scenario_event(
+                'DISPLACEMENT_CONFIRMED',
+                fvg_direction,
+                displacement_index,
+                fvg.get('quality_score'),
+                'fvg',
+                _fvg_pipeline_payload(
+                    fvg,
+                    selected_trigger,
+                    selected_fvg_test_data,
+                    fvg_direction,
+                    selected_direction,
+                    test_index=test_index,
+                    displacement_index=displacement_index,
+                ),
+            ))
 
     if risk_plan:
         risk_direction = 'bullish' if risk_plan.direction == 'LONG' else 'bearish'
@@ -1552,12 +1960,186 @@ def _build_scenario_events(
     return events
 
 
+def _candidate_risk_inputs(selected_scenario, fvg_data=None, selected_fvg_test_data=None, direction=None):
+    if selected_scenario is None:
+        return [], None, False
+    fvg_event = _candidate_event(selected_scenario, "FVG_CREATED")
+    retest_event = _candidate_event(selected_scenario, "FVG_RETESTED")
+    displacement_event = _candidate_event(selected_scenario, "DISPLACEMENT_CONFIRMED")
+    candidate_id = getattr(selected_scenario, "candidate_id", None)
+    if fvg_event is None:
+        inferred_fvg = _infer_candidate_fvg(selected_scenario, fvg_data, direction)
+        if inferred_fvg is None:
+            return [], None, False
+        inferred_fvg["source_candidate_id"] = candidate_id
+        inferred_fvg["candidate_id"] = candidate_id
+        inferred_fvg["tested"] = False
+        return [inferred_fvg], None, False
+    fvg_payload = payload_to_dict(getattr(fvg_event, "payload", None))
+    fvg_payload["source_candidate_id"] = candidate_id
+    fvg_payload["candidate_id"] = candidate_id
+    fvg_payload["tested"] = retest_event is not None
+    fvg_test_payload = None
+    if retest_event is not None:
+        fvg_test_payload = payload_to_dict(getattr(retest_event, "payload", None))
+        fvg_test_payload["source_candidate_id"] = candidate_id
+        fvg_test_payload.setdefault("index", getattr(retest_event, "index", None))
+    elif selected_fvg_test_data and _event_sort_key(selected_fvg_test_data.get("index")) > _event_sort_key(fvg_payload.get("created_index") or fvg_payload.get("end_index")):
+        fvg_test_payload = payload_to_dict(selected_fvg_test_data)
+        fvg_test_payload["source_candidate_id"] = candidate_id
+        fvg_payload["tested"] = True
+    return [fvg_payload], fvg_test_payload, displacement_event is not None
+
+
+def _build_candidate_risk_plan(
+    *,
+    selected_scenario,
+    direction,
+    current_price,
+    atr,
+    liquidity_map,
+    fvg_data,
+    selected_fvg_test_data,
+    sfp_data,
+    structure_data,
+):
+    if direction not in ('LONG', 'SHORT') or selected_scenario is None:
+        return None
+    selected_candidate_id = getattr(selected_scenario, 'candidate_id', None)
+    candidate_fvg_data, candidate_fvg_test_data, candidate_displacement_confirmed = _candidate_risk_inputs(
+        selected_scenario,
+        fvg_data,
+        selected_fvg_test_data,
+        direction,
+    )
+    candidate_structure_data = _candidate_confirmed_trigger(selected_scenario) or structure_data
+    candidate_sfp_data = _candidate_sfp(selected_scenario) or sfp_data
+    risk_plan = build_risk_plan(
+        direction=direction,
+        current_price=current_price,
+        atr=atr,
+        liquidity_map=liquidity_map,
+        fvg_data=candidate_fvg_data,
+        fvg_test_data=candidate_fvg_test_data,
+        sfp_data=candidate_sfp_data,
+        structure_data=candidate_structure_data,
+        source_candidate_id=selected_candidate_id,
+        candidate_fvg_created=bool(candidate_fvg_data),
+        candidate_fvg_retested=bool(candidate_fvg_test_data),
+        post_retest_displacement_confirmed=bool(candidate_displacement_confirmed),
+    )
+    return _ensure_risk_source_candidate(risk_plan, selected_candidate_id)
+
+
+def _not_available_risk_plan(direction, reason, source_candidate_id=None):
+    if direction not in ('LONG', 'SHORT'):
+        return None
+    return RiskPlan(
+        direction=direction,
+        entry=None,
+        stop_loss=None,
+        invalidation_level=None,
+        target_1=None,
+        target_2=None,
+        risk_per_unit=None,
+        rr_to_target_1=None,
+        rr_to_target_2=None,
+        stop_distance_percent=None,
+        entry_distance_from_poi_atr=None,
+        valid=False,
+        reason=reason,
+        entry_model="entry_not_available",
+        stop_model="none",
+        target_model="none",
+        risk_plan_status="not_available",
+        source_candidate_id=source_candidate_id,
+        risk_geometry="not_available",
+    )
+
+
+def _risk_plan_for_selected_candidate(risk_plan, selected_scenario, direction):
+    selected_candidate_id = getattr(selected_scenario, 'candidate_id', None) if selected_scenario else None
+    if risk_plan is None or not selected_candidate_id:
+        return risk_plan
+    source_candidate_id = risk_plan.get("source_candidate_id") if isinstance(risk_plan, dict) else getattr(risk_plan, "source_candidate_id", None)
+    if source_candidate_id is None:
+        return _ensure_risk_source_candidate(risk_plan, selected_candidate_id)
+    if str(source_candidate_id) != str(selected_candidate_id):
+        logger.warning(
+            "Risk plan provenance mismatch: selected_candidate_id=%s risk_source_candidate_id=%s",
+            selected_candidate_id,
+            source_candidate_id,
+        )
+        return _not_available_risk_plan(direction, "candidate_provenance_mismatch", selected_candidate_id)
+    return risk_plan
+
+
+def _infer_candidate_fvg(selected_scenario, fvg_data, direction):
+    confirmed = _candidate_confirmed_trigger(selected_scenario)
+    if not confirmed:
+        return None
+    selected_direction = _direction_to_state_direction(direction)
+    confirmed_index = confirmed.get("index")
+    candidates = []
+    for fvg in fvg_data or []:
+        payload = payload_to_dict(fvg)
+        if payload.get("type") != selected_direction:
+            continue
+        created_index = payload.get("end_index") or payload.get("created_index")
+        if created_index is None or _event_sort_key(created_index) <= _event_sort_key(confirmed_index):
+            continue
+        if payload.get("invalidated"):
+            continue
+        payload.setdefault("created_index", created_index)
+        candidates.append(payload)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: _event_sort_key(item.get("created_index") or item.get("end_index")))
+
+
+def _ensure_risk_source_candidate(risk_plan, candidate_id):
+    if risk_plan is None or not candidate_id:
+        return risk_plan
+    if isinstance(risk_plan, dict):
+        risk_plan.setdefault("source_candidate_id", candidate_id)
+        return risk_plan
+    if getattr(risk_plan, "source_candidate_id", None) is None:
+        object.__setattr__(risk_plan, "source_candidate_id", candidate_id)
+    return risk_plan
+
+
+def _candidate_confirmed_trigger(selected_scenario):
+    event = _candidate_event(selected_scenario, "CONFIRMED_TRIGGER_CONFIRMED")
+    return payload_to_dict(getattr(event, "payload", None)) if event is not None else None
+
+
+def _candidate_sfp(selected_scenario):
+    event = _candidate_event(selected_scenario, "SFP_CONFIRMED")
+    return payload_to_dict(getattr(event, "payload", None)) if event is not None else None
+
+
+def _candidate_event(selected_scenario, event_type):
+    wanted = str(event_type or "").upper()
+    aliases = {
+        "SFP_CONFIRMED": {"SFP_CONFIRMED", "LIQUIDITY_SWEEP_CONFIRMED"},
+        "CONFIRMED_TRIGGER_CONFIRMED": {"CONFIRMED_TRIGGER_CONFIRMED", "CHOCH_CONFIRMED", "BOS_CONFIRMED"},
+    }.get(wanted, {wanted})
+    for event in getattr(selected_scenario, "events_used", []) or []:
+        if str(getattr(event, "event_type", "") or "").upper() in aliases:
+            return event
+    return None
+
+
 def _poi_event_index(selected_fvg_test_data, last_closed_15m):
     if selected_fvg_test_data and selected_fvg_test_data.get('index') is not None:
         return selected_fvg_test_data.get('index')
     if last_closed_15m is not None and getattr(last_closed_15m, 'name', None) is not None:
         return last_closed_15m.name
     return None
+
+
+def _pd_location_id(payload):
+    return "|".join(str(payload.get(key)) for key in ("zone", "range_timeframe", "range_low", "range_high"))
 
 
 def _latest_fvgs_by_type(fvg_data):
@@ -2014,6 +2596,7 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
     short_score = calculate_setup_score('short', current_price, trend_data, context_break_1h, trigger_break_15m, sfp_data_in_window, short_fvg_test_data, all_fvgs, short_macro_data, premium_discount_data)
 
     final_score_result, direction = select_best_setup(long_score, short_score)
+    final_score_result['context_decision'] = final_score_result.get('decision')
     if low_adx_override_direction:
         selected_state_direction = _direction_to_state_direction(direction)
         if selected_state_direction == low_adx_override_direction:
@@ -2048,6 +2631,7 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
                 },
             }
             direction = 'NEUTRAL'
+    final_score_result.setdefault('context_decision', final_score_result.get('decision', 'Ignore'))
     selected_fvg_test_data = long_fvg_test_data if direction == 'LONG' else short_fvg_test_data if direction == 'SHORT' else None
     early_trigger_candidates = _detect_early_trigger_candidates(
         df_15m_closed,
@@ -2094,24 +2678,6 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         current_price,
         len(df_15m_closed) - 1,
     )
-    if (
-        final_score_result.get('total_score', 0) >= 70
-        and state_machine_result is not None
-        and not state_machine_result.signal_allowed
-    ):
-        raw_before_state = final_score_result.get('raw_score', final_score_result.get('total_score', 0))
-        final_score_result['raw_score'] = raw_before_state
-        final_score_result['total_score'] = 69
-        final_score_result['decision'] = 'Watchlist'
-        final_score_result['no_trade_reason'] = 'state_machine_block'
-        final_score_result.setdefault('diagnostics', {})['no_trade_reason'] = 'state_machine_block'
-        final_score_result['diagnostics']['state_machine_allowed'] = False
-        final_score_result.setdefault('breakdown', {})
-        final_score_result['breakdown']['scenario'] = (
-            f"WATCHLIST (State Machine gate: {state_machine_result.state.value}, "
-            f"next: {state_machine_result.missing_steps[0] if state_machine_result.missing_steps else 'ready'}, "
-            f"score {raw_before_state}->69)"
-        )
     final_score_result['breakdown']['liquidity_map'] = _format_liquidity_map(liquidity_map)
     final_score_result['breakdown']['state_machine'] = state_machine_status
     final_score_result['breakdown']['trigger_debug'] = _format_trigger_debug(trigger_debug)
@@ -2130,16 +2696,109 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
     final_score_result['diagnostics']['fvg_scenario_valid'] = trigger_debug.get('fvg_scenario_valid')
     final_score_result['diagnostics']['fvg_rejected_reason'] = trigger_debug.get('fvg_rejected_reason')
 
-    risk_plan = build_risk_plan(
+    scenario_events = _build_scenario_events(
+        direction,
+        market_structure,
+        premium_discount_data,
+        sfp_data_in_window,
+        trigger_scan,
+        context_break_1h,
+        all_fvgs,
+        selected_fvg_test_data,
+        None,
+        last_closed_15m,
+    )
+    scenario_scan = scan_scenarios(
+        events=scenario_events,
+        expected_direction=direction,
+        htf_structure=market_structure,
+        premium_discount=premium_discount_data,
+        risk_plan=None,
+    )
+    selected_scenario = scenario_scan.selected_scenario
+    risk_plan = _build_candidate_risk_plan(
+        selected_scenario=selected_scenario,
         direction=direction,
         current_price=current_price,
         atr=float(last_closed_15m.get('atr', 0.0)),
         liquidity_map=liquidity_map,
         fvg_data=all_fvgs,
-        fvg_test_data=selected_fvg_test_data,
+        selected_fvg_test_data=selected_fvg_test_data,
         sfp_data=sfp_data_in_window,
-        structure_data=context_break_1h or scenario_trigger_15m,
-    ) if direction in ('LONG', 'SHORT') else None
+        structure_data=context_break_1h,
+    )
+    candidate_fvg_data, candidate_fvg_test_data, _ = _candidate_risk_inputs(
+        selected_scenario,
+        all_fvgs,
+        selected_fvg_test_data,
+        direction,
+    )
+    if risk_plan and risk_plan.risk_plan_status != "not_available":
+        assert risk_plan.source_candidate_id is not None
+    if risk_plan:
+        scenario_events = _build_scenario_events(
+            direction,
+            market_structure,
+            premium_discount_data,
+            sfp_data_in_window,
+            _candidate_scoped_trigger_scan(scenario_scan, direction),
+            context_break_1h,
+            candidate_fvg_data,
+            candidate_fvg_test_data,
+            risk_plan,
+            last_closed_15m,
+        )
+        scenario_scan = scan_scenarios(
+            events=scenario_events,
+            expected_direction=direction,
+            htf_structure=market_structure,
+            premium_discount=premium_discount_data,
+            risk_plan=risk_plan,
+        )
+        final_selected_scenario = scenario_scan.selected_scenario
+        if (
+            final_selected_scenario is not None
+            and getattr(final_selected_scenario, 'candidate_id', None) != getattr(selected_scenario, 'candidate_id', None)
+        ):
+            risk_plan = _build_candidate_risk_plan(
+                selected_scenario=final_selected_scenario,
+                direction=direction,
+                current_price=current_price,
+                atr=float(last_closed_15m.get('atr', 0.0)),
+                liquidity_map=liquidity_map,
+                fvg_data=all_fvgs,
+                selected_fvg_test_data=selected_fvg_test_data,
+                sfp_data=sfp_data_in_window,
+                structure_data=context_break_1h,
+            )
+            risk_plan = _risk_plan_for_selected_candidate(risk_plan, final_selected_scenario, direction)
+            candidate_fvg_data, candidate_fvg_test_data, _ = _candidate_risk_inputs(
+                final_selected_scenario,
+                all_fvgs,
+                selected_fvg_test_data,
+                direction,
+            )
+            scenario_events = _build_scenario_events(
+                direction,
+                market_structure,
+                premium_discount_data,
+                sfp_data_in_window,
+                _candidate_scoped_trigger_scan(scenario_scan, direction),
+                context_break_1h,
+                candidate_fvg_data,
+                candidate_fvg_test_data,
+                risk_plan,
+                last_closed_15m,
+            )
+            scenario_scan = scan_scenarios(
+                events=scenario_events,
+                expected_direction=direction,
+                htf_structure=market_structure,
+                premium_discount=premium_discount_data,
+                risk_plan=risk_plan,
+            )
+        risk_plan = _risk_plan_for_selected_candidate(risk_plan, scenario_scan.selected_scenario, direction)
+    scenario_scan = _apply_runtime_update_counts(coin, scenario_scan)
     if risk_plan:
         final_score_result['breakdown']['risk_plan'] = _format_risk_plan(risk_plan)
         final_score_result.setdefault('diagnostics', {})['risk_plan_valid'] = risk_plan.valid
@@ -2151,34 +2810,15 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
             final_score_result['decision'] = 'Watchlist'
             final_score_result['no_trade_reason'] = 'risk_plan_block'
             final_score_result['diagnostics']['no_trade_reason'] = 'risk_plan_block'
+            rr_text = f"T1 {risk_plan.rr_to_target_1:.2f}R" if risk_plan.rr_to_target_1 is not None else "entry not available"
             final_score_result['breakdown']['risk_plan'] = (
                 f"WATCHLIST ({risk_plan.reason}, score {raw_before_risk}->69, "
-                f"T1 {risk_plan.rr_to_target_1:.2f}R)"
+                f"{rr_text})"
             )
     else:
         final_score_result['breakdown']['risk_plan'] = '0'
         final_score_result.setdefault('diagnostics', {})['risk_plan_valid'] = False
         final_score_result['diagnostics']['risk_geometry_valid'] = False
-
-    scenario_events = _build_scenario_events(
-        direction,
-        market_structure,
-        premium_discount_data,
-        sfp_data_in_window,
-        trigger_scan,
-        context_break_1h,
-        all_fvgs,
-        selected_fvg_test_data,
-        risk_plan,
-        last_closed_15m,
-    )
-    scenario_scan = scan_scenarios(
-        events=scenario_events,
-        expected_direction=direction,
-        htf_structure=market_structure,
-        premium_discount=premium_discount_data,
-        risk_plan=risk_plan,
-    )
     final_score_result['breakdown']['scenario_scan'] = _format_scenario_scan(scenario_scan)
     final_score_result['diagnostics']['scenario_scan_signal_allowed'] = scenario_scan.signal_allowed
     final_score_result['diagnostics']['scenario_scan_valid'] = scenario_scan.scenario_valid
@@ -2195,6 +2835,8 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
     final_score_result['diagnostics']['scenario_scan_status'] = selected_scenario.status if selected_scenario else None
     final_score_result['diagnostics']['scenario_scan_direction'] = scenario_scan.selected_direction
     final_score_result['diagnostics']['scenario_risk_valid'] = bool(selected_scenario and selected_scenario.risk_valid)
+    final_score_result['scenario_status'] = _decision_scenario_status(scenario_scan)
+    final_score_result['execution_status'] = _decision_execution_status(scenario_scan, risk_plan)
 
     raw_or_score = final_score_result.get('raw_score', final_score_result.get('total_score', 0))
     scenario_complete = bool(
@@ -2247,6 +2889,46 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
 
     return final_score_result, analysis_data
 
+
+def _decision_scenario_status(scenario_scan):
+    selected = getattr(scenario_scan, "selected_scenario", None) if scenario_scan else None
+    if selected is None:
+        return "none"
+    if selected.status == "invalidated":
+        return "invalidated"
+    if selected.status == "complete":
+        return "complete"
+    next_step = selected.next_expected_step
+    mapping = {
+        "POI_TOUCHED": "waiting_for_anchor",
+        "SFP_CONFIRMED": "waiting_for_anchor",
+        "EARLY_TRIGGER_CONFIRMED": "waiting_for_early_trigger",
+        "CONFIRMED_TRIGGER_CONFIRMED": "waiting_for_confirmed_trigger",
+        "FVG_CREATED": "waiting_for_fvg",
+        "FVG_RETESTED": "waiting_for_retest",
+        "DISPLACEMENT_CONFIRMED": "waiting_for_displacement",
+        "RISK_VALID": "waiting_for_risk",
+    }
+    return mapping.get(next_step, selected.status)
+
+
+def _decision_execution_status(scenario_scan, risk_plan):
+    selected = getattr(scenario_scan, "selected_scenario", None) if scenario_scan else None
+    if not selected or selected.status != "complete":
+        return "not_ready"
+    risk_valid = risk_plan.get("valid", False) if isinstance(risk_plan, dict) else getattr(risk_plan, "valid", False)
+    if risk_plan is None or not risk_valid:
+        return "not_ready"
+    return "ready"
+
+
+def _normalize_final_decision(decision):
+    if decision == "A+":
+        return "A+"
+    if decision in ("Watchlist", "A+ WATCH ONLY"):
+        return "Watchlist"
+    return "Ignore"
+
 def market_scan(report_mode="HUNT"):
     started_at_ts = time.time()
     started_at = pd.Timestamp.now(tz=DEFAULT_TIMEZONE).isoformat()
@@ -2277,7 +2959,7 @@ def market_scan(report_mode="HUNT"):
             score_result, analysis_data = prepare_and_analyze(coin, macro)
             if not score_result or not analysis_data:
                 dashboard_lines.append(f"• <b>{coin}</b>: Н/Д (ошибка данных)")
-                error = {"symbol": coin, "error": "no_analysis_data"}
+                error = _analysis_error(coin, "prepare_and_analyze", "NoAnalysisData", run_id)
                 errors.append(error)
                 symbol_results.append({"symbol": coin, "success": False, "error": error})
                 continue
@@ -2285,11 +2967,19 @@ def market_scan(report_mode="HUNT"):
 
             total_score = score_result.get('total_score', 0)
             decision = resolve_session_decision(score_result, in_kz)
+            final_decision = _normalize_final_decision(decision)
+            score_result['session_decision'] = decision
+            score_result['final_decision'] = final_decision
+            score_result['decision'] = final_decision
             delivery_gate = _annotate_a_plus_delivery_gate(score_result, analysis_data, in_kz)
             symbol_results.append({
                 "symbol": coin,
                 "success": True,
-                "decision": decision,
+                "decision": final_decision,
+                "context_decision": score_result.get("context_decision"),
+                "scenario_status": score_result.get("scenario_status"),
+                "execution_status": score_result.get("execution_status"),
+                "final_decision": final_decision,
                 "score_result": score_result,
                 "diagnostics": score_result.get("diagnostics", {}),
                 "analysis_data": analysis_data,
@@ -2309,6 +2999,15 @@ def market_scan(report_mode="HUNT"):
                         )
                     )
                     logger.info(f"Scan journal записан: {journal_path}")
+                    transition_timestamp = pd.Timestamp.now(tz=DEFAULT_TIMEZONE).isoformat()
+                    for transition_record in _build_scenario_transition_records(
+                        run_id,
+                        transition_timestamp,
+                        coin,
+                        analysis_data.get("scenario_scan"),
+                        detected_at=transition_timestamp,
+                    ):
+                        write_scan_record(transition_record)
                 except Exception as journal_error:
                     logger.error(f"Не удалось записать scan journal для {coin}: {journal_error}")
 
@@ -2344,10 +3043,31 @@ def market_scan(report_mode="HUNT"):
                     prompt = f"{A_PLUS_NARRATOR_INSTRUCTION}\n\nJSON ДАННЫЕ:\n{json.dumps(setup_details_json, indent=2, ensure_ascii=False)}"
                     try:
                         ai_response = model.generate_content(prompt).text
-                        send_telegram_alert(f"🚨 <b>СНАЙПЕР ОБНАРУЖИЛ СЕТАП! ({total_score}/100)</b> 🚨\n\n{ai_response}")
+                        send_telegram_alert(
+                            f"🚨 <b>СНАЙПЕР ОБНАРУЖИЛ СЕТАП! ({total_score}/100)</b> 🚨\n\n{ai_response}",
+                            run_id=run_id,
+                            message_type="A_PLUS",
+                            delivery_context={
+                                "in_kill_zone": bool(in_kz),
+                                "outside_kz_delivery_enabled": SEND_A_PLUS_OUTSIDE_KZ,
+                                "kill_zone_bypassed": bool(delivery_gate.get("kill_zone_bypassed")),
+                            },
+                        )
                         last_alert_time[coin] = time.time()
                     except Exception as e:
                         logger.error(f"Ошибка Gemini для A+ сетапа {coin}: {e}")
+                        _record_telegram_delivery(
+                            run_id=run_id,
+                            message_type="A_PLUS",
+                            attempted=True,
+                            sent=False,
+                            error=f"gemini_generation_failed: {e}",
+                            status_code=None,
+                            message_length=None,
+                            in_kill_zone=bool(in_kz),
+                            outside_kz_delivery_enabled=SEND_A_PLUS_OUTSIDE_KZ,
+                            kill_zone_bypassed=bool(delivery_gate.get("kill_zone_bypassed")),
+                        )
 
             trend_data = analysis_data.get('trend_data')
             trend_strength = trend_data.get('strength', 'Н/Д') if trend_data else "Н/Д"
@@ -2355,17 +3075,17 @@ def market_scan(report_mode="HUNT"):
             # Добавляем строку в дашборд
             if coin in ['BTC', 'ETH', 'SOL']:
             # if coin in COINS_LIST:
-                dashboard_lines.append(_build_dashboard_block(coin, score_result, analysis_data, decision, in_kz))
+                dashboard_lines.append(_build_dashboard_block(coin, score_result, analysis_data, final_decision, in_kz))
             else:
                 dashboard_lines.append(
                     f"• <b>{_html_text(coin)}</b>: {total_score} баллов | "
-                    f"{_html_text(decision)} | Тренд: {_html_text(trend_strength)}"
+                    f"{_html_text(final_decision)} | Тренд: {_html_text(trend_strength)}"
                 )
 
         except Exception as e:
             logger.error(f"Критическая ошибка при анализе {coin}: {e}", exc_info=True)
             dashboard_lines.append(f"• <b>{coin}</b>: ОШИБКА АНАЛИЗА")
-            error = {"symbol": coin, "error": str(e)}
+            error = _analysis_error(coin, "symbol_analysis", e, run_id)
             errors.append(error)
             symbol_results.append({"symbol": coin, "success": False, "error": error})
 
@@ -2379,7 +3099,7 @@ def market_scan(report_mode="HUNT"):
             f"🌍 Макро: <code>{_html_text(macro_str)}</code>",
             "────────────────"
         ]
-        send_telegram_blocks(summary_header, dashboard_lines)
+        send_telegram_blocks(summary_header, dashboard_lines, run_id=run_id, message_type="DASHBOARD")
     elif report_mode == "HUNT" and not in_kz:
         logger.info(f"[{current_time_str}] Вне Kill Zone. Дашборд скрыт для экономии эфира.")
 

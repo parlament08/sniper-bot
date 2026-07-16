@@ -76,6 +76,7 @@ def scan_post_anchor_trigger(
     max_bars_after_poi: int = 24,
     min_trigger_quality: int = 70,
     min_early_trigger_quality: int = 55,
+    selected_candidate_id: Optional[str] = None,
 ) -> TriggerScanResult:
     expected_direction = _normalize_direction(expected_direction)
     sfp_index = _event_index(sfp)
@@ -151,11 +152,13 @@ def scan_post_anchor_trigger(
     early_after_anchor = _best_within_window(early_after_candidates, anchor_index, max_bars) or _best_trigger(early_after_candidates)
     early_trigger = early_after_anchor if _early_trigger_is_valid(expected_direction, early_after_anchor, anchor_index, max_bars, min_early_trigger_quality) else None
     confirmed_anchor_index = _event_index(early_trigger) if early_trigger else anchor_index
+    scoped_candidate_id = selected_candidate_id or _candidate_id(early_trigger)
     generated_confirmed = _confirmed_trigger_candidates_after_early(
         df_15m_closed,
         expected_direction,
         early_trigger,
         anchor_index,
+        candidate_id=scoped_candidate_id,
         swing_points=swing_points,
         atr_series=atr_series,
         rvol_series=rvol_series,
@@ -166,11 +169,12 @@ def scan_post_anchor_trigger(
         confirmed_candidates = _compact_candidates(list(confirmed_candidates) + generated_confirmed, None, None)
     confirmed_debug = _confirmed_trigger_debug(
         expected_direction,
-        confirmed_candidates,
+        _compact_candidates(list(confirmed_candidates) + _after(opposite_candidates, confirmed_anchor_index), None, None),
         early_trigger,
         confirmed_anchor_index,
         max_bars,
         min_trigger_quality,
+        selected_candidate_id=scoped_candidate_id,
         df_15m_closed=df_15m_closed,
         swing_points=swing_points,
     )
@@ -183,6 +187,7 @@ def scan_post_anchor_trigger(
             confirmed_anchor_index,
             max_bars,
             min_trigger_quality,
+            selected_candidate_id=scoped_candidate_id,
         ) is None
     ]
     trigger_after_candidates = _after(valid_confirmed_candidates, confirmed_anchor_index)
@@ -322,6 +327,7 @@ def find_confirmed_trigger_after_early(
     atr_series,
     rvol_series=None,
     config=None,
+    candidate_id=None,
 ):
     candidates = _generate_confirmed_trigger_candidates_after_early(
         df_15m_closed,
@@ -333,6 +339,7 @@ def find_confirmed_trigger_after_early(
         rvol_series=rvol_series,
         config=config,
         max_bars=_config_value(config, "max_bars_after_early", 24),
+        candidate_id=candidate_id,
     )
     valid = [item for item in candidates if bool(item.get("detected"))]
     return _best_trigger(valid) if valid else None
@@ -434,6 +441,10 @@ def _event_index(event):
     return event.get("index") if event else None
 
 
+def _candidate_id(event):
+    return event.get("candidate_id") if event else None
+
+
 def _trigger_quality(trigger) -> int:
     return int(trigger.get("quality_score", 0) or 0) if trigger else 0
 
@@ -478,7 +489,7 @@ def _compact_candidates(
     for trigger in list(trigger_candidates or []) + [long_trigger_candidate, short_trigger_candidate]:
         if not trigger:
             continue
-        key = (trigger.get("type"), str(trigger.get("index")), trigger.get("quality_score"))
+        key = (trigger.get("candidate_id"), trigger.get("type"), str(trigger.get("index")))
         if key in seen:
             continue
         seen.add(key)
@@ -497,6 +508,7 @@ def _confirmed_trigger_candidates_after_early(
     rvol_series=None,
     config=None,
     max_bars=None,
+    candidate_id=None,
 ):
     if not early_trigger:
         return []
@@ -511,6 +523,7 @@ def _confirmed_trigger_candidates_after_early(
         rvol_series=rvol_series,
         config=config,
         max_bars=max_bars,
+        candidate_id=candidate_id,
     )
 
 
@@ -526,6 +539,7 @@ def _generate_confirmed_trigger_candidates_after_early(
     rvol_series=None,
     config=None,
     max_bars=None,
+    candidate_id=None,
 ):
     expected_direction = _normalize_direction(expected_direction)
     if expected_direction not in ("LONG", "SHORT"):
@@ -573,6 +587,7 @@ def _generate_confirmed_trigger_candidates_after_early(
             "direction": direction,
             "index": index,
             "level": round(float(level), 8),
+            "candidate_id": candidate_id or _candidate_id(early_trigger),
             "candidate_anchor_index": candidate_anchor_index,
             "early_trigger_index": early_trigger_index,
             "trigger_stage": "confirmed",
@@ -697,6 +712,7 @@ def _confirmed_trigger_debug(
     max_bars,
     min_trigger_quality,
     *,
+    selected_candidate_id=None,
     df_15m_closed=None,
     swing_points=None,
 ):
@@ -713,6 +729,7 @@ def _confirmed_trigger_debug(
     rejected = []
     historical_rejected = []
     valid_count = 0
+    valid_bos_count = 0
     bos_count = 0
     choch_count = 0
     active_candidates = []
@@ -724,6 +741,7 @@ def _confirmed_trigger_debug(
             search_anchor_index,
             max_bars,
             min_trigger_quality,
+            selected_candidate_id=selected_candidate_id,
         )
         if reason == "before_early_trigger":
             historical_rejected.append(_candidate_debug_snapshot(candidate, reason))
@@ -737,24 +755,32 @@ def _confirmed_trigger_debug(
             choch_count += 1
         if reason is None:
             valid_count += 1
+            if "bos" in trigger_type:
+                valid_bos_count += 1
             continue
         rejected.append(_candidate_debug_snapshot(candidate, reason))
 
     _attach_candidate_debug_to_checked_candles(context, active_candidates, rejected)
     final_reason = None
-    if valid_count == 0:
-        final_reason = "no_confirmed_bos_after_early_trigger"
+    if valid_count > 0:
+        final_reason = "confirmed_bos_found"
+    else:
+        final_reason = "no_candle_closed_beyond_break_level"
         if context.get("candles_after_early") == 0:
             final_reason = "not_enough_candles_after_early_trigger"
         elif context.get("break_level") is None and context.get("candles_after_early") is not None:
-            final_reason = "no_confirmed_break_level_after_early_trigger"
+            final_reason = "no_break_level_available"
         elif context.get("candles_after_early") is not None and not rejected and bos_count == 0 and choch_count == 0:
             final_reason = "no_candle_closed_beyond_break_level"
         if rejected:
-            final_reason = rejected[0].get("rejected_reason") or final_reason
+            final_reason = _confirmed_final_reason_from_rejection(rejected[0].get("rejected_reason"), final_reason)
 
     return {
+        "generator_called": context.get("generator_called"),
+        "candidate_id": selected_candidate_id,
         "early_trigger_index": _string_index(early_index),
+        "confirmed_search_start": _string_index(early_index),
+        "confirmed_search_end": _string_index(_window_end_index(early_index, max_bars)),
         "search_window_start": _string_index(early_index),
         "search_window_end": _string_index(_window_end_index(early_index, max_bars)),
         "expected_direction": expected_direction,
@@ -765,11 +791,18 @@ def _confirmed_trigger_debug(
         "rejected_candidates": rejected,
         "historical_rejected_candidates": historical_rejected,
         "final_reason": final_reason,
+        "bos_diagnostics": _bos_diagnostics_report(
+            bos_count,
+            valid_bos_count,
+            rejected,
+            context,
+        ),
     }
 
 
 def _candidate_debug_snapshot(candidate, reason):
     return {
+        "candidate_id": candidate.get("candidate_id"),
         "type": candidate.get("type"),
         "index": _string_index(_event_index(candidate)),
         "quality_score": candidate.get("quality_score"),
@@ -780,6 +813,52 @@ def _candidate_debug_snapshot(candidate, reason):
     }
 
 
+def _bos_diagnostics_report(bos_count, valid_bos_count, rejected, context, *, config=None):
+    config = config or BOSConfig()
+    rejected_counts = {
+        "quality_below_min": 0,
+        "wick_only": 0,
+        "weak_close": 0,
+        "weak_displacement": 0,
+        "opposite_structure_invalidated_candidate": 0,
+        "other": 0,
+    }
+    for item in rejected or []:
+        reason = item.get("rejected_reason")
+        if reason == "quality_below_min":
+            rejected_counts["quality_below_min"] += 1
+        elif reason == "opposite_structure_invalidated_candidate":
+            rejected_counts["opposite_structure_invalidated_candidate"] += 1
+        else:
+            rejected_counts["other"] += 1
+        close_position = item.get("close_position")
+        displacement_ratio = item.get("displacement_ratio")
+        if close_position is not None and float(close_position or 0.0) < config.min_close_position:
+            rejected_counts["weak_close"] += 1
+        if displacement_ratio is not None and float(displacement_ratio or 0.0) < config.min_displacement_atr:
+            rejected_counts["weak_displacement"] += 1
+
+    wick_only = sum(
+        1
+        for candle in (context.get("checked_candles") or [])
+        if candle.get("wick_breaks_level") and not candle.get("breaks_level")
+    )
+    rejected_counts["wick_only"] += wick_only
+    return {
+        "bos_candidates_total": int(bos_count or 0),
+        "confirmed": int(valid_bos_count or 0),
+        "rejected": rejected_counts,
+    }
+
+
+def _confirmed_final_reason_from_rejection(reason, default):
+    if reason == "quality_below_min":
+        return "quality_below_min"
+    if reason == "opposite_structure_invalidated_candidate":
+        return "opposite_structure_invalidated_candidate"
+    return default
+
+
 def _confirmed_trigger_rejected_reason(
     expected_direction,
     trigger,
@@ -787,19 +866,25 @@ def _confirmed_trigger_rejected_reason(
     search_anchor_index,
     max_bars,
     min_trigger_quality,
+    *,
+    selected_candidate_id=None,
 ):
     if not trigger:
         return "no_confirmed_trigger"
     if not early_trigger:
         return None
     if not _trigger_matches_direction(expected_direction, trigger):
-        return "direction_conflict"
+        return "opposite_structure_invalidated_candidate"
     trigger_index = _event_index(trigger)
     early_index = _event_index(early_trigger)
     if trigger_index is None:
         return "missing_index"
     if early_index is None or _event_sort_key(trigger_index) <= _event_sort_key(early_index):
         return "before_early_trigger"
+    expected_candidate_id = selected_candidate_id or _candidate_id(early_trigger)
+    trigger_candidate_id = _candidate_id(trigger)
+    if expected_candidate_id is not None and trigger_candidate_id != expected_candidate_id:
+        return "candidate_scope_mismatch"
     if not _within_confirmation_window(trigger_index, search_anchor_index, max_bars):
         return "outside_confirmation_window"
     if _trigger_quality(trigger) < min_trigger_quality:
@@ -865,10 +950,12 @@ def _checked_candle_debug(after_early, expected_direction, break_level):
             direction_ok = close_price > open_price
             close_position = (close_price - low_price) / candle_range if candle_range > 0 else 0.0
             breaks_level = break_level is not None and close_price > float(break_level)
+            wick_breaks_level = break_level is not None and high_price > float(break_level)
         else:
             direction_ok = close_price < open_price
             close_position = (high_price - close_price) / candle_range if candle_range > 0 else 0.0
             breaks_level = break_level is not None and close_price < float(break_level)
+            wick_breaks_level = break_level is not None and low_price < float(break_level)
         checked.append({
             "index": _string_index(index),
             "close": _round_optional(close_price),
@@ -879,6 +966,7 @@ def _checked_candle_debug(after_early, expected_direction, break_level):
             "displacement_ratio": round(displacement_ratio, 4),
             "rvol": _round_optional(candle.get("rvol")),
             "breaks_level": bool(breaks_level),
+            "wick_breaks_level": bool(wick_breaks_level),
             "direction_ok": bool(direction_ok),
             "candidate_created": False,
         })
@@ -1024,7 +1112,7 @@ def _within_confirmation_window(trigger_index, anchor_index, max_bars: Optional[
             if trigger_index > 1e8 or anchor_index > 1e8:
                 return (trigger_index - anchor_index) <= max_bars * 15 * 60
             return (trigger_index - anchor_index) <= max_bars
-        return (pd.Timestamp(trigger_index) - pd.Timestamp(anchor_index)) <= pd.Timedelta(minutes=max_bars * 15)
+        return (_event_sort_key(trigger_index) - _event_sort_key(anchor_index)) <= pd.Timedelta(minutes=max_bars * 15).value
     except (TypeError, ValueError):
         return True
 

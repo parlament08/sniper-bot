@@ -1,13 +1,17 @@
 services:
   analyzer:
     image: sniper-bot:local
-    build: .
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: sniper_analyzer
     restart: unless-stopped
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - GIT_COMMIT=${GIT_COMMIT:-unknown}
       - SCAN_JOURNAL_ENABLED=${SCAN_JOURNAL_ENABLED:-true}
       - SCAN_JOURNAL_DIR=/app/data/journal
       - TZ=Europe/Chisinau
@@ -17,13 +21,17 @@ services:
 
   listener:
     image: sniper-bot:local
-    build: .
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     container_name: sniper_listener
     restart: unless-stopped
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - GIT_COMMIT=${GIT_COMMIT:-unknown}
       - SCAN_JOURNAL_ENABLED=${SCAN_JOURNAL_ENABLED:-true}
       - SCAN_JOURNAL_DIR=/app/data/journal
       - TZ=Europe/Chisinau

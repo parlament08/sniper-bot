@@ -49,15 +49,18 @@ class RiskPlanTest(unittest.TestCase):
         self.assertTrue(plan.valid)
         self.assertEqual(plan.entry_model, "fvg_midpoint")
         self.assertIn("structural_invalidation", plan.stop_model)
-        self.assertEqual(plan.target_model, "nearest_liquidity")
+        self.assertEqual(plan.target_model, "valid_liquidity_target")
+        self.assertEqual(plan.target_1_info["type"], "buy_side")
+        self.assertEqual(plan.target_1_info["strength"], 80)
+        self.assertEqual(plan.target_1_info["freshness"], 10)
         self.assertGreaterEqual(plan.rr_to_target_1, 2.0)
 
-    def test_close_liquidity_target_blocks_a_plus_quality(self):
+    def test_close_liquidity_is_obstacle_not_target(self):
         liquidity = LiquidityMap(
             levels=[],
             nearest_buy_side=self._level("buy_side", 102.0),
             nearest_sell_side=None,
-            strongest_buy_side=self._level("old_high", 103.0),
+            strongest_buy_side=self._level("old_high", 118.0),
             strongest_sell_side=None,
         )
 
@@ -79,7 +82,10 @@ class RiskPlanTest(unittest.TestCase):
         )
 
         self.assertFalse(plan.valid)
-        self.assertIn("RR to target 1 below minimum", plan.reason)
+        self.assertEqual(plan.risk_geometry, "blocked_by_near_obstacle")
+        self.assertEqual(plan.nearest_obstacle["price"], 102.0)
+        self.assertEqual(plan.target_1, 118.0)
+        self.assertIn("blocked_by_near_obstacle", plan.reason)
 
     def test_late_entry_is_invalid_even_with_good_target(self):
         liquidity = LiquidityMap(
@@ -130,8 +136,148 @@ class RiskPlanTest(unittest.TestCase):
         )
 
         self.assertFalse(plan.valid)
-        self.assertEqual(plan.target_model, "3R_fallback_no_liquidity")
-        self.assertIn("no logical liquidity target", plan.reason)
+        self.assertEqual(plan.target_model, "none")
+        self.assertIsNone(plan.target_1)
+        self.assertEqual(plan.risk_geometry, "no_valid_target")
+        self.assertIn("no valid liquidity target", plan.reason)
+
+    def test_before_entry_model_risk_plan_is_not_available_without_999_sentinel(self):
+        liquidity = LiquidityMap(
+            levels=[],
+            nearest_buy_side=self._level("buy_side", 112.0),
+            nearest_sell_side=None,
+            strongest_buy_side=self._level("old_high", 118.0),
+            strongest_sell_side=None,
+        )
+
+        plan = build_risk_plan(
+            direction="LONG",
+            current_price=101.0,
+            atr=2.0,
+            liquidity_map=liquidity,
+            fvg_data=[],
+            fvg_test_data=None,
+            sfp_data={"type": "bullish_sfp", "level": 98.0},
+            structure_data={"type": "bullish_bos", "level": 100.0},
+        )
+
+        self.assertIsNotNone(plan)
+        self.assertFalse(plan.valid)
+        self.assertEqual(plan.risk_plan_status, "not_available")
+        self.assertEqual(plan.reason, "entry_model_not_formed")
+        self.assertIsNone(plan.entry)
+        self.assertIsNone(plan.entry_distance_from_poi_atr)
+        self.assertIsNotNone(plan.preliminary_risk)
+        self.assertIsNone(plan.preliminary_risk["feasible"])
+
+    def test_created_fvg_before_retest_builds_tentative_plan(self):
+        liquidity = LiquidityMap(
+            levels=[],
+            nearest_buy_side=self._level("buy_side", 112.0),
+            nearest_sell_side=None,
+            strongest_buy_side=self._level("old_high", 118.0),
+            strongest_sell_side=None,
+        )
+
+        plan = build_risk_plan(
+            direction="LONG",
+            current_price=101.0,
+            atr=2.0,
+            liquidity_map=liquidity,
+            fvg_data=[{
+                "type": "bullish",
+                "top": 102.0,
+                "bottom": 100.0,
+                "tested": False,
+                "invalidated": False,
+                "end_index": 5,
+            }],
+            fvg_test_data=None,
+            sfp_data={"type": "bullish_sfp", "level": 98.0},
+        )
+
+        self.assertEqual(plan.risk_plan_status, "tentative_plan")
+        self.assertIsNotNone(plan.entry)
+        self.assertIsNotNone(plan.entry_distance_from_poi_atr)
+
+    def test_candidate_fvg_gates_prevent_execution_plan_until_displacement(self):
+        liquidity = LiquidityMap(
+            levels=[],
+            nearest_buy_side=self._level("buy_side", 112.0),
+            nearest_sell_side=None,
+            strongest_buy_side=self._level("old_high", 118.0),
+            strongest_sell_side=None,
+        )
+        base_args = {
+            "direction": "LONG",
+            "current_price": 101.0,
+            "atr": 2.0,
+            "liquidity_map": liquidity,
+            "fvg_data": [{
+                "type": "bullish",
+                "top": 102.0,
+                "bottom": 100.0,
+                "tested": True,
+                "invalidated": False,
+                "end_index": 5,
+            }],
+            "fvg_test_data": {"index": 6},
+            "sfp_data": {"type": "bullish_sfp", "level": 98.0},
+            "source_candidate_id": "LONG_SFP_1",
+        }
+
+        not_created = build_risk_plan(**base_args, candidate_fvg_created=False)
+        no_retest = build_risk_plan(**base_args, candidate_fvg_created=True, candidate_fvg_retested=False)
+        no_displacement = build_risk_plan(
+            **base_args,
+            candidate_fvg_created=True,
+            candidate_fvg_retested=True,
+            post_retest_displacement_confirmed=False,
+        )
+        execution = build_risk_plan(
+            **base_args,
+            candidate_fvg_created=True,
+            candidate_fvg_retested=True,
+            post_retest_displacement_confirmed=True,
+        )
+
+        self.assertEqual(not_created.risk_plan_status, "not_available")
+        self.assertEqual(not_created.reason, "candidate_fvg_not_created")
+        self.assertEqual(no_retest.risk_plan_status, "tentative_plan")
+        self.assertEqual(no_displacement.risk_plan_status, "tentative_plan")
+        self.assertEqual(execution.risk_plan_status, "execution_plan")
+        self.assertEqual(execution.source_candidate_id, "LONG_SFP_1")
+
+    def test_stop_has_atr_buffer_and_does_not_equal_entry_or_invalidation(self):
+        liquidity = LiquidityMap(
+            levels=[],
+            nearest_buy_side=self._level("buy_side", 120.0),
+            nearest_sell_side=None,
+            strongest_buy_side=self._level("old_high", 125.0),
+            strongest_sell_side=None,
+        )
+
+        plan = build_risk_plan(
+            direction="LONG",
+            current_price=101.0,
+            atr=2.0,
+            liquidity_map=liquidity,
+            fvg_data=[{
+                "type": "bullish",
+                "top": 102.0,
+                "bottom": 100.0,
+                "tested": True,
+                "invalidated": False,
+                "end_index": 5,
+            }],
+            fvg_test_data={"index": 6},
+            sfp_data={"type": "bullish_sfp", "level": 100.9},
+        )
+
+        self.assertNotEqual(plan.stop_loss, plan.entry)
+        self.assertNotEqual(plan.stop_loss, plan.invalidation_level)
+        self.assertGreater(plan.risk_per_unit, 0)
+        self.assertGreater(plan.stop_distance_percent, 0)
 
 
 if __name__ == "__main__":
