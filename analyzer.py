@@ -32,7 +32,7 @@ from core.liquidity import build_liquidity_map
 from core.payload import payload_to_dict
 from core.premium_discount import evaluate_premium_discount
 from core.risk import calculate_setup_score, format_setup_direction, resolve_session_decision, select_best_setup
-from core.risk_plan import RiskPlan, build_risk_plan
+from core.risk_plan import RiskPlan, RiskPlanConfig, build_risk_plan
 from core.session import DEFAULT_TIMEZONE, evaluate_session, next_quarter_close
 from core.scenario_scanner import ScenarioEvent, scan_scenarios
 from core.state_machine import SniperEvent, SniperStateMachine
@@ -102,6 +102,7 @@ def send_telegram_alert(text, *, run_id=None, message_type="UNKNOWN", delivery_c
     sent = False
     error = None
     status_code = None
+    message_id = None
     try:
         res = requests.post(url, data=payload, timeout=10)
         status_code = res.status_code
@@ -110,6 +111,10 @@ def send_telegram_alert(text, *, run_id=None, message_type="UNKNOWN", delivery_c
             logger.error(f"Ошибка Telegram API: {res.text}")
         else:
             sent = True
+            try:
+                message_id = (res.json().get("result") or {}).get("message_id")
+            except Exception:
+                message_id = None
     except Exception as e:
         error = str(e)
         logger.error(f"Не удалось отправить пуш в Telegram: {e}")
@@ -121,6 +126,7 @@ def send_telegram_alert(text, *, run_id=None, message_type="UNKNOWN", delivery_c
         error=error,
         status_code=status_code,
         message_length=len(text or ""),
+        telegram_message_id=message_id if sent else None,
         **(delivery_context or {}),
     )
     return {"attempted": True, "sent": sent, "error": error, "status_code": status_code}
@@ -473,6 +479,17 @@ def _scenario_scan_snapshot(scenario_output):
     return dict(scenario_output)
 
 
+def _scenario_identity(selected_scenario):
+    if selected_scenario is None:
+        return None
+    scenario_key = getattr(selected_scenario, "scenario_key", None)
+    if scenario_key is not None:
+        if isinstance(scenario_key, (list, tuple)):
+            return "|".join(str(item) for item in scenario_key)
+        return str(scenario_key)
+    return getattr(selected_scenario, "candidate_id", None)
+
+
 def _candidate_scoped_trigger_scan(scenario_output, expected_direction=None):
     snapshot = _scenario_scan_snapshot(scenario_output)
     if not snapshot:
@@ -558,6 +575,11 @@ def _build_telegram_delivery_record(
     error,
     status_code=None,
     message_length=None,
+    telegram_message_id=None,
+    symbol=None,
+    candidate_id=None,
+    scenario_id=None,
+    delivery_gate_result=None,
     in_kill_zone=None,
     outside_kz_delivery_enabled=None,
     kill_zone_bypassed=None,
@@ -568,11 +590,16 @@ def _build_telegram_delivery_record(
         "run_id": run_id,
         "timestamp": pd.Timestamp.now(tz=DEFAULT_TIMEZONE).isoformat(),
         "message_type": message_type,
+        "symbol": symbol,
+        "candidate_id": candidate_id,
+        "scenario_id": scenario_id,
         "attempted": bool(attempted),
         "sent": bool(sent),
         "error": error,
         "status_code": status_code,
         "message_length": message_length,
+        "telegram_message_id": telegram_message_id,
+        "delivery_gate_result": delivery_gate_result,
     }
     if message_type == "A_PLUS":
         record.update({
@@ -709,6 +736,28 @@ def _build_scan_journal_record(run_id, timestamp, symbol, session, score_result,
     premium_discount = analysis_data.get('premium_discount_data')
     risk_plan = analysis_data.get('risk_plan')
     last_15m = analysis_data.get('last_closed_15m')
+    selected_scenario = getattr(analysis_data.get('scenario_scan'), "selected_scenario", None)
+    selected_candidate_id = getattr(selected_scenario, "candidate_id", None)
+    scenario_id = _scenario_identity(selected_scenario)
+    risk_snapshot = risk_plan.to_dict() if hasattr(risk_plan, 'to_dict') else risk_plan if isinstance(risk_plan, dict) else {}
+    risk_snapshot = risk_snapshot or {}
+    risk_config = RiskPlanConfig()
+    market_data_timestamps = analysis_data.get('market_data_timestamps') or {}
+    scan_interval = analysis_data.get('scan_interval')
+    htf_context = analysis_data.get('htf_context')
+    shadow_candidate = analysis_data.get('shadow_candidate') or {}
+    trigger_diagnostics = _build_trigger_diagnostics(score_result, analysis_data, session)
+    shadow_outcome = _empty_shadow_outcome()
+    production_a_plus_allowed = score_result.get('diagnostics', {}).get('a_plus_delivery_allowed')
+    delivery_gate = score_result.get('diagnostics', {}).get('a_plus_delivery_gate') or {}
+    shadow_rejection_reasons = list(shadow_candidate.get('shadow_rejection_reasons') or [])
+    for failed_gate in delivery_gate.get("failed_gates") or []:
+        reason = f"production_gate_{failed_gate}"
+        if reason not in shadow_rejection_reasons:
+            shadow_rejection_reasons.append(reason)
+    journal_shadow_tier = (
+        "A+" if shadow_candidate and production_a_plus_allowed is True else shadow_candidate.get('shadow_tier')
+    )
 
     return {
         **_build_metadata(),
@@ -716,8 +765,43 @@ def _build_scan_journal_record(run_id, timestamp, symbol, session, score_result,
         'run_id': run_id,
         'timestamp': timestamp,
         'symbol': symbol,
+        'scan_interval': scan_interval,
+        'market_data_timestamp_15m': market_data_timestamps.get('15m'),
+        'market_data_timestamp_1h': market_data_timestamps.get('1h'),
+        'market_data_timestamp_4h': market_data_timestamps.get('4h'),
+        'market_open_15m': _safe_float(last_15m.get('open')) if last_15m is not None else None,
+        'market_high_15m': _safe_float(last_15m.get('high')) if last_15m is not None else None,
+        'market_low_15m': _safe_float(last_15m.get('low')) if last_15m is not None else None,
+        'market_close_15m': _safe_float(last_15m.get('close')) if last_15m is not None else None,
+        'atr': analysis_data.get('atr'),
+        'poi_price': risk_snapshot.get('poi_price'),
+        'planned_entry': risk_snapshot.get('entry'),
+        'current_price': analysis_data.get('current_price'),
+        'planned_entry_distance_from_poi_atr': risk_snapshot.get('entry_distance_from_poi_atr'),
+        'current_price_distance_from_poi_atr': risk_snapshot.get('current_price_distance_from_poi_atr'),
+        'max_entry_distance_from_poi_atr': risk_snapshot.get('max_entry_distance_from_poi_atr', risk_config.max_entry_distance_from_poi_atr),
+        'minimum_stop_distance_percent': risk_snapshot.get('minimum_stop_distance_percent'),
+        'minimum_stop_distance_atr': risk_snapshot.get('minimum_stop_distance_atr', risk_config.min_stop_distance_atr),
+        'candidate_id': selected_candidate_id,
+        'scenario_id': scenario_id,
+        'state_machine_allowed': score_result.get('diagnostics', {}).get('state_machine_allowed'),
+        'scenario_scan_signal_allowed': score_result.get('diagnostics', {}).get('scenario_scan_signal_allowed'),
+        'a_plus_delivery_allowed': score_result.get('diagnostics', {}).get('a_plus_delivery_allowed'),
+        'delivery_gate_checks': score_result.get('diagnostics', {}).get('a_plus_delivery_gate'),
+        'htf_context': htf_context,
+        'trigger_diagnostics': trigger_diagnostics,
+        'shadow_tier': journal_shadow_tier,
+        'shadow_candidate_id': shadow_candidate.get('shadow_candidate_id'),
+        'shadow_direction': shadow_candidate.get('shadow_direction'),
+        'shadow_created_at': shadow_candidate.get('shadow_created_at'),
+        'shadow_rejection_reasons': shadow_rejection_reasons if shadow_candidate else [],
+        'htf_context_class': shadow_candidate.get('htf_context_class'),
+        'production_a_plus_allowed': production_a_plus_allowed,
+        **shadow_outcome,
         'timeframes': {
             '15m_last_closed': str(last_15m.name) if last_15m is not None else None,
+            '1h_last_closed': market_data_timestamps.get('1h'),
+            '4h_last_closed': market_data_timestamps.get('4h'),
         },
         'session': session.to_dict() if hasattr(session, 'to_dict') else session,
         'decision': score_result.get('decision'),
@@ -741,6 +825,8 @@ def _build_scan_journal_record(run_id, timestamp, symbol, session, score_result,
                 'n_di': trend_data.get('n_di'),
             },
             'market_structure_4h': market_structure.to_dict() if hasattr(market_structure, 'to_dict') else market_structure,
+            'htf_context': htf_context,
+            'trigger_diagnostics': trigger_diagnostics,
             'context_1h': _event_snapshot(analysis_data.get('context_break_1h')),
             'trigger_15m': _event_snapshot(analysis_data.get('trigger_break_15m')),
             'scenario_trigger_15m': _event_snapshot(analysis_data.get('scenario_trigger_15m')),
@@ -754,7 +840,8 @@ def _build_scan_journal_record(run_id, timestamp, symbol, session, score_result,
                 'strongest_buy_side': _liquidity_level_snapshot(_level_value(liquidity_map, 'strongest_buy_side')),
                 'strongest_sell_side': _liquidity_level_snapshot(_level_value(liquidity_map, 'strongest_sell_side')),
             },
-            'risk_plan': risk_plan.to_dict() if hasattr(risk_plan, 'to_dict') else risk_plan,
+            'risk_plan': risk_snapshot or None,
+            'shadow_candidate': shadow_candidate or None,
             'trigger_debug': analysis_data.get('trigger_debug'),
             'trigger_scan': _trigger_scan_snapshot(analysis_data.get('trigger_scan')),
             'scenario_scan': _scenario_scan_snapshot(analysis_data.get('scenario_scan')),
@@ -2138,6 +2225,704 @@ def _poi_event_index(selected_fvg_test_data, last_closed_15m):
     return None
 
 
+def _scan_interval_minutes(df):
+    if df is None or len(df.index) < 2:
+        return None
+    try:
+        delta = pd.Timestamp(df.index[-1]) - pd.Timestamp(df.index[-2])
+        return round(delta.total_seconds() / 60.0, 4)
+    except Exception:
+        return None
+
+
+def _build_htf_context_explain(
+    *,
+    market_structure,
+    trend_data,
+    df_4h_closed,
+    df_1h_closed,
+    swing_highs_4h,
+    swing_lows_4h,
+    recent_structure_events,
+    market_data_timestamps,
+):
+    config = MarketStructureConfig()
+    recent_highs = swing_highs_4h.sort_index().tail(config.swing_lookback) if swing_highs_4h is not None else None
+    recent_lows = swing_lows_4h.sort_index().tail(config.swing_lookback) if swing_lows_4h is not None else None
+    sequence_points = _htf_swing_sequence(recent_highs, recent_lows)
+    sequence_labels = [point["label"] for point in sequence_points if point.get("label") not in ("H", "L")]
+
+    high_diff = recent_highs['high'].astype(float).diff().dropna() if recent_highs is not None and not recent_highs.empty and 'high' in recent_highs else pd.Series(dtype=float)
+    low_diff = recent_lows['low'].astype(float).diff().dropna() if recent_lows is not None and not recent_lows.empty and 'low' in recent_lows else pd.Series(dtype=float)
+    latest_high_change = float(high_diff.iloc[-1]) if not high_diff.empty else 0.0
+    latest_low_change = float(low_diff.iloc[-1]) if not low_diff.empty else 0.0
+    latest_hh = latest_high_change > 0
+    latest_lh = latest_high_change < 0
+    latest_hl = latest_low_change > 0
+    latest_ll = latest_low_change < 0
+
+    adx = float(trend_data.get('adx_value')) if trend_data and trend_data.get('adx_value') is not None else None
+    reason = getattr(market_structure, "reason", None)
+    reason_flags = []
+    if adx is not None and adx < config.adx_neutral_threshold:
+        reason_flags.append("adx_below_threshold")
+    if reason == "Conflicting swing structure" or (latest_hh and latest_ll):
+        reason_flags.append("conflicting_swings")
+    if reason == "Compressed swing structure" or (latest_lh and latest_hl and not (latest_hh or latest_ll)):
+        reason_flags.append("compressed_swings")
+    if reason == "No confirmed swing structure":
+        reason_flags.append("insufficient_confirmed_swings")
+    if reason == "Range too narrow":
+        reason_flags.append("range_too_narrow")
+    if reason == "Conflicting recent BOS":
+        reason_flags.append("conflicting_recent_bos")
+    if reason == "No confirmed directional structure":
+        reason_flags.append("no_confirmed_directional_structure")
+
+    last_break = _latest_structure_event(recent_structure_events)
+    protected_high = _last_swing_value(recent_highs, "high")
+    protected_low = _last_swing_value(recent_lows, "low")
+    bull_score = int(latest_hh) + int(latest_hl) + int(bool(trend_data and trend_data.get('is_bullish') is True))
+    bear_score = int(latest_lh) + int(latest_ll) + int(bool(trend_data and trend_data.get('is_bullish') is False))
+    neutral_score = len(reason_flags)
+
+    last_closed_4h = (market_data_timestamps or {}).get("4h")
+    market_data_age_seconds = _age_seconds(last_closed_4h)
+
+    return {
+        "direction": getattr(market_structure, "trend", None),
+        "reason": reason,
+        "adx": adx,
+        "adx_threshold": config.adx_neutral_threshold,
+        "last_closed_1h": (market_data_timestamps or {}).get("1h"),
+        "last_closed_4h": last_closed_4h,
+        "market_data_age_seconds": market_data_age_seconds,
+        "protected_high": protected_high,
+        "protected_low": protected_low,
+        "last_break_type": last_break.get("break_type"),
+        "last_break_direction": last_break.get("direction"),
+        "last_break_index": last_break.get("index"),
+        "swing_sequence": sequence_labels,
+        "swing_points": sequence_points,
+        "bull_score": bull_score,
+        "bear_score": bear_score,
+        "neutral_score": neutral_score,
+        "conflicting_structure": bool("conflicting_swings" in reason_flags or "conflicting_recent_bos" in reason_flags),
+        "reason_flags": reason_flags,
+    }
+
+
+def _htf_swing_sequence(swing_highs, swing_lows):
+    points = []
+    previous_high = None
+    if swing_highs is not None:
+        for idx, row in swing_highs.sort_index().iterrows():
+            price = _safe_float(row.get("high"))
+            if previous_high is None:
+                label = "H"
+            elif price is not None and previous_high is not None and price > previous_high:
+                label = "HH"
+            elif price is not None and previous_high is not None and price < previous_high:
+                label = "LH"
+            else:
+                label = "EH"
+            points.append({"kind": "high", "label": label, "price": price, "index": str(idx)})
+            previous_high = price
+    previous_low = None
+    if swing_lows is not None:
+        for idx, row in swing_lows.sort_index().iterrows():
+            price = _safe_float(row.get("low"))
+            if previous_low is None:
+                label = "L"
+            elif price is not None and previous_low is not None and price > previous_low:
+                label = "HL"
+            elif price is not None and previous_low is not None and price < previous_low:
+                label = "LL"
+            else:
+                label = "EL"
+            points.append({"kind": "low", "label": label, "price": price, "index": str(idx)})
+            previous_low = price
+    return sorted(points, key=lambda item: item["index"])
+
+
+def _safe_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _last_swing_value(swings, column):
+    if swings is None or swings.empty or column not in swings:
+        return None
+    return _safe_float(swings.sort_index().iloc[-1].get(column))
+
+
+def _latest_structure_event(events):
+    if not events:
+        return {}
+    event = events[-1]
+    event_type = str(event.get("type") or "")
+    direction = "bullish" if "bullish" in event_type else "bearish" if "bearish" in event_type else None
+    break_type = "BOS" if "bos" in event_type.lower() else "CHOCH" if "choch" in event_type.lower() else None
+    return {"break_type": break_type, "direction": direction, "index": str(event.get("index")) if event.get("index") is not None else None}
+
+
+def _opposite_state_direction(direction):
+    if direction == "bullish":
+        return "bearish"
+    if direction == "bearish":
+        return "bullish"
+    return None
+
+
+def _shadow_target_level(direction, liquidity_map):
+    if direction == "bullish":
+        return _level_value(_level_value(liquidity_map, "nearest_buy_side"), "price")
+    if direction == "bearish":
+        return _level_value(_level_value(liquidity_map, "nearest_sell_side"), "price")
+    return None
+
+
+def _shadow_invalidation_level(direction, liquidity_map, current_price, atr, sfp_data=None):
+    sfp_level = _safe_float((sfp_data or {}).get("level"))
+    if sfp_level is not None:
+        return sfp_level
+    if direction == "bullish":
+        return (
+            _safe_float(_level_value(_level_value(liquidity_map, "nearest_sell_side"), "price"))
+            or (float(current_price) - (2 * float(atr or 0.0)))
+        )
+    if direction == "bearish":
+        return (
+            _safe_float(_level_value(_level_value(liquidity_map, "nearest_buy_side"), "price"))
+            or (float(current_price) + (2 * float(atr or 0.0)))
+        )
+    return None
+
+
+def _shadow_rr(direction, entry, stop, target):
+    entry = _safe_float(entry)
+    stop = _safe_float(stop)
+    target = _safe_float(target)
+    if entry is None or stop is None or target is None:
+        return None
+    risk = abs(entry - stop)
+    if risk <= 0:
+        return None
+    reward = (target - entry) if direction == "bullish" else (entry - target)
+    if reward <= 0:
+        return None
+    return round(reward / risk, 4)
+
+
+def _shadow_candidate_id(symbol, direction, anchor_type, anchor_index, entry, stop, target):
+    payload = "|".join(
+        str(item)
+        for item in (
+            symbol,
+            direction,
+            anchor_type,
+            anchor_index,
+            round(float(entry), 8) if entry is not None else None,
+            round(float(stop), 8) if stop is not None else None,
+            round(float(target), 8) if target is not None else None,
+        )
+    )
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+    return f"SHADOW_{str(symbol).upper()}_{str(direction).upper()}_{digest}"
+
+
+def _shadow_event_for_direction(direction, context_break_1h, long_trigger_candidate, short_trigger_candidate, trigger_break_15m):
+    directional_context = context_break_1h if _event_direction(context_break_1h) == direction else None
+    directional_trigger = _candidate_for_direction(direction, long_trigger_candidate, short_trigger_candidate)
+    if not directional_trigger and _event_direction(trigger_break_15m) == direction:
+        directional_trigger = trigger_break_15m
+    return directional_context or directional_trigger, directional_context, directional_trigger
+
+
+def _build_shadow_candidate(
+    *,
+    symbol,
+    htf_context,
+    market_structure,
+    context_break_1h,
+    trigger_break_15m,
+    long_trigger_candidate,
+    short_trigger_candidate,
+    sfp_data,
+    premium_discount_data,
+    liquidity_map,
+    current_price,
+    atr,
+    risk_plan=None,
+    scenario_scan=None,
+    created_at=None,
+):
+    current_price = _safe_float(current_price)
+    atr = _safe_float(atr) or 0.0
+    if current_price is None:
+        return None
+
+    direction_scores = []
+    for direction in ("bullish", "bearish"):
+        anchor, context_event, trigger_event = _shadow_event_for_direction(
+            direction,
+            context_break_1h,
+            long_trigger_candidate,
+            short_trigger_candidate,
+            trigger_break_15m,
+        )
+        if not anchor:
+            continue
+        quality = float(anchor.get("quality_score") or 0.0)
+        context_bonus = 10 if context_event else 0
+        trigger_bonus = 5 if trigger_event else 0
+        direction_scores.append((quality + context_bonus + trigger_bonus, direction, anchor, context_event, trigger_event))
+
+    if not direction_scores:
+        return None
+
+    _, direction, anchor, context_event, trigger_event = max(direction_scores, key=lambda item: (item[0], _event_sort_key(item[2].get("index"))))
+    target = _safe_float(_shadow_target_level(direction, liquidity_map))
+    stop = _safe_float(_shadow_invalidation_level(direction, liquidity_map, current_price, atr, sfp_data=sfp_data))
+    entry = _safe_float((trigger_event or anchor).get("level")) or current_price
+    rr = _shadow_rr(direction, entry, stop, target)
+    htf_direction = (htf_context or {}).get("direction") or (market_structure.get("trend") if market_structure else None)
+    htf_supportive = htf_direction == direction
+    has_poi = bool(premium_discount_data)
+    has_sweep = bool(sfp_data)
+    has_trigger = bool(trigger_event)
+    preliminary_risk_valid = rr is not None and rr >= RiskPlanConfig().min_rr_for_watchlist
+    confirmed_trigger = bool(trigger_event and float(trigger_event.get("quality_score") or 0.0) >= MIN_TRIGGER_QUALITY)
+    tier = "C"
+    rejection_reasons = []
+    if target is None:
+        rejection_reasons.append("target_not_available")
+    if stop is None:
+        rejection_reasons.append("invalidation_not_available")
+    if rr is None:
+        rejection_reasons.append("risk_reward_not_available")
+    if not has_sweep and not has_poi:
+        rejection_reasons.append("no_poi_or_sweep")
+    if not has_trigger:
+        rejection_reasons.append("no_trigger_candidate")
+    if not preliminary_risk_valid:
+        rejection_reasons.append("preliminary_risk_invalid")
+    if (has_sweep or has_poi) and has_trigger and preliminary_risk_valid:
+        tier = "B"
+    if not htf_supportive:
+        rejection_reasons.append("htf_not_directionally_supportive")
+    if not confirmed_trigger:
+        rejection_reasons.append("confirmed_trigger_missing")
+    if tier == "B" and htf_supportive and confirmed_trigger and rr is not None and rr >= RiskPlanConfig().min_rr_for_a_plus:
+        tier = "A"
+
+    anchor_type = str(anchor.get("type") or "structure")
+    anchor_index = anchor.get("index")
+    created_at = created_at or anchor_index
+    shadow_id = _shadow_candidate_id(symbol, direction, anchor_type, anchor_index, entry, stop, target)
+    return {
+        "shadow_tier": tier,
+        "shadow_candidate_id": shadow_id,
+        "shadow_direction": "LONG" if direction == "bullish" else "SHORT",
+        "shadow_created_at": str(created_at) if created_at is not None else None,
+        "shadow_rejection_reasons": sorted(set(rejection_reasons)),
+        "htf_context_class": "directional" if htf_direction in ("bullish", "bearish") else "neutral",
+        "entry": entry,
+        "stop_loss": stop,
+        "target_1": target,
+        "risk_per_unit": round(abs(entry - stop), 8) if entry is not None and stop is not None else None,
+        "rr_to_target_1": rr,
+        "anchor_type": anchor_type,
+        "anchor_index": str(anchor_index) if anchor_index is not None else None,
+        "context_1h": _event_snapshot(context_event),
+        "trigger_15m": _event_snapshot(trigger_event),
+        "sfp": _event_snapshot(sfp_data),
+    }
+
+
+def _empty_shadow_outcome():
+    return {
+        "entry_filled": None,
+        "entry_filled_at": None,
+        "max_favorable_excursion_r": None,
+        "max_adverse_excursion_r": None,
+        "reached_1r": None,
+        "reached_2r": None,
+        "target_1_hit": None,
+        "stop_hit": None,
+        "expired": None,
+        "outcome_at": None,
+    }
+
+
+def _component_result(
+    *,
+    detected=False,
+    direction=None,
+    timestamp=None,
+    quality_score=None,
+    configured_threshold=None,
+    passed=None,
+    rejection_reason=None,
+    condition_value=None,
+    condition_threshold=None,
+):
+    if passed is None:
+        if configured_threshold is not None and quality_score is not None:
+            passed = float(quality_score or 0.0) >= float(configured_threshold)
+        else:
+            passed = bool(detected)
+    return {
+        "detected": bool(detected),
+        "direction": direction,
+        "timestamp": str(timestamp) if timestamp is not None else None,
+        "quality_score": quality_score,
+        "configured_threshold": configured_threshold,
+        "passed": bool(passed),
+        "rejection_reason": rejection_reason,
+        "condition_value": condition_value if condition_value is not None else quality_score,
+        "condition_threshold": condition_threshold if condition_threshold is not None else configured_threshold,
+    }
+
+
+def _component_from_event(event, threshold=None, rejection_reason=None):
+    payload = payload_to_dict(event)
+    return _component_result(
+        detected=bool(payload),
+        direction=_event_direction(payload),
+        timestamp=payload.get("index") or payload.get("event_time"),
+        quality_score=payload.get("quality_score"),
+        configured_threshold=threshold,
+        rejection_reason=rejection_reason,
+    )
+
+
+def _scenario_event_payload_by_type(selected_scenario, wanted):
+    event = _candidate_event(selected_scenario, wanted)
+    if event is None:
+        return None
+    payload = payload_to_dict(getattr(event, "payload", None))
+    payload.setdefault("index", getattr(event, "index", None))
+    payload.setdefault("quality_score", getattr(event, "quality_score", None))
+    return payload
+
+
+def _latest_checked_candle_metric(confirmed_debug, key):
+    values = [
+        _safe_float(candle.get(key))
+        for candle in (confirmed_debug or {}).get("checked_candles") or []
+        if _safe_float(candle.get(key)) is not None
+    ]
+    return max(values) if values else None
+
+
+def _best_confirmed_candidate_debug(confirmed_debug):
+    candidates = list((confirmed_debug or {}).get("rejected_candidates") or [])
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: float(item.get("quality_score") or 0.0))
+
+
+def _close_distance_from_break_atr(confirmed_debug):
+    break_level = _safe_float((confirmed_debug or {}).get("break_level"))
+    if break_level is None:
+        return None
+    best = None
+    for candle in (confirmed_debug or {}).get("checked_candles") or []:
+        close = _safe_float(candle.get("close"))
+        if close is None:
+            continue
+        distance = abs(break_level - close)
+        if best is None or distance < best:
+            best = distance
+    return best
+
+
+def _fvg_distance_from_current_atr(fvg_data, current_price, atr):
+    current_price = _safe_float(current_price)
+    atr = _safe_float(atr)
+    if current_price is None or not atr or atr <= 0:
+        return None
+    distances = []
+    for fvg in fvg_data or []:
+        top = _safe_float(fvg.get("top"))
+        bottom = _safe_float(fvg.get("bottom"))
+        if top is None or bottom is None:
+            continue
+        if bottom <= current_price <= top:
+            distances.append(0.0)
+        else:
+            distances.append(min(abs(current_price - top), abs(current_price - bottom)) / atr)
+    return round(min(distances), 4) if distances else None
+
+
+def _retest_progress_toward_fvg(fvg_data, current_price):
+    current_price = _safe_float(current_price)
+    if current_price is None:
+        return None
+    candidates = []
+    for fvg in fvg_data or []:
+        top = _safe_float(fvg.get("top"))
+        bottom = _safe_float(fvg.get("bottom"))
+        if top is None or bottom is None or top == bottom:
+            continue
+        if bottom <= current_price <= top:
+            candidates.append(1.0)
+        else:
+            width = abs(top - bottom)
+            distance = min(abs(current_price - top), abs(current_price - bottom))
+            candidates.append(max(0.0, min(1.0, 1.0 - (distance / width))))
+    return round(max(candidates), 4) if candidates else None
+
+
+def _bars_since_index(index, last_closed_15m, scan_interval_minutes):
+    if index is None or last_closed_15m is None or getattr(last_closed_15m, "name", None) is None:
+        return None
+    try:
+        minutes = (pd.Timestamp(last_closed_15m.name) - pd.Timestamp(index)).total_seconds() / 60.0
+        interval = float(scan_interval_minutes or 15.0)
+        return max(0, int(minutes // interval))
+    except Exception:
+        return None
+
+
+def _near_miss_from_components(components):
+    candidates = []
+    for name, component in (components or {}).items():
+        value = _safe_float(component.get("condition_value"))
+        threshold = _safe_float(component.get("condition_threshold"))
+        if value is None or threshold is None or threshold <= 0:
+            continue
+        ratio = value / threshold
+        if ratio < 1.0:
+            candidates.append((ratio, name, value, threshold))
+    if not candidates:
+        return None, None, None, None
+    ratio, name, value, threshold = max(candidates, key=lambda item: item[0])
+    return name, round(value, 4), round(threshold, 4), round(ratio, 4)
+
+
+def _trigger_stage_from_required(required_next_event):
+    text = str(required_next_event or "").upper()
+    if "EARLY_TRIGGER" in text or "CHOCH" in text:
+        return "waiting_for_early_trigger"
+    if "CONFIRMED_TRIGGER" in text or "BOS" in text:
+        return "waiting_for_confirmed_trigger"
+    if "FVG_CREATED" in text:
+        return "waiting_for_fvg_creation"
+    if "FVG_RETESTED" in text:
+        return "waiting_for_fvg_retest"
+    if "DISPLACEMENT" in text:
+        return "waiting_for_displacement"
+    return "not_waiting_for_trigger"
+
+
+def _build_trigger_diagnostics(score_result, analysis_data, session):
+    scenario_scan = analysis_data.get("scenario_scan") if analysis_data else None
+    selected = getattr(scenario_scan, "selected_scenario", None) if scenario_scan else None
+    if selected is None:
+        return None
+
+    selected_snapshot = selected.to_dict() if hasattr(selected, "to_dict") else dict(selected)
+    candidate_id_value = selected_snapshot.get("candidate_id")
+    required_next = selected_snapshot.get("next_expected_step") or selected_snapshot.get("waiting_for")
+    trigger_stage = _trigger_stage_from_required(required_next)
+    trigger_scan = _candidate_scoped_trigger_scan(scenario_scan, selected_snapshot.get("direction"))
+    trigger_scan_data = trigger_scan.to_dict() if hasattr(trigger_scan, "to_dict") else dict(trigger_scan or {})
+    confirmed_debug = trigger_scan_data.get("confirmed_trigger_debug") or {}
+    direction = selected_snapshot.get("direction")
+    state_direction = _direction_to_state_direction(direction)
+    opposite_direction = _opposite_state_direction(state_direction)
+    event_types_used = _selected_scenario_event_types(analysis_data)
+
+    sfp_payload = _scenario_event_payload_by_type(selected, "SFP_CONFIRMED") or analysis_data.get("sfp_data")
+    early_trigger = trigger_scan_data.get("early_trigger")
+    confirmed_trigger = trigger_scan_data.get("confirmed_trigger") or trigger_scan_data.get("selected_trigger")
+    candidate_trigger = trigger_scan_data.get("candidate_trigger") or analysis_data.get("trigger_break_15m")
+    best_rejected_confirmed = _best_confirmed_candidate_debug(confirmed_debug)
+    fvg_created = "FVG_CREATED" in event_types_used
+    fvg_retested = "FVG_RETESTED" in event_types_used
+    displacement_confirmed = "DISPLACEMENT_CONFIRMED" in event_types_used
+    last_closed = analysis_data.get("last_closed_15m")
+    scan_interval = analysis_data.get("scan_interval") or 15.0
+
+    choch_candidate = None
+    bos_candidate = None
+    for item in [early_trigger, confirmed_trigger, candidate_trigger, best_rejected_confirmed]:
+        item_type = str((item or {}).get("type") or "").lower()
+        if "choch" in item_type and choch_candidate is None:
+            choch_candidate = item
+        if "bos" in item_type and bos_candidate is None:
+            bos_candidate = item
+
+    if choch_candidate is None and early_trigger and "early" in str(early_trigger.get("type", "")).lower():
+        choch_candidate = early_trigger
+
+    displacement_value = (
+        _safe_float((confirmed_trigger or {}).get("displacement_ratio"))
+        or _safe_float((early_trigger or {}).get("displacement_ratio"))
+        or _latest_checked_candle_metric(confirmed_debug, "displacement_ratio")
+        or _safe_float((candidate_trigger or {}).get("displacement_ratio"))
+    )
+    close_position_value = (
+        _safe_float((confirmed_trigger or {}).get("close_position"))
+        or _safe_float((early_trigger or {}).get("close_position"))
+        or _latest_checked_candle_metric(confirmed_debug, "close_position")
+        or _safe_float((candidate_trigger or {}).get("close_position"))
+    )
+    impulse_value = (
+        _safe_float((confirmed_trigger or {}).get("rvol"))
+        or _safe_float((early_trigger or {}).get("rvol"))
+        or _latest_checked_candle_metric(confirmed_debug, "rvol")
+        or _safe_float((candidate_trigger or {}).get("rvol"))
+    )
+    confirmed_bos_quality = _safe_float((confirmed_trigger or {}).get("quality_score"))
+    if confirmed_bos_quality is None and best_rejected_confirmed:
+        confirmed_bos_quality = _safe_float(best_rejected_confirmed.get("quality_score"))
+
+    components = {
+        "SFP": _component_from_event(sfp_payload),
+        "CHoCH": _component_from_event(
+            choch_candidate,
+            threshold=MIN_EARLY_TRIGGER_QUALITY,
+            rejection_reason=trigger_scan_data.get("rejected_reason") if not early_trigger else None,
+        ),
+        "BOS": _component_result(
+            detected=bool(confirmed_trigger or best_rejected_confirmed),
+            direction=_event_direction(confirmed_trigger or best_rejected_confirmed),
+            timestamp=(confirmed_trigger or best_rejected_confirmed or {}).get("index"),
+            quality_score=confirmed_bos_quality,
+            configured_threshold=MIN_TRIGGER_QUALITY,
+            rejection_reason=(best_rejected_confirmed or {}).get("rejected_reason") or confirmed_debug.get("final_reason"),
+        ),
+        "displacement": _component_result(
+            detected=displacement_value is not None,
+            direction=state_direction,
+            timestamp=(confirmed_trigger or early_trigger or candidate_trigger or {}).get("index"),
+            quality_score=displacement_value,
+            configured_threshold=MIN_EARLY_TRIGGER_DISPLACEMENT_ATR,
+            rejection_reason="displacement_quality_below_threshold" if displacement_value is not None and displacement_value < MIN_EARLY_TRIGGER_DISPLACEMENT_ATR else None,
+        ),
+        "FVG creation": _component_result(detected=fvg_created, direction=state_direction, passed=fvg_created),
+        "FVG retest": _component_result(detected=fvg_retested, direction=state_direction, passed=fvg_retested),
+        "close beyond structure": _component_result(
+            detected=any(bool(candle.get("breaks_level")) for candle in confirmed_debug.get("checked_candles") or []),
+            direction=state_direction,
+            condition_value=close_position_value,
+            condition_threshold=BOSConfig().min_close_position,
+            configured_threshold=BOSConfig().min_close_position,
+            passed=any(bool(candle.get("breaks_level")) for candle in confirmed_debug.get("checked_candles") or []),
+            rejection_reason=confirmed_debug.get("final_reason") if confirmed_debug else None,
+        ),
+        "volume/impulse confirmation": _component_result(
+            detected=impulse_value is not None,
+            direction=state_direction,
+            quality_score=impulse_value,
+            configured_threshold=MIN_EARLY_TRIGGER_RVOL,
+            condition_value=impulse_value,
+            condition_threshold=MIN_EARLY_TRIGGER_RVOL,
+            rejection_reason="volume_impulse_below_threshold" if impulse_value is not None and impulse_value < MIN_EARLY_TRIGGER_RVOL else None,
+        ),
+        "session/kill-zone condition": _component_result(
+            detected=session is not None,
+            direction=None,
+            passed=bool(getattr(session, "in_kill_zone", False)) or SEND_A_PLUS_OUTSIDE_KZ,
+            rejection_reason=None if (bool(getattr(session, "in_kill_zone", False)) or SEND_A_PLUS_OUTSIDE_KZ) else "outside_kill_zone",
+        ),
+    }
+
+    missing_conditions = []
+    if not components["SFP"]["detected"]:
+        missing_conditions.append("sfp_not_detected")
+    if trigger_stage == "waiting_for_early_trigger":
+        if not early_trigger:
+            missing_conditions.append("early_trigger_not_detected")
+        if not choch_candidate:
+            missing_conditions.append("choch_not_detected")
+        if not bos_candidate:
+            missing_conditions.append("bos_not_detected")
+        if displacement_value is not None and displacement_value < MIN_EARLY_TRIGGER_DISPLACEMENT_ATR:
+            missing_conditions.append("displacement_quality_below_threshold")
+    if trigger_stage == "waiting_for_confirmed_trigger":
+        if not early_trigger:
+            missing_conditions.append("early_trigger_not_detected")
+        if not confirmed_trigger:
+            missing_conditions.append("confirmation_bos_not_detected")
+        if confirmed_bos_quality is not None and confirmed_bos_quality < MIN_TRIGGER_QUALITY:
+            missing_conditions.append("bos_quality_below_threshold")
+        if not components["close beyond structure"]["passed"]:
+            missing_conditions.append("close_beyond_structure_missing")
+    if not fvg_created:
+        missing_conditions.append("fvg_not_created")
+    if fvg_created and not fvg_retested:
+        missing_conditions.append("fvg_not_retested")
+    if fvg_retested and not displacement_confirmed:
+        missing_conditions.append("post_retest_displacement_missing")
+    if impulse_value is not None and impulse_value < MIN_EARLY_TRIGGER_RVOL:
+        missing_conditions.append("volume_impulse_below_threshold")
+
+    closest, value, threshold, ratio = _near_miss_from_components(components)
+    early_index = (early_trigger or {}).get("index")
+    diagnostics = {
+        "candidate_id": candidate_id_value,
+        "scenario_id": _scenario_identity(selected),
+        "trigger_stage": trigger_stage,
+        "required_next_event": required_next,
+        "bars_waiting": selected_snapshot.get("market_age_bars") or selected_snapshot.get("age_bars"),
+        "scans_waiting": selected_snapshot.get("runtime_update_count") or selected_snapshot.get("update_count"),
+        "early_trigger_detected": bool(early_trigger),
+        "confirmed_trigger_detected": bool(confirmed_trigger),
+        "components": components,
+        "missing_conditions": sorted(set(missing_conditions)),
+        "near_miss": {
+            "closest_failed_condition": closest,
+            "condition_value": value,
+            "condition_threshold": threshold,
+            "near_miss_ratio": ratio,
+        },
+        "near_miss_metrics": {
+            "displacement_quality": displacement_value,
+            "required_displacement_quality": MIN_EARLY_TRIGGER_DISPLACEMENT_ATR,
+            "bos_quality": confirmed_bos_quality,
+            "required_bos_quality": MIN_TRIGGER_QUALITY,
+            "close_distance_from_confirmation_level_atr": _close_distance_from_break_atr(confirmed_debug),
+            "fvg_distance_from_current_price_atr": _fvg_distance_from_current_atr(
+                analysis_data.get("fvg_candidates"),
+                analysis_data.get("current_price"),
+                analysis_data.get("atr"),
+            ),
+            "retracement_progress_toward_fvg": _retest_progress_toward_fvg(
+                analysis_data.get("fvg_candidates"),
+                analysis_data.get("current_price"),
+            ),
+            "bars_since_early_trigger": _bars_since_index(early_index, last_closed, scan_interval),
+        },
+        "last_observed_events": [
+            event.get("event_type") or event.get("type")
+            for event in selected_snapshot.get("events_used") or []
+            if isinstance(event, dict) and (event.get("event_type") or event.get("type"))
+        ],
+        "opposite_direction": opposite_direction,
+    }
+    return diagnostics
+
+
+def _age_seconds(timestamp):
+    if timestamp is None:
+        return None
+    try:
+        ts = pd.Timestamp(timestamp)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(DEFAULT_TIMEZONE)
+        else:
+            ts = ts.tz_convert(DEFAULT_TIMEZONE)
+        return round((pd.Timestamp.now(tz=DEFAULT_TIMEZONE) - ts).total_seconds(), 4)
+    except Exception:
+        return None
+
+
 def _pd_location_id(payload):
     return "|".join(str(payload.get(key)) for key in ("zone", "range_timeframe", "range_low", "range_high"))
 
@@ -2314,6 +3099,12 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
     df_1h_closed = df_1h.iloc[:-1].copy()
     df_15m_closed = df_15m.iloc[:-1].copy()
     last_closed_15m = df_15m_closed.iloc[-1]
+    scan_interval_minutes = _scan_interval_minutes(df_15m_closed)
+    market_data_timestamps = {
+        "15m": str(df_15m_closed.index[-1]) if not df_15m_closed.empty else None,
+        "1h": str(df_1h_closed.index[-1]) if not df_1h_closed.empty else None,
+        "4h": str(df_4h_closed.index[-1]) if not df_4h_closed.empty else None,
+    }
     window_15m = df_15m_closed.tail(100)
     window_1h = df_1h_closed.tail(100)
     
@@ -2445,6 +3236,16 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         recent_structure_events=recent_4h_structure_events,
         config=MarketStructureConfig(),
     )
+    htf_context = _build_htf_context_explain(
+        market_structure=market_structure,
+        trend_data=trend_data,
+        df_4h_closed=df_4h_closed,
+        df_1h_closed=df_1h_closed,
+        swing_highs_4h=swing_highs_4h,
+        swing_lows_4h=swing_lows_4h,
+        recent_structure_events=recent_4h_structure_events,
+        market_data_timestamps=market_data_timestamps,
+    )
     low_adx_override_direction = None
     if market_structure.trend == 'neutral' and market_structure.reason == 'ADX below neutral threshold':
         low_adx_override_direction = _has_strong_reversal_context(
@@ -2481,6 +3282,23 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
             htf_structure=market_structure,
             premium_discount=None,
             risk_plan=None,
+        )
+        shadow_candidate = _build_shadow_candidate(
+            symbol=coin,
+            htf_context=htf_context,
+            market_structure=market_structure,
+            context_break_1h=context_break_1h,
+            trigger_break_15m=trigger_break_15m,
+            long_trigger_candidate=long_trigger_candidate,
+            short_trigger_candidate=short_trigger_candidate,
+            sfp_data=sfp_data_in_window,
+            premium_discount_data=None,
+            liquidity_map=liquidity_map,
+            current_price=current_price,
+            atr=float(last_closed_15m.get('atr', 0.0)),
+            risk_plan=None,
+            scenario_scan=neutral_scenario_scan,
+            created_at=market_data_timestamps.get("15m"),
         )
         return {
             'raw_score': 0,
@@ -2541,9 +3359,15 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
             'trigger_scan': neutral_trigger_scan,
             'scenario_scan': neutral_scenario_scan,
             'state_machine': None,
+            'htf_context': htf_context,
             'session': None,
             'direction': 'NEUTRAL',
             'last_closed_15m': last_closed_15m,
+            'market_data_timestamps': market_data_timestamps,
+            'scan_interval': scan_interval_minutes,
+            'current_price': current_price,
+            'atr': float(last_closed_15m.get('atr', 0.0)),
+            'shadow_candidate': shadow_candidate,
         }
         
     # Находим самый последний тест FVG в окне памяти
@@ -2882,10 +3706,32 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         "scenario_scan": scenario_scan,
         "scenario_events": scenario_events,
         "state_machine": state_machine_status,
+        "htf_context": htf_context,
         "session": None,
         "direction": direction,
         "last_closed_15m": last_closed_15m,
+        "market_data_timestamps": market_data_timestamps,
+        "scan_interval": scan_interval_minutes,
+        "current_price": current_price,
+        "atr": float(last_closed_15m.get('atr', 0.0)),
     }
+    analysis_data["shadow_candidate"] = _build_shadow_candidate(
+        symbol=coin,
+        htf_context=htf_context,
+        market_structure=market_structure,
+        context_break_1h=context_break_1h,
+        trigger_break_15m=trigger_break_15m,
+        long_trigger_candidate=long_trigger_candidate,
+        short_trigger_candidate=short_trigger_candidate,
+        sfp_data=sfp_data_in_window,
+        premium_discount_data=premium_discount_data,
+        liquidity_map=liquidity_map,
+        current_price=current_price,
+        atr=float(last_closed_15m.get('atr', 0.0)),
+        risk_plan=risk_plan,
+        scenario_scan=scenario_scan,
+        created_at=market_data_timestamps.get("15m"),
+    )
 
     return final_score_result, analysis_data
 
@@ -3016,6 +3862,9 @@ def market_scan(report_mode="HUNT"):
                 direction = analysis_data['direction']
                 risk_plan = analysis_data.get('risk_plan')
                 entry_price = risk_plan.get('entry') if risk_plan and risk_plan.get('valid') else None
+                selected_delivery_scenario = getattr(analysis_data.get('scenario_scan'), "selected_scenario", None)
+                delivery_candidate_id = getattr(selected_delivery_scenario, "candidate_id", None)
+                delivery_scenario_id = _scenario_identity(selected_delivery_scenario)
 
                 if entry_price and (time.time() - last_alert_time.get(coin, 0) > 7200):
                     entry_price = float(entry_price)
@@ -3048,6 +3897,10 @@ def market_scan(report_mode="HUNT"):
                             run_id=run_id,
                             message_type="A_PLUS",
                             delivery_context={
+                                "symbol": coin,
+                                "candidate_id": delivery_candidate_id,
+                                "scenario_id": delivery_scenario_id,
+                                "delivery_gate_result": delivery_gate,
                                 "in_kill_zone": bool(in_kz),
                                 "outside_kz_delivery_enabled": SEND_A_PLUS_OUTSIDE_KZ,
                                 "kill_zone_bypassed": bool(delivery_gate.get("kill_zone_bypassed")),
@@ -3064,6 +3917,10 @@ def market_scan(report_mode="HUNT"):
                             error=f"gemini_generation_failed: {e}",
                             status_code=None,
                             message_length=None,
+                            symbol=coin,
+                            candidate_id=delivery_candidate_id,
+                            scenario_id=delivery_scenario_id,
+                            delivery_gate_result=delivery_gate,
                             in_kill_zone=bool(in_kz),
                             outside_kz_delivery_enabled=SEND_A_PLUS_OUTSIDE_KZ,
                             kill_zone_bypassed=bool(delivery_gate.get("kill_zone_bypassed")),

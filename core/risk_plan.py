@@ -43,6 +43,11 @@ class RiskPlan:
     target_2_info: Optional[Dict[str, Any]] = None
     alternative_targets: Optional[List[Dict[str, Any]]] = None
     risk_geometry: str = "ok"
+    poi_price: Optional[float] = None
+    current_price_distance_from_poi_atr: Optional[float] = None
+    max_entry_distance_from_poi_atr: Optional[float] = None
+    minimum_stop_distance_atr: Optional[float] = None
+    minimum_stop_distance_percent: Optional[float] = None
 
     def get(self, key: str, default: Any = None) -> Any:
         return asdict(self).get(key, default)
@@ -161,6 +166,7 @@ def build_risk_plan(
     rr_to_target_1 = _rr(direction, entry, target_1, risk_per_unit)
     rr_to_target_2 = _rr(direction, entry, target_2, risk_per_unit) if target_2 is not None else None
     stop_distance_percent = (risk_per_unit / entry) * 100 if entry > 0 else 0.0
+    minimum_stop_distance_percent = ((config.min_stop_distance_atr * atr) / entry) * 100 if entry > 0 else None
 
     valid = True
     reasons = []
@@ -216,6 +222,11 @@ def build_risk_plan(
         target_2_info=target_2_info,
         alternative_targets=alternative_targets,
         risk_geometry=risk_geometry,
+        poi_price=round(poi_price, 8) if poi_price is not None else None,
+        current_price_distance_from_poi_atr=round(current_distance_from_poi_atr, 4) if current_distance_from_poi_atr is not None else None,
+        max_entry_distance_from_poi_atr=config.max_entry_distance_from_poi_atr,
+        minimum_stop_distance_atr=config.min_stop_distance_atr,
+        minimum_stop_distance_percent=round(minimum_stop_distance_percent, 4) if minimum_stop_distance_percent is not None else None,
     )
 
 

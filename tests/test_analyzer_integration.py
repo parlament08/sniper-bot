@@ -32,6 +32,263 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         lows = df.iloc[[10, 50, 90]][["low"]]
         return highs, lows
 
+    def test_neutral_htf_builds_shadow_candidate_without_a_plus(self):
+        liquidity_map = {
+            "nearest_buy_side": {"price": 110.0},
+            "nearest_sell_side": {"price": 96.0},
+        }
+        trigger = {
+            "type": "bullish_bos",
+            "index": pd.Timestamp("2026-01-01 10:00:00"),
+            "level": 101.0,
+            "quality_score": 82,
+        }
+        shadow = analyzer._build_shadow_candidate(
+            symbol="BNB",
+            htf_context={"direction": "neutral"},
+            market_structure=MarketStructure(trend="neutral", confidence=22, reason="ADX below neutral threshold"),
+            context_break_1h=None,
+            trigger_break_15m=trigger,
+            long_trigger_candidate=trigger,
+            short_trigger_candidate=None,
+            sfp_data={"type": "bullish_sfp", "index": pd.Timestamp("2026-01-01 09:30:00"), "level": 98.0},
+            premium_discount_data=None,
+            liquidity_map=liquidity_map,
+            current_price=102.0,
+            atr=2.0,
+            risk_plan=None,
+            scenario_scan=None,
+            created_at="2026-01-01 10:15:00",
+        )
+
+        self.assertIsNotNone(shadow)
+        self.assertEqual(shadow["shadow_tier"], "B")
+        self.assertEqual(shadow["shadow_direction"], "LONG")
+        self.assertEqual(shadow["htf_context_class"], "neutral")
+        self.assertIn("htf_not_directionally_supportive", shadow["shadow_rejection_reasons"])
+
+    def test_shadow_candidate_id_is_stable_across_repeated_scan_timestamp(self):
+        liquidity_map = {"nearest_buy_side": {"price": 110.0}, "nearest_sell_side": {"price": 96.0}}
+        trigger = {"type": "bullish_bos", "index": "2026-01-01 10:00:00", "level": 101.0, "quality_score": 82}
+        first = analyzer._build_shadow_candidate(
+            symbol="BNB",
+            htf_context={"direction": "neutral"},
+            market_structure=MarketStructure(trend="neutral", confidence=20, reason="neutral"),
+            context_break_1h=None,
+            trigger_break_15m=trigger,
+            long_trigger_candidate=trigger,
+            short_trigger_candidate=None,
+            sfp_data={"type": "bullish_sfp", "index": "2026-01-01 09:30:00", "level": 98.0},
+            premium_discount_data=None,
+            liquidity_map=liquidity_map,
+            current_price=102.0,
+            atr=2.0,
+            created_at="2026-01-01 10:15:00",
+        )
+        second = analyzer._build_shadow_candidate(
+            symbol="BNB",
+            htf_context={"direction": "neutral"},
+            market_structure=MarketStructure(trend="neutral", confidence=20, reason="neutral"),
+            context_break_1h=None,
+            trigger_break_15m=trigger,
+            long_trigger_candidate=trigger,
+            short_trigger_candidate=None,
+            sfp_data={"type": "bullish_sfp", "index": "2026-01-01 09:30:00", "level": 98.0},
+            premium_discount_data=None,
+            liquidity_map=liquidity_map,
+            current_price=102.0,
+            atr=2.0,
+            created_at="2026-01-01 10:30:00",
+        )
+
+        self.assertEqual(first["shadow_candidate_id"], second["shadow_candidate_id"])
+
+    def test_shadow_candidate_does_not_relax_production_delivery_gate(self):
+        score_result = {
+            "total_score": 92,
+            "diagnostics": {
+                "scenario_scan_valid": False,
+                "scenario_scan_signal_allowed": False,
+                "trigger_confirmed": True,
+                "scenario_risk_valid": False,
+            },
+        }
+        analysis_data = {
+            "scenario_scan": None,
+            "shadow_candidate": {"shadow_tier": "B", "shadow_candidate_id": "SHADOW_BNB_LONG_1"},
+        }
+
+        gate = analyzer._a_plus_delivery_gate(score_result, analysis_data, in_kill_zone=True)
+
+        self.assertFalse(gate["allowed"])
+        self.assertIn("scenario_valid", gate["failed_gates"])
+        self.assertIn("signal_allowed", gate["failed_gates"])
+
+    def test_trigger_diagnostics_explains_waiting_for_early_trigger(self):
+        scenario = ScenarioScanResult(
+            direction="LONG",
+            status="waiting_for_confirmation",
+            current_step="liquidity_sweep_confirmed",
+            next_expected_step="EARLY_TRIGGER_CONFIRMED",
+            signal_allowed=False,
+            scenario_valid=False,
+            completion_ratio=0.4,
+            completed_steps=3,
+            total_steps=10,
+            quality_score=70,
+            candidate_id="CAND-EARLY",
+            market_age_bars=5,
+            runtime_update_count=2,
+            events_used=[
+                ScenarioEvent(
+                    "SFP_CONFIRMED",
+                    "bullish",
+                    pd.Timestamp("2026-01-01 10:00:00"),
+                    payload={"type": "bullish_sfp", "index": "2026-01-01 10:00:00", "quality_score": 90},
+                )
+            ],
+            trigger_scan={
+                "expected_direction": "LONG",
+                "candidate_trigger": {
+                    "type": "bullish_choch",
+                    "index": "2026-01-01 10:30:00",
+                    "quality_score": 61,
+                    "displacement_ratio": 0.49,
+                    "rvol": 1.8,
+                    "close_position": 0.7,
+                },
+                "early_trigger": None,
+                "confirmed_trigger": None,
+                "trigger_confirmed": False,
+                "early_trigger_confirmed": False,
+                "rejected_reason": "early_trigger_quality_below_min",
+                "waiting_for": "bullish CHOCH/BOS after SFP/POI",
+            },
+        )
+        scan = ScenarioScannerOutput(
+            best_long_scenario=scenario,
+            best_short_scenario=None,
+            selected_scenario=scenario,
+            selected_direction="LONG",
+            signal_allowed=False,
+            scenario_valid=False,
+            reason="waiting_for_bullish_choch_or_bos",
+        )
+
+        diagnostics = analyzer._build_trigger_diagnostics(
+            {"diagnostics": {}},
+            {
+                "scenario_scan": scan,
+                "sfp_data": {"type": "bullish_sfp", "index": "2026-01-01 10:00:00"},
+                "trigger_break_15m": scenario.trigger_scan["candidate_trigger"],
+                "fvg_candidates": [],
+                "current_price": 100.0,
+                "atr": 1.0,
+                "last_closed_15m": pd.Series({"close": 100.0}, name=pd.Timestamp("2026-01-01 11:15:00")),
+                "scan_interval": 15.0,
+            },
+            session=type("Session", (), {"in_kill_zone": True})(),
+        )
+
+        self.assertEqual(diagnostics["trigger_stage"], "waiting_for_early_trigger")
+        self.assertIn("displacement_quality_below_threshold", diagnostics["missing_conditions"])
+        self.assertIn("fvg_not_created", diagnostics["missing_conditions"])
+        self.assertEqual(diagnostics["near_miss"]["closest_failed_condition"], "displacement")
+        self.assertAlmostEqual(diagnostics["near_miss"]["near_miss_ratio"], 0.98)
+        self.assertEqual(diagnostics["bars_waiting"], 5)
+        self.assertEqual(diagnostics["scans_waiting"], 2)
+
+    def test_trigger_diagnostics_explains_waiting_for_confirmed_trigger(self):
+        scenario = ScenarioScanResult(
+            direction="LONG",
+            status="waiting_for_confirmation",
+            current_step="early_trigger_confirmed",
+            next_expected_step="CONFIRMED_TRIGGER_CONFIRMED",
+            signal_allowed=False,
+            scenario_valid=False,
+            completion_ratio=0.5,
+            completed_steps=4,
+            total_steps=10,
+            quality_score=75,
+            candidate_id="CAND-CONFIRM",
+            events_used=[
+                ScenarioEvent("SFP_CONFIRMED", "bullish", "2026-01-01 10:00:00", payload={"type": "bullish_sfp", "index": "2026-01-01 10:00:00"}),
+                ScenarioEvent("EARLY_TRIGGER_CONFIRMED", "bullish", "2026-01-01 10:15:00", payload={"type": "bullish_early_choch", "index": "2026-01-01 10:15:00", "quality_score": 91}),
+            ],
+            trigger_scan={
+                "expected_direction": "LONG",
+                "early_trigger": {"type": "bullish_early_choch", "index": "2026-01-01 10:15:00", "quality_score": 91, "displacement_ratio": 0.8, "rvol": 1.4, "close_position": 0.8},
+                "confirmed_trigger": None,
+                "trigger_confirmed": False,
+                "early_trigger_confirmed": True,
+                "rejected_reason": "confirmed_trigger_missing",
+                "waiting_for": "confirmed bullish BOS after early CHOCH",
+                "confirmed_trigger_debug": {
+                    "final_reason": "quality_below_min",
+                    "break_level": 101.0,
+                    "checked_candles": [
+                        {"index": "2026-01-01 10:30:00", "close": 100.8, "breaks_level": False, "close_position": 0.7, "displacement_ratio": 0.7, "rvol": 1.4}
+                    ],
+                    "rejected_candidates": [
+                        {"type": "bullish_bos", "index": "2026-01-01 10:30:00", "quality_score": 68, "rejected_reason": "quality_below_min"}
+                    ],
+                },
+            },
+        )
+        scan = ScenarioScannerOutput(
+            best_long_scenario=scenario,
+            best_short_scenario=None,
+            selected_scenario=scenario,
+            selected_direction="LONG",
+            signal_allowed=False,
+            scenario_valid=False,
+            reason="waiting_for_confirmed_bullish_bos",
+        )
+
+        diagnostics = analyzer._build_trigger_diagnostics(
+            {"diagnostics": {}},
+            {
+                "scenario_scan": scan,
+                "fvg_candidates": [],
+                "current_price": 100.0,
+                "atr": 1.0,
+                "last_closed_15m": pd.Series({"close": 100.0}, name=pd.Timestamp("2026-01-01 10:45:00")),
+                "scan_interval": 15.0,
+            },
+            session=type("Session", (), {"in_kill_zone": True})(),
+        )
+
+        self.assertEqual(diagnostics["trigger_stage"], "waiting_for_confirmed_trigger")
+        self.assertTrue(diagnostics["early_trigger_detected"])
+        self.assertFalse(diagnostics["confirmed_trigger_detected"])
+        self.assertIn("bos_quality_below_threshold", diagnostics["missing_conditions"])
+        self.assertIn("close_beyond_structure_missing", diagnostics["missing_conditions"])
+        self.assertEqual(diagnostics["near_miss"]["closest_failed_condition"], "BOS")
+        self.assertAlmostEqual(diagnostics["near_miss"]["near_miss_ratio"], round(68 / 70, 4))
+
+    def test_trigger_diagnostics_do_not_affect_production_delivery_gate(self):
+        score_result = {
+            "total_score": 92,
+            "diagnostics": {
+                "scenario_scan_valid": False,
+                "scenario_scan_signal_allowed": False,
+                "trigger_confirmed": False,
+                "scenario_risk_valid": False,
+            },
+        }
+        analysis_data = {
+            "scenario_scan": None,
+            "trigger_diagnostics": {
+                "missing_conditions": [],
+                "near_miss": {"near_miss_ratio": 0.99},
+            },
+        }
+
+        gate = analyzer._a_plus_delivery_gate(score_result, analysis_data, in_kill_zone=True)
+
+        self.assertFalse(gate["allowed"])
+        self.assertIn("trigger_confirmed", gate["failed_gates"])
+
     def test_prepare_fetches_direct_1h_and_reports_liquidity_map(self):
         calls = []
 
