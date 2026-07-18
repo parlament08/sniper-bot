@@ -1623,7 +1623,7 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertIn("+DI 22.10 / -DI 18.40", text)
         self.assertIn("weak/neutral", text)
 
-    def test_state_machine_diagnostic_respects_event_chronology(self):
+    def test_state_machine_diagnostic_ignores_historical_fvg(self):
         market_structure = MarketStructure(trend="bullish", confidence=80, reason="test")
         pd_result = {
             "valid_for_buy": True,
@@ -1636,8 +1636,8 @@ class AnalyzerIntegrationTest(unittest.TestCase):
             market_structure,
             pd_result,
             liquidity_map=None,
-            sfp_data={"type": "bullish_sfp", "index": 10, "detected": True, "swept": True},
-            context_structure=None,
+            sfp_data={"type": "bullish_sfp", "index": 2, "detected": True, "swept": True},
+            context_structure={"type": "bullish_choch", "index": 3, "quality_score": 90},
             trigger_structure={"type": "bullish_bos", "index": 5, "quality_score": 95},
             fvg_test_data={"index": 6, "displacement_index": 7},
             fvg_data=[{
@@ -1654,7 +1654,8 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         )
 
         self.assertFalse(result.signal_allowed)
-        self.assertIn("invalidated", status)
+        self.assertIn("waiting_for_fvg", status)
+        self.assertNotIn("Unexpected fvg_created", status)
 
     def test_state_machine_diagnostic_allows_ordered_full_sequence(self):
         market_structure = MarketStructure(trend="bullish", confidence=80, reason="test")
@@ -1725,6 +1726,116 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertEqual(annotated[0]["scenario_reject_reason"], "fvg_quality_below_min")
         self.assertFalse(result.signal_allowed)
         self.assertIn("waiting_for_fvg", status)
+        self.assertNotIn("Unexpected fvg_created", status)
+
+    def test_state_machine_ignores_unrelated_candidate_fvg(self):
+        market_structure = MarketStructure(trend="bullish", confidence=80, reason="test")
+        pd_result = {
+            "valid_for_buy": True,
+            "valid_for_sell": False,
+            "zone": "discount",
+        }
+
+        status, result = analyzer._state_machine_diagnostic(
+            "LONG",
+            market_structure,
+            pd_result,
+            liquidity_map=None,
+            sfp_data={"type": "bullish_sfp", "index": 2, "detected": True, "swept": True},
+            context_structure={"type": "bullish_choch", "index": 3, "quality_score": 90},
+            trigger_structure={"type": "bullish_bos", "index": 4, "quality_score": 95, "event_id": "bos-A"},
+            fvg_test_data={"index": 6, "displacement_index": 7},
+            fvg_data=[{
+                "type": "bullish",
+                "end_index": 5,
+                "tested": True,
+                "invalidated": False,
+                "quality_score": 90,
+                "age_bars": 2,
+                "retest_count": 1,
+                "source_candidate_id": "CAND-B",
+                "source_confirmed_trigger_id": "bos-B",
+            }],
+            current_price=100.0,
+            current_bar=7,
+            expected_candidate_id="CAND-A",
+        )
+
+        self.assertFalse(result.signal_allowed)
+        self.assertIn("waiting_for_fvg", status)
+        self.assertNotIn("Unexpected fvg_created", status)
+
+    def test_state_machine_accepts_valid_candidate_fvg(self):
+        market_structure = MarketStructure(trend="bullish", confidence=80, reason="test")
+        pd_result = {
+            "valid_for_buy": True,
+            "valid_for_sell": False,
+            "zone": "discount",
+        }
+
+        status, result = analyzer._state_machine_diagnostic(
+            "LONG",
+            market_structure,
+            pd_result,
+            liquidity_map=None,
+            sfp_data={"type": "bullish_sfp", "index": 2, "detected": True, "swept": True},
+            context_structure={"type": "bullish_choch", "index": 3, "quality_score": 90},
+            trigger_structure={"type": "bullish_bos", "index": 4, "quality_score": 95, "event_id": "bos-A"},
+            fvg_test_data={"index": 6, "displacement_index": 7},
+            fvg_data=[{
+                "type": "bullish",
+                "end_index": 5,
+                "tested": True,
+                "invalidated": False,
+                "quality_score": 90,
+                "age_bars": 2,
+                "retest_count": 1,
+                "source_candidate_id": "CAND-A",
+                "source_confirmed_trigger_id": "bos-A",
+            }],
+            current_price=100.0,
+            current_bar=7,
+            expected_candidate_id="CAND-A",
+        )
+
+        self.assertTrue(result.signal_allowed)
+        self.assertIn("signal_ready", status)
+
+    def test_inj_state_machine_regression_ignores_global_fvg_without_confirmed_trigger(self):
+        market_structure = MarketStructure(trend="bullish", confidence=80, reason="test")
+        pd_result = {
+            "valid_for_buy": True,
+            "valid_for_sell": False,
+            "zone": "discount",
+        }
+
+        status, result = analyzer._state_machine_diagnostic(
+            "LONG",
+            market_structure,
+            pd_result,
+            liquidity_map=None,
+            sfp_data={"type": "bullish_sfp", "index": "2026-07-18 06:45", "detected": True, "swept": True},
+            context_structure={"type": "bullish_choch", "index": "2026-07-18 07:00", "quality_score": 82},
+            trigger_structure=None,
+            fvg_test_data={"index": "2026-07-18 09:30", "displacement_index": "2026-07-18 09:45"},
+            fvg_data=[{
+                "type": "bullish",
+                "end_index": "2026-07-18 09:15",
+                "tested": True,
+                "invalidated": False,
+                "quality_score": 90,
+                "age_bars": 1,
+                "retest_count": 1,
+                "source_candidate_id": "CAND-B",
+                "source_confirmed_trigger_id": "bos-B",
+            }],
+            current_price=100.0,
+            current_bar=7,
+            expected_candidate_id="CAND-A",
+        )
+
+        self.assertFalse(result.signal_allowed)
+        self.assertIn("waiting_for_bos", status)
         self.assertNotIn("Unexpected fvg_created", status)
 
     def test_trigger_debug_reports_stale_low_quality_fvg(self):

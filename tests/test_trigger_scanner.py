@@ -550,6 +550,7 @@ class TriggerScannerTest(unittest.TestCase):
                     "quality_score": 60,
                     "close_position": 0.4,
                     "displacement_ratio": 0.3,
+                    "rvol": 1.389,
                 },
             ],
             selected_candidate_id=candidate_id,
@@ -557,7 +558,13 @@ class TriggerScannerTest(unittest.TestCase):
 
         self.assertFalse(result.trigger_confirmed)
         self.assertEqual(result.confirmed_trigger_debug["candidate_bos_count"], 1)
-        self.assertEqual(result.confirmed_trigger_debug["rejected_candidates"][0]["rejected_reason"], "quality_below_min")
+        rejected = result.confirmed_trigger_debug["rejected_candidates"][0]
+        self.assertEqual(rejected["rejected_reason"], "quality_below_min")
+        self.assertEqual(rejected["primary_reason"], "quality_below_min")
+        self.assertIn("close_position_below_min", rejected["failed_conditions"])
+        self.assertIn("displacement_below_min", rejected["failed_conditions"])
+        self.assertIn("volume_not_confirmed", rejected["failed_conditions"])
+        self.assertIn("quality_score_below_min", rejected["failed_conditions"])
         diagnostics = result.confirmed_trigger_debug["bos_diagnostics"]
         self.assertEqual(diagnostics["bos_candidates_total"], 1)
         self.assertEqual(diagnostics["confirmed"], 0)

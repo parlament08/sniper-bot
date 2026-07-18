@@ -1440,12 +1440,28 @@ def _select_scenario_fvg(direction, fvg_test_data, fvg_data):
     return max(candidates, key=lambda item: _event_sort_key(item.get('end_index')))
 
 
-def _fvg_for_state_machine(direction, fvg_test_data, fvg_data, current_price):
+def _select_candidate_scenario_fvg(direction, fvg_test_data, fvg_data, expected_candidate_id=None):
+    candidates = []
+    for fvg in _directional_fvgs(direction, fvg_data):
+        if not fvg.get('scenario_valid', _scenario_fvg_reject_reason(fvg) is None):
+            continue
+        if not (fvg.get('tested', False) or bool(fvg_test_data)):
+            continue
+        source_candidate_id = fvg.get('source_candidate_id') or fvg.get('candidate_id')
+        if expected_candidate_id is not None and source_candidate_id is not None and str(source_candidate_id) != str(expected_candidate_id):
+            continue
+        candidates.append(fvg)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: _event_sort_key(item.get('end_index')))
+
+
+def _fvg_for_state_machine(direction, fvg_test_data, fvg_data, current_price, expected_candidate_id=None):
     state_direction = _direction_to_state_direction(direction)
     if state_direction is None or not fvg_test_data:
         return None
 
-    fvg = _select_scenario_fvg(direction, fvg_test_data, fvg_data)
+    fvg = _select_candidate_scenario_fvg(direction, fvg_test_data, fvg_data, expected_candidate_id)
     if fvg:
         return {
             'detected': True,
@@ -1458,7 +1474,14 @@ def _fvg_for_state_machine(direction, fvg_test_data, fvg_data, current_price):
             'age_bars': fvg.get('age_bars'),
             'retest_count': fvg.get('retest_count'),
             'end_index': fvg.get('end_index'),
+            'created_index': fvg.get('created_index') or fvg.get('end_index'),
             'test_index': fvg_test_data.get('index') if fvg_test_data else None,
+            'source_candidate_id': fvg.get('source_candidate_id') or fvg.get('candidate_id'),
+            'source_confirmed_trigger_id': fvg.get('source_confirmed_trigger_id'),
+            'source_confirmed_trigger_index': fvg.get('source_confirmed_trigger_index') or fvg.get('confirmed_trigger_index'),
+            'historical_only': fvg.get('historical_only', False),
+            'is_reconstructed': fvg.get('is_reconstructed', False),
+            'displacement_index': fvg.get('displacement_index') or (fvg_test_data or {}).get('displacement_index'),
         }
     return None
 
@@ -2945,6 +2968,7 @@ def _scenario_events_for_state_machine(
     trigger_structure,
     fvg_result,
     fvg_test_data,
+    expected_candidate_id=None,
 ):
     state_direction = _direction_to_state_direction(direction)
     if state_direction is None:
@@ -2978,7 +3002,15 @@ def _scenario_events_for_state_machine(
         if structure is trigger_structure and 'bos' in struct_type:
             events.append((event_index, SniperEvent.BOS_CONFIRMED))
 
-    if fvg_result:
+    confirmed_trigger_index = _event_sort_key(trigger_structure.get('index')) if trigger_structure else None
+    confirmed_trigger_id = _structure_event_id(trigger_structure) if trigger_structure else None
+    if fvg_result and _fvg_matches_state_machine_scenario(
+        fvg_result,
+        state_direction,
+        expected_candidate_id=expected_candidate_id,
+        confirmed_trigger_index=confirmed_trigger_index,
+        confirmed_trigger_id=confirmed_trigger_id,
+    ):
         created_index = fvg_result.get('end_index')
         if created_index is not None:
             events.append((_event_sort_key(created_index), SniperEvent.FVG_CREATED))
@@ -3005,6 +3037,40 @@ def _scenario_events_for_state_machine(
     return deduped
 
 
+def _fvg_matches_state_machine_scenario(
+    fvg_result,
+    state_direction,
+    *,
+    expected_candidate_id=None,
+    confirmed_trigger_index,
+    confirmed_trigger_id,
+):
+    if not fvg_result or confirmed_trigger_index is None:
+        return False
+    if fvg_result.get('direction') not in (None, state_direction):
+        return False
+    fvg_type = fvg_result.get('type')
+    if fvg_type is not None and fvg_type != state_direction:
+        return False
+    if fvg_result.get('invalidated', False):
+        return False
+    if fvg_result.get('historical_only', False) or fvg_result.get('is_reconstructed', False):
+        return False
+    created_index = fvg_result.get('end_index') or fvg_result.get('created_index')
+    if created_index is None or _event_sort_key(created_index) <= confirmed_trigger_index:
+        return False
+    source_trigger_id = fvg_result.get('source_confirmed_trigger_id')
+    if source_trigger_id is not None and confirmed_trigger_id is not None and str(source_trigger_id) != str(confirmed_trigger_id):
+        return False
+    source_candidate_id = fvg_result.get('source_candidate_id') or fvg_result.get('candidate_id')
+    if expected_candidate_id is not None and source_candidate_id is not None and str(source_candidate_id) != str(expected_candidate_id):
+        return False
+    source_trigger_index = fvg_result.get('source_confirmed_trigger_index') or fvg_result.get('confirmed_trigger_index')
+    if source_trigger_index is not None and _event_sort_key(source_trigger_index) != confirmed_trigger_index:
+        return False
+    return True
+
+
 def _state_machine_diagnostic(
     direction,
     market_structure,
@@ -3017,13 +3083,14 @@ def _state_machine_diagnostic(
     fvg_data,
     current_price,
     current_bar,
+    expected_candidate_id=None,
 ):
     state_direction = _direction_to_state_direction(direction)
     if state_direction is None:
         return '0', None
 
     structure_result = _structure_for_state_machine(direction, market_structure, context_structure, trigger_structure)
-    fvg_result = _fvg_for_state_machine(direction, fvg_test_data, fvg_data, current_price)
+    fvg_result = _fvg_for_state_machine(direction, fvg_test_data, fvg_data, current_price, expected_candidate_id)
     displacement_result = None
 
     selected_structure = trigger_structure or context_structure
@@ -3043,6 +3110,7 @@ def _state_machine_diagnostic(
         trigger_structure,
         fvg_result,
         fvg_test_data,
+        expected_candidate_id=expected_candidate_id,
     )
     result = machine.update(
         events=scenario_events,
@@ -3557,6 +3625,25 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         selected_fvg_test_data,
         direction,
     )
+    if selected_scenario is not None:
+        state_machine_status, state_machine_result = _state_machine_diagnostic(
+            direction,
+            market_structure,
+            premium_discount_data,
+            liquidity_map,
+            sfp_data_in_window,
+            context_break_1h,
+            _candidate_confirmed_trigger(selected_scenario) or scenario_trigger_15m,
+            candidate_fvg_test_data,
+            candidate_fvg_data,
+            current_price,
+            len(df_15m_closed) - 1,
+            expected_candidate_id=getattr(selected_scenario, 'candidate_id', None),
+        )
+        final_score_result['breakdown']['state_machine'] = state_machine_status
+        final_score_result['diagnostics']['state_machine_allowed'] = (
+            state_machine_result.signal_allowed if state_machine_result is not None else False
+        )
     if risk_plan and risk_plan.risk_plan_status != "not_available":
         assert risk_plan.source_candidate_id is not None
     if risk_plan:

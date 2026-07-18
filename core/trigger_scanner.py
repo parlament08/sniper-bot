@@ -801,16 +801,40 @@ def _confirmed_trigger_debug(
 
 
 def _candidate_debug_snapshot(candidate, reason):
+    failed_conditions = _bos_failed_conditions(candidate)
     return {
         "candidate_id": candidate.get("candidate_id"),
         "type": candidate.get("type"),
         "index": _string_index(_event_index(candidate)),
         "quality_score": candidate.get("quality_score"),
         "rejected_reason": reason,
+        "primary_reason": reason,
+        "failed_conditions": failed_conditions,
         "body_ratio": candidate.get("body_ratio"),
         "close_position": candidate.get("close_position"),
         "displacement_ratio": candidate.get("displacement_ratio"),
+        "rvol": candidate.get("rvol"),
     }
+
+
+def _bos_failed_conditions(candidate, *, config=None):
+    config = config or BOSConfig()
+    failed = []
+    body_ratio = candidate.get("body_ratio")
+    close_position = candidate.get("close_position")
+    displacement_ratio = candidate.get("displacement_ratio")
+    rvol = candidate.get("rvol")
+    if body_ratio is not None and float(body_ratio or 0.0) < config.min_body_ratio:
+        failed.append("body_ratio_below_min")
+    if displacement_ratio is not None and float(displacement_ratio or 0.0) < config.min_displacement_atr:
+        failed.append("displacement_below_min")
+    if close_position is not None and float(close_position or 0.0) < config.min_close_position:
+        failed.append("close_position_below_min")
+    if rvol is not None and float(rvol or 0.0) < config.min_rvol:
+        failed.append("volume_not_confirmed")
+    if int(candidate.get("quality_score", 0) or 0) < config.min_quality_score:
+        failed.append("quality_score_below_min")
+    return failed
 
 
 def _bos_diagnostics_report(bos_count, valid_bos_count, rejected, context, *, config=None):
