@@ -75,6 +75,8 @@ class ScenarioScanResult:
     scenario_key: Optional[object] = None
     market_age_bars: int = 0
     runtime_update_count: int = 0
+    pending_observations: list[dict] = field(default_factory=list)
+    event_diagnostics: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         data = asdict(self)
@@ -337,6 +339,8 @@ def _scan_direction(
         return _finalize_candidate(_invalid_result(direction, "pd_invalid_for_direction"), anchor_event, candidate_sequence)
 
     used: list[ScenarioEvent] = []
+    pending_observations: list[ScenarioEvent] = []
+    event_diagnostics: list[dict] = []
     completed = 0
     sfp_index = None
     has_early_trigger_event = any(
@@ -360,87 +364,57 @@ def _scan_direction(
     risk_event_seen = False
     last_invalidated_component = None
 
-    for event in events:
+    def current_expected():
+        return FLOW[completed] if completed < len(FLOW) else None
+
+    def diagnose(event, status, reason=None):
+        event_diagnostics.append(_event_diagnostic(event, status, reason, current_expected()))
+
+    def pend(event, reason):
+        pending_observations.append(event)
+        diagnose(event, "event_observed_early", reason)
+        diagnose(event, "event_pending", reason)
+
+    def reject(event, reason):
+        diagnose(event, "event_rejected_by_validation", reason)
+
+    def accept(event):
+        diagnose(event, "event_accepted", None)
+
+    def accept_pending_event(event):
+        nonlocal completed
+        nonlocal early_trigger_seen, early_trigger_index
+        nonlocal confirmed_trigger_seen, confirmed_trigger_index, confirmed_trigger_id
+        nonlocal fvg_seen, fvg_created_index, retest_seen, retest_index
+        nonlocal risk_valid, risk_reason, last_invalidated_component
+
         event_type = _normalize_event_type(event.event_type)
         side = _normalize_side(event.direction)
-        if event_type == "INVALIDATION" and _event_applies(direction, event):
-            return _finalize_candidate(_invalid_result(direction, _payload_reason(event, "invalidation"), used), anchor_event, candidate_sequence)
+        if side not in (None, scenario_side):
+            reject(event, "direction_mismatch")
+            return "rejected"
 
-        if side not in (None, scenario_side, opposite_side, "neutral"):
-            continue
-
-        if event_type == "HTF_CONTEXT_CONFIRMED":
-            if side == "neutral":
-                return _finalize_candidate(_invalid_result(direction, "htf_direction_conflict", used), anchor_event, candidate_sequence)
-            if side == scenario_side and completed < 1:
-                used.append(event)
-                completed = max(completed, 1)
-            elif side == opposite_side:
-                return _finalize_candidate(_invalid_result(direction, "htf_direction_conflict", used), anchor_event, candidate_sequence)
-            continue
-
-        if completed == 0:
-            continue
-
-        if event_type == "PD_LOCATION_VALID":
-            if side in (None, scenario_side) and completed < 2:
-                used.append(event)
-                completed = max(completed, 2)
-            continue
-
-        if event_type == "POI_TOUCHED":
-            if side in (None, scenario_side) and completed < 2:
-                used.append(event)
-                completed = max(completed, 2)
-            continue
-
-        if event_type in ("SFP_CONFIRMED", "LIQUIDITY_SWEEP_CONFIRMED"):
-            if side == scenario_side and completed < 3:
-                used.append(_with_type(event, "SFP_CONFIRMED"))
-                completed = max(completed, 3)
-                sfp_index = event.index
-            continue
-
-        if event_type in ("EARLY_TRIGGER_CONFIRMED", "CHOCH_CONFIRMED", "BOS_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED") and side == scenario_side and completed < 3:
-            last_invalidated_component = "trigger_before_sfp"
-            continue
-
-        if event_type == "EARLY_TRIGGER_CONFIRMED" and side == opposite_side and completed >= 3:
-            opposite_trigger_event = event
-            continue
-
-        if event_type in ("CHOCH_CONFIRMED", "BOS_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED") and side == opposite_side and completed >= 3:
-            if not _event_candidate_matches(event, expected_candidate_id):
-                continue
-            opposite_trigger_event = event
-            if _is_confirmed_bos_event(event) and float(event.quality_score or 0.0) >= CONFIRMED_TRIGGER_MIN_QUALITY:
-                return _finalize_candidate(_invalid_result(
-                    direction,
-                    "opposite_confirmed_bos",
-                    used + [event],
-                    opposite_trigger_event=event,
-                    last_invalidated_component="opposite_confirmed_bos",
-                ), anchor_event, candidate_sequence)
-            rejected_confirmed_candidates.append(_rejected_confirmed_candidate(event, "opposite_structure_warning"))
-            continue
-
-        if event_type == "EARLY_TRIGGER_CONFIRMED" and side == scenario_side:
+        if event_type == "EARLY_TRIGGER_CONFIRMED":
+            if completed < 3:
+                return None
             if completed < 4:
                 used.append(_with_candidate_payload(event, expected_candidate_id, anchor_index=anchor_index))
                 completed = max(completed, 4)
             early_trigger_seen = True
             early_trigger_index = event.index
-            continue
+            accept(event)
+            return "accepted"
 
-        if event_type in ("CHOCH_CONFIRMED", "BOS_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED") and side == scenario_side:
+        if event_type in ("CHOCH_CONFIRMED", "BOS_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED"):
+            if completed < 3:
+                return None
             if has_early_trigger_event and not early_trigger_seen:
-                last_invalidated_component = "confirmed_trigger_before_early"
-                rejected_confirmed_candidates.append(_rejected_confirmed_candidate(event, "before_early_trigger"))
-                continue
+                return None
             if has_early_trigger_event and float(event.quality_score or 0.0) < CONFIRMED_TRIGGER_MIN_QUALITY:
                 last_invalidated_component = "confirmed_trigger_quality_below_min"
                 rejected_confirmed_candidates.append(_rejected_confirmed_candidate(event, "quality_below_min"))
-                continue
+                reject(event, "quality_below_min")
+                return "rejected"
             if completed < 5:
                 used.append(_with_type(_with_candidate_payload(
                     event,
@@ -452,20 +426,21 @@ def _scan_direction(
             confirmed_trigger_seen = True
             confirmed_trigger_index = event.index
             confirmed_trigger_id = _event_id(event)
-            continue
+            accept(event)
+            return "accepted"
 
-        if event_type == "FVG_CREATED" and side == scenario_side:
-            if not confirmed_trigger_seen:
-                continue
-            if _event_sort_key(event.index) <= _event_sort_key(confirmed_trigger_index):
-                last_invalidated_component = "fvg_before_bos"
-                continue
+        if event_type == "FVG_CREATED":
+            if completed < 5 or not confirmed_trigger_seen:
+                return None
             if not _fvg_event_matches_candidate(event, expected_candidate_id, confirmed_trigger_id):
-                continue
+                reject(event, "candidate_or_trigger_mismatch")
+                return "rejected"
             if _payload_bool(event, "historical_only") or _payload_bool(event, "is_reconstructed"):
-                continue
+                reject(event, "historical_or_reconstructed_fvg")
+                return "rejected"
             if _payload_bool(event, "invalidated"):
-                return _finalize_candidate(_invalid_result(direction, "fvg_invalidated", used + [event]), anchor_event, candidate_sequence)
+                diagnose(event, "scenario_invalidated", "fvg_invalidated")
+                return _invalid_result(direction, "fvg_invalidated", used + [event])
             if completed < 6:
                 used.append(_with_candidate_payload(
                     event,
@@ -476,19 +451,15 @@ def _scan_direction(
                 completed = max(completed, 6)
             fvg_seen = True
             fvg_created_index = event.index
-            continue
+            accept(event)
+            return "accepted"
 
-        if event_type == "FVG_RETESTED" and side == scenario_side:
-            if not confirmed_trigger_seen:
-                continue
+        if event_type == "FVG_RETESTED":
+            if completed < 6 or not confirmed_trigger_seen or not fvg_seen:
+                return None
             if not _fvg_event_matches_candidate(event, expected_candidate_id, confirmed_trigger_id):
-                continue
-            if _fvg_created_before_confirmed(event, confirmed_trigger_index):
-                continue
-            if not fvg_seen:
-                return _finalize_candidate(_invalid_result(direction, "retest_before_fvg", used + [event]), anchor_event, candidate_sequence)
-            if _event_sort_key(event.index) <= _event_sort_key(fvg_created_index):
-                return _finalize_candidate(_invalid_result(direction, "retest_before_fvg", used + [event]), anchor_event, candidate_sequence)
+                reject(event, "candidate_or_trigger_mismatch")
+                return "rejected"
             if completed < 7:
                 used.append(_with_candidate_payload(
                     event,
@@ -499,21 +470,15 @@ def _scan_direction(
                 completed = max(completed, 7)
             retest_seen = True
             retest_index = event.index
-            continue
+            accept(event)
+            return "accepted"
 
-        if event_type == "DISPLACEMENT_CONFIRMED" and side == scenario_side:
-            if not confirmed_trigger_seen:
-                continue
+        if event_type == "DISPLACEMENT_CONFIRMED":
+            if completed < 7 or not confirmed_trigger_seen or not retest_seen:
+                return None
             if not _fvg_event_matches_candidate(event, expected_candidate_id, confirmed_trigger_id):
-                continue
-            if _fvg_created_before_confirmed(event, confirmed_trigger_index):
-                continue
-            if not retest_seen:
-                if _payload_value(event, "displacement_stage") == "bos_displacement":
-                    continue
-                return _finalize_candidate(_invalid_result(direction, "displacement_before_retest", used + [event]), anchor_event, candidate_sequence)
-            if _event_sort_key(event.index) <= _event_sort_key(retest_index):
-                return _finalize_candidate(_invalid_result(direction, "displacement_before_retest", used + [event]), anchor_event, candidate_sequence)
+                reject(event, "candidate_or_trigger_mismatch")
+                return "rejected"
             if completed < 8:
                 used.append(_with_candidate_payload(
                     event,
@@ -522,6 +487,241 @@ def _scan_direction(
                     confirmed_trigger_id=confirmed_trigger_id,
                 ))
                 completed = max(completed, 8)
+            accept(event)
+            return "accepted"
+
+        if event_type in ("RISK_VALID", "RISK_INVALID"):
+            if completed < 8:
+                return None
+            if event_type == "RISK_INVALID":
+                reason = _risk_invalid_reason(payload_to_dict(event.payload), risk_plan)
+                last_invalidated_component = reason
+                risk_reason = reason
+                reject(event, reason)
+                return "rejected"
+            used.append(_with_type(event, "RISK_VALID"))
+            completed = max(completed, 10)
+            risk_valid = True
+            risk_reason = _payload_reason(event, None)
+            accept(event)
+            return "accepted"
+
+        reject(event, "unsupported_pending_event")
+        return "rejected"
+
+    def drain_pending():
+        while True:
+            progressed = False
+            remaining = []
+            for pending_event in pending_observations:
+                outcome = accept_pending_event(pending_event)
+                if isinstance(outcome, ScenarioScanResult):
+                    return outcome
+                if outcome in ("accepted", "rejected"):
+                    progressed = True
+                    continue
+                remaining.append(pending_event)
+            pending_observations[:] = remaining
+            if not progressed:
+                return None
+
+    def finalize_with_diagnostics(result):
+        result.pending_observations = [_pending_observation(item, current_expected()) for item in pending_observations]
+        result.event_diagnostics = list(event_diagnostics)
+        return _finalize_candidate(result, anchor_event, candidate_sequence)
+
+    for event in events:
+        event_type = _normalize_event_type(event.event_type)
+        side = _normalize_side(event.direction)
+        if event_type == "INVALIDATION" and _event_applies(direction, event):
+            reason = _payload_reason(event, "invalidation")
+            diagnose(event, "scenario_invalidated", reason)
+            return finalize_with_diagnostics(_invalid_result(direction, reason, used))
+
+        if side not in (None, scenario_side, opposite_side, "neutral"):
+            continue
+
+        if event_type == "HTF_CONTEXT_CONFIRMED":
+            if side == "neutral":
+                diagnose(event, "scenario_invalidated", "htf_direction_conflict")
+                return finalize_with_diagnostics(_invalid_result(direction, "htf_direction_conflict", used))
+            if side == scenario_side and completed < 1:
+                used.append(event)
+                completed = max(completed, 1)
+                accept(event)
+            elif side == opposite_side:
+                diagnose(event, "scenario_invalidated", "htf_direction_conflict")
+                return finalize_with_diagnostics(_invalid_result(direction, "htf_direction_conflict", used))
+            continue
+
+        if completed == 0:
+            continue
+
+        if event_type == "PD_LOCATION_VALID":
+            if side in (None, scenario_side) and completed < 2:
+                used.append(event)
+                completed = max(completed, 2)
+                accept(event)
+            continue
+
+        if event_type == "POI_TOUCHED":
+            if side in (None, scenario_side) and completed < 2:
+                used.append(event)
+                completed = max(completed, 2)
+                accept(event)
+            continue
+
+        if event_type in ("SFP_CONFIRMED", "LIQUIDITY_SWEEP_CONFIRMED"):
+            if side == scenario_side and completed < 3:
+                used.append(_with_type(event, "SFP_CONFIRMED"))
+                completed = max(completed, 3)
+                sfp_index = event.index
+                accept(event)
+            continue
+
+        if event_type in ("EARLY_TRIGGER_CONFIRMED", "CHOCH_CONFIRMED", "BOS_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED") and side == scenario_side and completed < 3:
+            pend(event, "trigger_before_sfp")
+            continue
+
+        if event_type == "EARLY_TRIGGER_CONFIRMED" and side == opposite_side and completed >= 3:
+            opposite_trigger_event = event
+            continue
+
+        if event_type in ("CHOCH_CONFIRMED", "BOS_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED") and side == opposite_side and completed >= 3:
+            if not _event_candidate_matches(event, expected_candidate_id):
+                continue
+            opposite_trigger_event = event
+            if _is_confirmed_bos_event(event) and float(event.quality_score or 0.0) >= CONFIRMED_TRIGGER_MIN_QUALITY:
+                diagnose(event, "scenario_invalidated", "opposite_confirmed_bos")
+                return finalize_with_diagnostics(_invalid_result(
+                    direction,
+                    "opposite_confirmed_bos",
+                    used + [event],
+                    opposite_trigger_event=event,
+                    last_invalidated_component="opposite_confirmed_bos",
+                ))
+            rejected_confirmed_candidates.append(_rejected_confirmed_candidate(event, "opposite_structure_warning"))
+            continue
+
+        if event_type == "EARLY_TRIGGER_CONFIRMED" and side == scenario_side:
+            if completed < 4:
+                used.append(_with_candidate_payload(event, expected_candidate_id, anchor_index=anchor_index))
+                completed = max(completed, 4)
+                accept(event)
+            early_trigger_seen = True
+            early_trigger_index = event.index
+            continue
+
+        if event_type in ("CHOCH_CONFIRMED", "BOS_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED") and side == scenario_side:
+            if has_early_trigger_event and not early_trigger_seen:
+                rejected_confirmed_candidates.append(_rejected_confirmed_candidate(event, "before_early_trigger"))
+                pend(event, "confirmed_trigger_before_early")
+                continue
+            if has_early_trigger_event and float(event.quality_score or 0.0) < CONFIRMED_TRIGGER_MIN_QUALITY:
+                last_invalidated_component = "confirmed_trigger_quality_below_min"
+                rejected_confirmed_candidates.append(_rejected_confirmed_candidate(event, "quality_below_min"))
+                reject(event, "quality_below_min")
+                continue
+            if completed < 5:
+                used.append(_with_type(_with_candidate_payload(
+                    event,
+                    expected_candidate_id,
+                    anchor_index=anchor_index,
+                    early_trigger_index=early_trigger_index,
+                ), "CONFIRMED_TRIGGER_CONFIRMED"))
+                completed = max(completed, 5)
+                accept(event)
+            confirmed_trigger_seen = True
+            confirmed_trigger_index = event.index
+            confirmed_trigger_id = _event_id(event)
+            continue
+
+        if event_type == "FVG_CREATED" and side == scenario_side:
+            if not confirmed_trigger_seen:
+                pend(event, "fvg_before_confirmed_trigger")
+                continue
+            if _event_sort_key(event.index) <= _event_sort_key(confirmed_trigger_index):
+                pend(event, "fvg_before_confirmed_trigger")
+                continue
+            if not _fvg_event_matches_candidate(event, expected_candidate_id, confirmed_trigger_id):
+                reject(event, "candidate_or_trigger_mismatch")
+                continue
+            if _payload_bool(event, "historical_only") or _payload_bool(event, "is_reconstructed"):
+                reject(event, "historical_or_reconstructed_fvg")
+                continue
+            if _payload_bool(event, "invalidated"):
+                diagnose(event, "scenario_invalidated", "fvg_invalidated")
+                return finalize_with_diagnostics(_invalid_result(direction, "fvg_invalidated", used + [event]))
+            if completed < 6:
+                used.append(_with_candidate_payload(
+                    event,
+                    expected_candidate_id,
+                    anchor_index=anchor_index,
+                    confirmed_trigger_id=confirmed_trigger_id,
+                ))
+                completed = max(completed, 6)
+                accept(event)
+            fvg_seen = True
+            fvg_created_index = event.index
+            continue
+
+        if event_type == "FVG_RETESTED" and side == scenario_side:
+            if not confirmed_trigger_seen:
+                pend(event, "retest_before_confirmed_trigger")
+                continue
+            if not _fvg_event_matches_candidate(event, expected_candidate_id, confirmed_trigger_id):
+                reject(event, "candidate_or_trigger_mismatch")
+                continue
+            if _fvg_created_before_confirmed(event, confirmed_trigger_index):
+                pend(event, "retest_for_pending_fvg")
+                continue
+            if not fvg_seen:
+                pend(event, "retest_before_fvg")
+                continue
+            if _event_sort_key(event.index) <= _event_sort_key(fvg_created_index):
+                pend(event, "retest_before_fvg")
+                continue
+            if completed < 7:
+                used.append(_with_candidate_payload(
+                    event,
+                    expected_candidate_id,
+                    anchor_index=anchor_index,
+                    confirmed_trigger_id=confirmed_trigger_id,
+                ))
+                completed = max(completed, 7)
+                accept(event)
+            retest_seen = True
+            retest_index = event.index
+            continue
+
+        if event_type == "DISPLACEMENT_CONFIRMED" and side == scenario_side:
+            if not confirmed_trigger_seen:
+                pend(event, "displacement_before_confirmed_trigger")
+                continue
+            if not _fvg_event_matches_candidate(event, expected_candidate_id, confirmed_trigger_id):
+                reject(event, "candidate_or_trigger_mismatch")
+                continue
+            if _fvg_created_before_confirmed(event, confirmed_trigger_index):
+                pend(event, "displacement_for_pending_fvg")
+                continue
+            if not retest_seen:
+                if _payload_value(event, "displacement_stage") == "bos_displacement":
+                    diagnose(event, "event_pending", "bos_displacement_before_retest")
+                    continue
+                pend(event, "displacement_before_retest")
+                continue
+            if _event_sort_key(event.index) <= _event_sort_key(retest_index):
+                pend(event, "displacement_before_retest")
+                continue
+            if completed < 8:
+                used.append(_with_candidate_payload(
+                    event,
+                    expected_candidate_id,
+                    anchor_index=anchor_index,
+                    confirmed_trigger_id=confirmed_trigger_id,
+                ))
+                completed = max(completed, 8)
+                accept(event)
             continue
 
         if event_type in ("RISK_VALID", "RISK_INVALID"):
@@ -534,11 +734,17 @@ def _scan_direction(
                 continue
             risk_event_seen = True
             if completed < 8:
+                pend(event, "risk_before_scenario_complete")
                 continue
             used.append(_with_type(event, "RISK_VALID"))
             completed = max(completed, 10)
             risk_valid = True
             risk_reason = _payload_reason(event, None)
+            accept(event)
+
+    pending_invalid = drain_pending()
+    if pending_invalid is not None:
+        return finalize_with_diagnostics(pending_invalid)
 
     if risk_plan is not None and not risk_event_seen:
         if _get(risk_plan, "valid", False):
@@ -565,6 +771,8 @@ def _scan_direction(
         risk_valid=risk_valid,
         risk_reason=risk_reason,
         last_invalidated_component=last_invalidated_component,
+        pending_observations=[_pending_observation(item, current_expected()) for item in pending_observations],
+        event_diagnostics=event_diagnostics,
         opposite_trigger_event=opposite_trigger_event,
         confirmed_trigger_debug=_confirmed_trigger_debug(
             direction,
@@ -577,7 +785,15 @@ def _scan_direction(
         ),
     ), anchor_event, candidate_sequence)
     if completed >= len(FLOW):
-        return _finalize_candidate(_complete_result(direction, used, risk_valid=risk_valid, risk_reason=risk_reason), anchor_event, candidate_sequence)
+        complete = _complete_result(
+            direction,
+            used,
+            risk_valid=risk_valid,
+            risk_reason=risk_reason,
+            pending_observations=[_pending_observation(item, current_expected()) for item in pending_observations],
+            event_diagnostics=event_diagnostics,
+        )
+        return _finalize_candidate(complete, anchor_event, candidate_sequence)
     return _finalize_candidate(_partial_result(
         direction,
         "waiting_for_confirmation",
@@ -587,6 +803,8 @@ def _scan_direction(
         risk_reason=risk_reason,
         anchor_index=sfp_index,
         last_invalidated_component=last_invalidated_component,
+        pending_observations=[_pending_observation(item, current_expected()) for item in pending_observations],
+        event_diagnostics=event_diagnostics,
         opposite_trigger_event=opposite_trigger_event,
         confirmed_trigger_debug=_confirmed_trigger_debug(
             direction,
@@ -610,6 +828,8 @@ def _partial_result(
     risk_reason=None,
     anchor_index=None,
     last_invalidated_component=None,
+    pending_observations=None,
+    event_diagnostics=None,
     opposite_trigger_event=None,
     confirmed_trigger_debug=None,
 ) -> ScenarioScanResult:
@@ -641,6 +861,8 @@ def _partial_result(
         last_event_index=_last_index(used),
         risk_valid=risk_valid,
         risk_reason=risk_reason,
+        pending_observations=list(pending_observations or []),
+        event_diagnostics=list(event_diagnostics or []),
         trigger_scan=trigger_scan_extra or None,
     )
     return _apply_opposite_trigger_fields(result, opposite_trigger_event, candidate_invalidated=False)
@@ -975,6 +1197,8 @@ def _candidate_trigger_scan(result: ScenarioScanResult) -> dict:
         "waiting_for": waiting_for,
         "confirmed_trigger_debug": confirmed_trigger_debug,
         "pd_location_index": _string_index(_first_index(result.events_used, ("PD_LOCATION_VALID",))),
+        "pending_observations": list(result.pending_observations or []),
+        "event_diagnostics": list(result.event_diagnostics or []),
     }
     if result.opposite_trigger_detected:
         scan.update({
@@ -1202,7 +1426,7 @@ def _candidate_summary(candidate):
     return data
 
 
-def _complete_result(direction, used, *, risk_valid=False, risk_reason=None):
+def _complete_result(direction, used, *, risk_valid=False, risk_reason=None, pending_observations=None, event_diagnostics=None):
     return ScenarioScanResult(
         direction=direction,
         status="complete",
@@ -1220,7 +1444,39 @@ def _complete_result(direction, used, *, risk_valid=False, risk_reason=None):
         last_event_index=_last_index(used),
         risk_valid=risk_valid,
         risk_reason=risk_reason,
+        pending_observations=list(pending_observations or []),
+        event_diagnostics=list(event_diagnostics or []),
     )
+
+
+def _event_diagnostic(event, status, reason, current_expected):
+    payload = payload_to_dict(event.payload)
+    return {
+        "event_type": _normalize_event_type(event.event_type),
+        "direction": event.direction,
+        "index": _string_index(event.index),
+        "quality_score": event.quality_score,
+        "status": status,
+        "reason": reason,
+        "current_expected_step": current_expected,
+        "candidate_id": payload.get("candidate_id") or payload.get("source_candidate_id"),
+        "source_confirmed_trigger_id": payload.get("source_confirmed_trigger_id"),
+    }
+
+
+def _pending_observation(event, current_expected):
+    payload = payload_to_dict(event.payload)
+    return {
+        "event_type": _normalize_event_type(event.event_type),
+        "direction": event.direction,
+        "index": _string_index(event.index),
+        "quality_score": event.quality_score,
+        "source": event.source,
+        "current_expected_step": current_expected,
+        "candidate_id": payload.get("candidate_id") or payload.get("source_candidate_id"),
+        "source_confirmed_trigger_id": payload.get("source_confirmed_trigger_id"),
+        "reason": payload.get("reason"),
+    }
 
 
 def _invalid_result(

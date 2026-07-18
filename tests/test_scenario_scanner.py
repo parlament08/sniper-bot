@@ -46,7 +46,7 @@ class ScenarioScannerTest(unittest.TestCase):
         self.assertTrue(output.scenario_valid)
         self.assertTrue(output.signal_allowed)
 
-    def test_fvg_before_confirmed_bos_is_not_counted(self):
+    def test_fvg_before_confirmed_bos_is_replayed_from_pending(self):
         output = scan_scenarios(
             events=[
                 event("HTF_CONTEXT_CONFIRMED", index=1),
@@ -65,8 +65,26 @@ class ScenarioScannerTest(unittest.TestCase):
         )
 
         scenario = output.selected_scenario
-        self.assertEqual(scenario.next_expected_step, "FVG_CREATED")
-        self.assertFalse(output.signal_allowed)
+        self.assertEqual(scenario.status, "complete")
+        self.assertTrue(output.signal_allowed)
+        self.assertEqual(
+            [item.event_type for item in scenario.events_used],
+            [
+                "HTF_CONTEXT_CONFIRMED",
+                "POI_TOUCHED",
+                "SFP_CONFIRMED",
+                "EARLY_TRIGGER_CONFIRMED",
+                "CONFIRMED_TRIGGER_CONFIRMED",
+                "FVG_CREATED",
+                "FVG_RETESTED",
+                "DISPLACEMENT_CONFIRMED",
+                "RISK_VALID",
+            ],
+        )
+        statuses = [item["status"] for item in scenario.event_diagnostics if item["event_type"] == "FVG_CREATED"]
+        self.assertIn("event_observed_early", statuses)
+        self.assertIn("event_pending", statuses)
+        self.assertIn("event_accepted", statuses)
 
     def test_fvg_from_other_candidate_or_trigger_is_ignored(self):
         output = scan_scenarios(
@@ -197,7 +215,7 @@ class ScenarioScannerTest(unittest.TestCase):
         self.assertFalse(scenario.signal_allowed)
         self.assertFalse(scenario.scenario_valid)
 
-    def test_confirmed_trigger_before_early_does_not_complete_trigger_step(self):
+    def test_confirmed_trigger_before_early_is_replayed_from_pending(self):
         output = scan_scenarios(
             events=[
                 event("HTF_CONTEXT_CONFIRMED", index=1),
@@ -213,11 +231,15 @@ class ScenarioScannerTest(unittest.TestCase):
 
         scenario = output.selected_scenario
         self.assertEqual(scenario.status, "waiting_for_confirmation")
-        self.assertEqual(scenario.current_step, "early_trigger_confirmed")
-        self.assertEqual(scenario.next_expected_step, "CONFIRMED_TRIGGER_CONFIRMED")
-        self.assertEqual(scenario.completed_steps, 4)
-        self.assertEqual(scenario.last_invalidated_component, "confirmed_trigger_before_early")
-        self.assertEqual(scenario.waiting_for, "confirmed bullish BOS after early CHOCH")
+        self.assertEqual(scenario.current_step, "confirmed_trigger_confirmed")
+        self.assertEqual(scenario.next_expected_step, "FVG_CREATED")
+        self.assertEqual(scenario.completed_steps, 5)
+        self.assertIsNone(scenario.last_invalidated_component)
+        self.assertEqual(scenario.waiting_for, "bullish FVG after confirmed BOS")
+        statuses = [item["status"] for item in scenario.event_diagnostics if item["event_type"] == "CONFIRMED_TRIGGER_CONFIRMED"]
+        self.assertIn("event_observed_early", statuses)
+        self.assertIn("event_pending", statuses)
+        self.assertIn("event_accepted", statuses)
 
     def test_waiting_for_liquidity_sweep_uses_human_text_but_stable_reason(self):
         output = scan_scenarios(
@@ -538,7 +560,7 @@ class ScenarioScannerTest(unittest.TestCase):
         self.assertNotIn(2, [item.index for item in output.best_long_scenario.events_used])
         self.assertFalse(output.signal_allowed)
 
-    def test_fvg_before_bos_is_ignored_until_branch_has_bos(self):
+    def test_fvg_before_bos_is_accepted_after_branch_has_bos(self):
         output = scan_scenarios(
             events=[
                 event("HTF_CONTEXT_CONFIRMED", index=1),
@@ -554,8 +576,38 @@ class ScenarioScannerTest(unittest.TestCase):
 
         self.assertEqual(output.best_long_scenario.status, "waiting_for_confirmation")
         self.assertIsNone(output.best_long_scenario.invalidated_reason)
-        self.assertEqual(output.best_long_scenario.current_step, "confirmed_trigger_confirmed")
-        self.assertEqual(output.best_long_scenario.waiting_for, "bullish FVG after confirmed BOS")
+        self.assertEqual(output.best_long_scenario.current_step, "fvg_created")
+        self.assertEqual(output.best_long_scenario.next_expected_step, "FVG_RETESTED")
+        self.assertEqual(output.best_long_scenario.waiting_for, "bullish FVG retest")
+        statuses = [item["status"] for item in output.best_long_scenario.event_diagnostics if item["event_type"] == "FVG_CREATED"]
+        self.assertIn("event_observed_early", statuses)
+        self.assertIn("event_accepted", statuses)
+
+    def test_inj_regression_long_candidate_early_fvg_later_structure_confirmation(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index="2026-07-17 20:00", payload={"symbol": "INJUSDT"}),
+                event("POI_TOUCHED", index="2026-07-17 20:15", payload={"zone": "discount", "range_low": 10.0, "range_high": 12.0}),
+                event("SFP_CONFIRMED", index="2026-07-17 20:30", payload={"symbol": "INJUSDT"}),
+                event("FVG_CREATED", index="2026-07-17 20:45", payload={"created_index": "2026-07-17 20:45"}),
+                event("EARLY_TRIGGER_CONFIRMED", index="2026-07-17 21:00", quality=82),
+                event("BOS_CONFIRMED", index="2026-07-17 21:15", quality=91, payload={"type": "bullish_bos"}),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+            premium_discount={"valid_for_buy": True},
+        )
+
+        scenario = output.selected_scenario
+        self.assertIsNotNone(scenario)
+        self.assertEqual(scenario.direction, "LONG")
+        self.assertEqual(scenario.status, "waiting_for_confirmation")
+        self.assertIsNone(scenario.invalidated_reason)
+        self.assertEqual(scenario.current_step, "fvg_created")
+        self.assertEqual(scenario.next_expected_step, "FVG_RETESTED")
+        self.assertIn("FVG_CREATED", [item.event_type for item in scenario.events_used])
+        statuses = [item["status"] for item in scenario.event_diagnostics if item["event_type"] == "FVG_CREATED"]
+        self.assertEqual(statuses, ["event_observed_early", "event_pending", "event_accepted"])
 
     def test_poi_candidate_with_pseudo_index_ignores_unbranched_invalid_fvg(self):
         output = scan_scenarios(
@@ -575,7 +627,7 @@ class ScenarioScannerTest(unittest.TestCase):
         self.assertEqual(scenario.completed_steps, 2)
         self.assertEqual(scenario.waiting_for, "liquidity sweep / SFP")
 
-    def test_displacement_before_retest_invalidates_only_that_candidate(self):
+    def test_displacement_before_retest_stays_pending_without_invalidating_candidate(self):
         output = scan_scenarios(
             events=[
                 event("HTF_CONTEXT_CONFIRMED", index=1),
@@ -590,8 +642,14 @@ class ScenarioScannerTest(unittest.TestCase):
             premium_discount={"valid_for_buy": True},
         )
 
-        self.assertEqual(output.best_long_scenario.status, "invalidated")
-        self.assertEqual(output.best_long_scenario.invalidated_reason, "displacement_before_retest")
+        scenario = output.best_long_scenario
+        self.assertEqual(scenario.status, "waiting_for_confirmation")
+        self.assertIsNone(scenario.invalidated_reason)
+        self.assertEqual(scenario.next_expected_step, "FVG_RETESTED")
+        pending_types = [item["event_type"] for item in scenario.pending_observations]
+        self.assertIn("DISPLACEMENT_CONFIRMED", pending_types)
+        statuses = [item["status"] for item in scenario.event_diagnostics if item["event_type"] == "DISPLACEMENT_CONFIRMED"]
+        self.assertIn("event_pending", statuses)
 
     def test_opposite_bos_after_sfp_invalidates_only_that_candidate(self):
         output = scan_scenarios(
