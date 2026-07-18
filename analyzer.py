@@ -57,6 +57,9 @@ SEND_DIAGNOSTIC_OUTSIDE_KZ = os.environ.get("SEND_DIAGNOSTIC_OUTSIDE_KZ", "false
 SEND_A_PLUS_OUTSIDE_KZ = os.environ.get("SEND_A_PLUS_OUTSIDE_KZ", "true").lower() == "true"
 TELEGRAM_REPORT_DETAIL = os.environ.get("TELEGRAM_REPORT_DETAIL", "compact").lower()
 SCAN_JOURNAL_ENABLED = os.environ.get("SCAN_JOURNAL_ENABLED", "true").lower() == "true"
+ENABLE_SCENARIO_RESEARCH_TRACE = os.environ.get("ENABLE_SCENARIO_RESEARCH_TRACE", "false").lower() == "true"
+SCENARIO_RESEARCH_TRACE_MAX_FVGS = int(os.environ.get("SCENARIO_RESEARCH_TRACE_MAX_FVGS", "12"))
+SCENARIO_RESEARCH_TRACE_MAX_CANDLES = int(os.environ.get("SCENARIO_RESEARCH_TRACE_MAX_CANDLES", "64"))
 APP_VERSION = os.environ.get("APP_VERSION", "v1.0.0-rc2")
 GIT_COMMIT = os.environ.get("GIT_COMMIT")
 BUILD_TIME = os.environ.get("BUILD_TIME") or pd.Timestamp.now(tz=DEFAULT_TIMEZONE).isoformat()
@@ -593,6 +596,321 @@ def _trigger_scan_snapshot(trigger_scan):
     }
 
 
+def _object_field(value, field, default=None):
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        return value.get(field, default)
+    return getattr(value, field, default)
+
+
+def _json_safe(value):
+    if hasattr(value, "to_dict"):
+        value = value.to_dict()
+    elif hasattr(value, "_asdict"):
+        value = value._asdict()
+    elif hasattr(value, "__dict__") and not isinstance(value, type):
+        value = vars(value)
+    return _json_state_value(value)
+
+
+def _fvg_diagnostic_id(fvg):
+    if not fvg:
+        return None
+    fvg_type = fvg.get("type") or fvg.get("direction")
+    created = fvg.get("end_index") or fvg.get("created_index")
+    top = fvg.get("top")
+    bottom = fvg.get("bottom")
+    raw = f"{fvg_type}:{created}:{top}:{bottom}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _fvg_diagnostic_snapshot(fvg):
+    if not fvg:
+        return None
+    data = _json_safe(fvg) if not isinstance(fvg, dict) else _json_safe(dict(fvg))
+    if not isinstance(data, dict):
+        return None
+    top = _safe_float(data.get("top"))
+    bottom = _safe_float(data.get("bottom"))
+    gap_size = round(top - bottom, 10) if top is not None and bottom is not None else None
+    invalidated = bool(data.get("invalidated"))
+    return {
+        "fvg_id": data.get("fvg_id") or _fvg_diagnostic_id(data),
+        "direction": data.get("direction") or data.get("type"),
+        "created_at": data.get("created_at") or data.get("end_index") or data.get("created_index"),
+        "created_index": data.get("created_index") or data.get("end_index"),
+        "left_index": data.get("start_index"),
+        "middle_index": data.get("middle_index"),
+        "right_index": data.get("right_index") or data.get("end_index"),
+        "lower": bottom,
+        "upper": top,
+        "gap_size": gap_size,
+        "gap_size_atr": data.get("gap_size_atr") if data.get("gap_size_atr") is not None else data.get("size_atr_ratio"),
+        "quality_score": data.get("quality_score"),
+        "detected": data.get("detected"),
+        "valid": data.get("valid") if data.get("valid") is not None else bool(data.get("detected") and not invalidated),
+        "invalidated": invalidated,
+        "invalidation_reason": data.get("invalidation_reason"),
+        "invalidated_at": data.get("invalidated_at"),
+        "invalidation_candle_index": data.get("invalidation_candle_index") or data.get("invalidated_at"),
+        "invalidation_price": data.get("invalidation_price"),
+        "invalidation_boundary": data.get("invalidation_boundary"),
+        "invalidation_operator": data.get("invalidation_operator"),
+        "filled_percentage": data.get("filled_percentage") if data.get("filled_percentage") is not None else data.get("overlap_percent"),
+        "historical_only": data.get("historical_only"),
+        "is_reconstructed": data.get("is_reconstructed"),
+        "source_confirmed_trigger_id": data.get("source_confirmed_trigger_id"),
+        "source_confirmed_trigger_index": data.get("source_confirmed_trigger_index") or data.get("confirmed_trigger_index"),
+        "candidate_id": data.get("candidate_id") or data.get("source_candidate_id"),
+    }
+
+
+def _selected_scenario_for_trace(analysis_data):
+    scenario_scan = (analysis_data or {}).get("scenario_scan")
+    return getattr(scenario_scan, "selected_scenario", None)
+
+
+def _selected_scenario_direction(selected, analysis_data=None):
+    direction = _object_field(selected, "direction")
+    if direction:
+        normalized = str(direction).lower()
+        if normalized == "long":
+            return "bullish"
+        if normalized == "short":
+            return "bearish"
+        return direction
+    scenario_scan = (analysis_data or {}).get("scenario_scan")
+    direction = getattr(scenario_scan, "selected_direction", None) or (analysis_data or {}).get("direction")
+    normalized = str(direction).lower() if direction is not None else None
+    if normalized == "long":
+        return "bullish"
+    if normalized == "short":
+        return "bearish"
+    return direction
+
+
+def _scenario_event_payload_by_type(selected, event_type):
+    for event in _object_field(selected, "events_used", []) or []:
+        if _scenario_event_field(event, "event_type") != event_type:
+            continue
+        payload = _scenario_event_payload(event)
+        if payload:
+            return payload
+        return {
+            "index": _scenario_event_field(event, "index"),
+            "event_id": _scenario_event_field(event, "event_id"),
+        }
+    return None
+
+
+def _scenario_confirmed_trigger(selected):
+    trigger_scan = _object_field(selected, "trigger_scan", {}) or {}
+    trigger = trigger_scan.get("confirmed_trigger") if isinstance(trigger_scan, dict) else None
+    return trigger or _scenario_event_payload_by_type(selected, "CONFIRMED_TRIGGER_CONFIRMED")
+
+
+def _scenario_early_trigger(selected):
+    trigger_scan = _object_field(selected, "trigger_scan", {}) or {}
+    trigger = trigger_scan.get("early_trigger") if isinstance(trigger_scan, dict) else None
+    return trigger or _scenario_event_payload_by_type(selected, "EARLY_TRIGGER_CONFIRMED")
+
+
+def _normalized_invalidation_reason(reason):
+    if reason in {"opposite_confirmed_bos", "opposite_confirmed_choch"}:
+        return "opposite_confirmed_trigger"
+    return reason
+
+
+def _trigger_research_diagnostics(selected, analysis_data):
+    if not selected:
+        return None
+    trigger = _scenario_confirmed_trigger(selected)
+    trigger_type = trigger.get("type") if isinstance(trigger, dict) else None
+    trigger_direction = _event_direction(trigger) if trigger else None
+    scenario_direction = _selected_scenario_direction(selected, analysis_data)
+    return {
+        "scenario_direction": scenario_direction,
+        "trigger_direction": trigger_direction,
+        "same_direction": None if not trigger_direction or not scenario_direction else trigger_direction == scenario_direction,
+        "candidate_invalidated_reason": _object_field(selected, "invalidated_reason"),
+        "candidate_invalidated_reason_normalized": _normalized_invalidation_reason(_object_field(selected, "invalidated_reason")),
+        "last_invalidated_component": _object_field(selected, "last_invalidated_component"),
+        "opposite_trigger_invalidation": _normalized_invalidation_reason(_object_field(selected, "invalidated_reason")) == "opposite_confirmed_trigger",
+        "confirmed_trigger": {
+            "trigger_id": _structure_event_id(trigger) if trigger else None,
+            "type": trigger_type,
+            "direction": trigger_direction,
+            "timestamp": str(trigger.get("index")) if isinstance(trigger, dict) and trigger.get("index") is not None else None,
+            "index": str(trigger.get("index")) if isinstance(trigger, dict) and trigger.get("index") is not None else None,
+            "quality_score": trigger.get("quality_score") if isinstance(trigger, dict) else None,
+            "body_ratio": trigger.get("body_ratio") if isinstance(trigger, dict) else None,
+            "displacement_ratio": trigger.get("displacement_ratio") if isinstance(trigger, dict) else None,
+            "close_position": trigger.get("close_position") if isinstance(trigger, dict) else None,
+            "rvol": trigger.get("rvol") if isinstance(trigger, dict) else None,
+            "opposite_wick_ratio": trigger.get("opposite_wick_ratio") if isinstance(trigger, dict) else None,
+            "hold_confirmed": trigger.get("hold_confirmed") if isinstance(trigger, dict) else None,
+            "failed_conditions": trigger.get("failed_conditions") if isinstance(trigger, dict) else None,
+        },
+    }
+
+
+def _research_candles_for_candidate(df_15m_closed, selected_candidate, max_candles=None):
+    if df_15m_closed is None or df_15m_closed.empty or not selected_candidate:
+        return []
+    early = _scenario_early_trigger(selected_candidate)
+    if not early or early.get("index") is None:
+        return []
+    max_candles = max_candles or SCENARIO_RESEARCH_TRACE_MAX_CANDLES
+    confirmed = _scenario_confirmed_trigger(selected_candidate)
+    early_key = _event_sort_key(early.get("index"))
+    confirmed_key = _event_sort_key(confirmed.get("index")) if confirmed and confirmed.get("index") is not None else None
+    positions = list(range(len(df_15m_closed.index)))
+    early_pos = min(positions, key=lambda pos: abs(_event_sort_key(df_15m_closed.index[pos]) - early_key))
+    if confirmed_key is not None:
+        confirmed_pos = min(positions, key=lambda pos: abs(_event_sort_key(df_15m_closed.index[pos]) - confirmed_key))
+        start = max(0, early_pos - 10)
+        end = min(len(df_15m_closed), confirmed_pos + 21)
+    else:
+        start = max(0, early_pos - 10)
+        end = min(len(df_15m_closed), early_pos + 21)
+    if end - start > max_candles:
+        end = start + max_candles
+    candles = []
+    for index_position, (idx, row) in enumerate(df_15m_closed.iloc[start:end].iterrows(), start=start):
+        candles.append({
+            "timestamp": str(idx),
+            "open": _safe_float(row.get("open")),
+            "high": _safe_float(row.get("high")),
+            "low": _safe_float(row.get("low")),
+            "close": _safe_float(row.get("close")),
+            "volume": _safe_float(row.get("volume")),
+            "atr": _safe_float(row.get("atr")),
+            "rvol": _safe_float(row.get("rvol")),
+            "closed": True,
+            "index": str(idx),
+            "position": index_position,
+        })
+    return candles
+
+
+def _scenario_lifecycle_events(selected, analysis_time, selected_fvg=None):
+    if not selected:
+        return []
+    candidate_id = _object_field(selected, "candidate_id")
+    events = []
+    previous_stage = None
+    type_map = {
+        "HTF_CONTEXT_CONFIRMED": "candidate_created",
+        "SFP_CONFIRMED": "sfp_confirmed",
+        "LIQUIDITY_SWEEP_CONFIRMED": "sfp_confirmed",
+        "EARLY_TRIGGER_CONFIRMED": "early_trigger_confirmed",
+        "CONFIRMED_TRIGGER_CONFIRMED": "confirmed_trigger_confirmed",
+        "FVG_CREATED": "fvg_detected",
+        "FVG_RETESTED": "fvg_matched",
+        "RISK_VALID": "risk_plan_created",
+    }
+    for event in _object_field(selected, "events_used", []) or []:
+        event_type = _scenario_event_field(event, "event_type")
+        mapped_type = type_map.get(event_type, str(event_type).lower() if event_type else None)
+        payload = _scenario_event_payload(event)
+        events.append({
+            "candidate_id": candidate_id,
+            "event_type": mapped_type,
+            "event_time": str(_scenario_event_field(event, "index")) if _scenario_event_field(event, "index") is not None else None,
+            "analysis_time": str(analysis_time) if analysis_time is not None else None,
+            "previous_stage": previous_stage,
+            "new_stage": event_type,
+            "reason": payload.get("reason"),
+            "related_trigger_id": payload.get("event_id") or _structure_event_id(payload),
+            "related_fvg_id": None,
+        })
+        previous_stage = event_type
+    if selected_fvg and selected_fvg.get("invalidated"):
+        events.append({
+            "candidate_id": candidate_id,
+            "event_type": "fvg_invalidated",
+            "event_time": selected_fvg.get("invalidated_at") or selected_fvg.get("invalidation_candle_index"),
+            "analysis_time": str(analysis_time) if analysis_time is not None else None,
+            "previous_stage": previous_stage,
+            "new_stage": previous_stage,
+            "reason": selected_fvg.get("invalidation_reason") or "fvg_invalidated",
+            "related_trigger_id": None,
+            "related_fvg_id": selected_fvg.get("fvg_id"),
+        })
+    if _object_field(selected, "status") == "invalidated":
+        events.append({
+            "candidate_id": candidate_id,
+            "event_type": "candidate_invalidated",
+            "event_time": str(_object_field(selected, "last_event_index")) if _object_field(selected, "last_event_index") is not None else None,
+            "analysis_time": str(analysis_time) if analysis_time is not None else None,
+            "previous_stage": previous_stage,
+            "new_stage": "INVALIDATED",
+            "reason": _object_field(selected, "invalidated_reason"),
+            "related_trigger_id": None,
+            "related_fvg_id": selected_fvg.get("fvg_id") if selected_fvg else None,
+        })
+    return events
+
+
+def _build_scenario_research_trace(symbol, timestamp, score_result, analysis_data):
+    selected = _selected_scenario_for_trace(analysis_data)
+    if not selected:
+        return None
+    stage = _object_field(selected, "current_step") or _object_field(selected, "status")
+    events = _object_field(selected, "events_used", []) or []
+    stage_names = {_scenario_event_field(event, "event_type") for event in events}
+    if "SFP_CONFIRMED" not in stage_names and "LIQUIDITY_SWEEP_CONFIRMED" not in stage_names and "EARLY_TRIGGER_CONFIRMED" not in stage_names:
+        return None
+
+    candidate_id = _object_field(selected, "candidate_id")
+    direction = _selected_scenario_direction(selected, analysis_data)
+    confirmed_trigger = _scenario_confirmed_trigger(selected)
+    confirmed_trigger_index = _event_sort_key(confirmed_trigger.get("index")) if confirmed_trigger and confirmed_trigger.get("index") is not None else None
+    confirmed_trigger_id = _structure_event_id(confirmed_trigger) if confirmed_trigger else None
+    fvg_candidates = list((analysis_data or {}).get("fvg_candidates") or [])[:SCENARIO_RESEARCH_TRACE_MAX_FVGS]
+    candidate_fvgs = [_fvg_diagnostic_snapshot(fvg) for fvg in fvg_candidates]
+    candidate_fvgs = [item for item in candidate_fvgs if item]
+    selected_fvg = _fvg_diagnostic_snapshot((analysis_data or {}).get("active_fvg"))
+    match_trace = []
+    for raw_fvg, snapshot in zip(fvg_candidates, candidate_fvgs):
+        diagnostics = _fvg_matches_state_machine_scenario(
+            raw_fvg,
+            direction,
+            expected_candidate_id=candidate_id,
+            confirmed_trigger_index=confirmed_trigger_index,
+            confirmed_trigger_id=confirmed_trigger_id,
+            return_diagnostics=True,
+        )
+        match_trace.append({
+            "fvg_id": snapshot.get("fvg_id"),
+            **diagnostics["checks"],
+            "rejection_reasons": diagnostics["rejection_reasons"],
+        })
+    candle_trace = list((analysis_data or {}).get("research_15m_candles") or [])[:SCENARIO_RESEARCH_TRACE_MAX_CANDLES]
+    return {
+        "enabled": True,
+        "symbol": symbol,
+        "analysis_time": str(timestamp) if timestamp is not None else None,
+        "candidate_id": candidate_id,
+        "candidate_stage": stage,
+        "fvg_diagnostics": {
+            "candidates": candidate_fvgs,
+            "selected_fvg": selected_fvg,
+            "candidate_fvg_created": any(item.get("accepted") for item in match_trace),
+            "candidate_fvg_retested": bool(selected_fvg and selected_fvg.get("filled_percentage")),
+        },
+        "fvg_match_trace": match_trace,
+        "trigger_diagnostics": _trigger_research_diagnostics(selected, analysis_data),
+        "lifecycle_events": _scenario_lifecycle_events(selected, timestamp, selected_fvg),
+        "candle_trace": {
+            "candles": candle_trace,
+            "count": len(candle_trace),
+            "truncated": len((analysis_data or {}).get("research_15m_candles") or []) > SCENARIO_RESEARCH_TRACE_MAX_CANDLES,
+        },
+    }
+
+
 def _scenario_scan_snapshot(scenario_output):
     if not scenario_output:
         return None
@@ -881,7 +1199,7 @@ def _build_scan_journal_record(run_id, timestamp, symbol, session, score_result,
         "A+" if shadow_candidate and production_a_plus_allowed is True else shadow_candidate.get('shadow_tier')
     )
 
-    return {
+    record = {
         **_build_metadata(),
         'record_type': 'symbol_scan',
         'run_id': run_id,
@@ -972,6 +1290,11 @@ def _build_scan_journal_record(run_id, timestamp, symbol, session, score_result,
         'breakdown': score_result.get('breakdown', {}),
         'macro': macro,
     }
+    if ENABLE_SCENARIO_RESEARCH_TRACE:
+        trace = _build_scenario_research_trace(symbol, timestamp, score_result, analysis_data)
+        if trace:
+            record["scenario_research_trace"] = trace
+    return record
 
 
 def _scenario_transition_state(candidate):
@@ -3185,31 +3508,76 @@ def _fvg_matches_state_machine_scenario(
     expected_candidate_id=None,
     confirmed_trigger_index,
     confirmed_trigger_id,
+    return_diagnostics=False,
 ):
-    if not fvg_result or confirmed_trigger_index is None:
-        return False
-    if fvg_result.get('direction') not in (None, state_direction):
-        return False
+    checks = {
+        "same_direction": False,
+        "after_confirmed_trigger": False,
+        "candidate_id_match": None,
+        "source_trigger_id_match": None,
+        "source_trigger_index_match": None,
+        "historical_allowed": False,
+        "reconstructed_allowed": False,
+        "not_invalidated": False,
+        "accepted": False,
+    }
+    rejection_reasons = []
+
+    if not fvg_result:
+        rejection_reasons.append("missing_fvg")
+        result = {"matched": False, "checks": checks, "rejection_reasons": rejection_reasons}
+        return result if return_diagnostics else False
+
+    direction_value = fvg_result.get('direction')
     fvg_type = fvg_result.get('type')
-    if fvg_type is not None and fvg_type != state_direction:
-        return False
-    if fvg_result.get('invalidated', False):
-        return False
-    if fvg_result.get('historical_only', False) or fvg_result.get('is_reconstructed', False):
-        return False
+    checks["same_direction"] = direction_value in (None, state_direction) and fvg_type in (None, state_direction)
+    if not checks["same_direction"]:
+        rejection_reasons.append("direction_mismatch")
+
+    checks["not_invalidated"] = not bool(fvg_result.get('invalidated', False))
+    if not checks["not_invalidated"]:
+        rejection_reasons.append(fvg_result.get("invalidation_reason") or "fvg_invalidated")
+
+    checks["historical_allowed"] = not bool(fvg_result.get('historical_only', False))
+    if not checks["historical_allowed"]:
+        rejection_reasons.append("historical_only")
+
+    checks["reconstructed_allowed"] = not bool(fvg_result.get('is_reconstructed', False))
+    if not checks["reconstructed_allowed"]:
+        rejection_reasons.append("is_reconstructed")
+
     created_index = fvg_result.get('end_index') or fvg_result.get('created_index')
-    if created_index is None or _event_sort_key(created_index) <= confirmed_trigger_index:
-        return False
+    if confirmed_trigger_index is None:
+        rejection_reasons.append("missing_confirmed_trigger")
+    else:
+        checks["after_confirmed_trigger"] = created_index is not None and _event_sort_key(created_index) > confirmed_trigger_index
+        if not checks["after_confirmed_trigger"]:
+            rejection_reasons.append("created_before_or_at_confirmed_trigger")
+
     source_trigger_id = fvg_result.get('source_confirmed_trigger_id')
     if source_trigger_id is not None and confirmed_trigger_id is not None and str(source_trigger_id) != str(confirmed_trigger_id):
-        return False
+        checks["source_trigger_id_match"] = False
+        rejection_reasons.append("source_trigger_id_mismatch")
+    elif source_trigger_id is not None and confirmed_trigger_id is not None:
+        checks["source_trigger_id_match"] = True
+
     source_candidate_id = fvg_result.get('source_candidate_id') or fvg_result.get('candidate_id')
     if expected_candidate_id is not None and source_candidate_id is not None and str(source_candidate_id) != str(expected_candidate_id):
-        return False
+        checks["candidate_id_match"] = False
+        rejection_reasons.append("candidate_id_mismatch")
+    elif expected_candidate_id is not None and source_candidate_id is not None:
+        checks["candidate_id_match"] = True
+
     source_trigger_index = fvg_result.get('source_confirmed_trigger_index') or fvg_result.get('confirmed_trigger_index')
     if source_trigger_index is not None and _event_sort_key(source_trigger_index) != confirmed_trigger_index:
-        return False
-    return True
+        checks["source_trigger_index_match"] = False
+        rejection_reasons.append("source_trigger_index_mismatch")
+    elif source_trigger_index is not None:
+        checks["source_trigger_index_match"] = True
+
+    checks["accepted"] = not rejection_reasons
+    result = {"matched": checks["accepted"], "checks": checks, "rejection_reasons": rejection_reasons}
+    return result if return_diagnostics else checks["accepted"]
 
 
 def _state_machine_diagnostic(
@@ -3979,6 +4347,12 @@ def analyze_symbol_snapshot(
         "atr": float(last_closed_15m.get('atr', 0.0)),
         "analysis_time": analysis_time,
     }
+    if ENABLE_SCENARIO_RESEARCH_TRACE:
+        analysis_data["research_15m_candles"] = _research_candles_for_candidate(
+            df_15m_closed,
+            scenario_scan.selected_scenario,
+            max_candles=SCENARIO_RESEARCH_TRACE_MAX_CANDLES,
+        )
     analysis_data["shadow_candidate"] = _build_shadow_candidate(
         symbol=coin,
         htf_context=htf_context,

@@ -248,6 +248,11 @@ class FVGResult:
     close_invalidated: bool = False
     absorption_warning: bool = False
     absorption_score: float = 0.0
+    invalidation_reason: Optional[str] = None
+    invalidated_at: Any = None
+    invalidation_price: Optional[float] = None
+    invalidation_boundary: Optional[float] = None
+    invalidation_operator: Optional[str] = None
 
     def __bool__(self) -> bool:
         return self.detected and not self.invalidated
@@ -527,7 +532,8 @@ def find_fvg(
             retest_depth = max(0.0, min((top - deepest_price) / fvg_size, 1.0))
             overlap_percent = round(retest_depth * 100)
             wick_violated = bool((future_candles['low'] <= bottom).any())
-            close_invalidated = bool((future_candles['close'] < bottom).any())
+            close_invalidations = future_candles[future_candles['close'] < bottom]
+            close_invalidated = bool(not close_invalidations.empty)
             invalidated = close_invalidated
             retest_count = _count_retests(touch_mask)
         else:
@@ -537,7 +543,8 @@ def find_fvg(
             retest_depth = max(0.0, min((deepest_price - bottom) / fvg_size, 1.0))
             overlap_percent = round(retest_depth * 100)
             wick_violated = bool((future_candles['high'] >= top).any())
-            close_invalidated = bool((future_candles['close'] > top).any())
+            close_invalidations = future_candles[future_candles['close'] > top]
+            close_invalidated = bool(not close_invalidations.empty)
             invalidated = close_invalidated
             retest_count = _count_retests(touch_mask)
 
@@ -565,6 +572,22 @@ def find_fvg(
         if close_invalidated:
             quality_score = config.invalid_quality_score
             invalidated = True
+        invalidation_reason = None
+        invalidated_at = None
+        invalidation_price = None
+        invalidation_boundary = None
+        invalidation_operator = None
+        if close_invalidated and not future_candles.empty:
+            invalidation_reason = "price_closed_through_fvg"
+            invalidation_row = close_invalidations.iloc[0]
+            invalidated_at = close_invalidations.index[0]
+            invalidation_price = _safe_float(invalidation_row.get('close'))
+            if fvg_type == 'bullish':
+                invalidation_boundary = bottom
+                invalidation_operator = "close < bottom"
+            else:
+                invalidation_boundary = top
+                invalidation_operator = "close > top"
 
         return FVGResult(
             detected=True,
@@ -588,6 +611,11 @@ def find_fvg(
             close_invalidated=close_invalidated,
             absorption_warning=displacement.absorption_warning,
             absorption_score=displacement.absorption_score,
+            invalidation_reason=invalidation_reason,
+            invalidated_at=invalidated_at,
+            invalidation_price=invalidation_price,
+            invalidation_boundary=invalidation_boundary,
+            invalidation_operator=invalidation_operator,
         )
     
     is_bullish_fvg = (df['low'] > df['high'].shift(2))
