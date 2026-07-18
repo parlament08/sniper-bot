@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import json
 from dataclasses import asdict, is_dataclass
 from typing import Any, Callable, Mapping, Optional
@@ -61,6 +62,7 @@ def compare_scan_paths(
     analysis_time: Any,
     runtime_state: Optional[Mapping[str, Any]] = None,
     *,
+    other_runtime_state: Optional[Mapping[str, Any]] = None,
     other_candles_by_timeframe: Optional[Mapping[str, pd.DataFrame]] = None,
     macro_context: Optional[Mapping[str, Any]] = None,
     apply_closed_candle_filter: bool = False,
@@ -81,10 +83,18 @@ def compare_scan_paths(
     input_diffs = _input_diffs(left_inputs, right_inputs)
     inputs_equal = left_hashes == right_hashes
 
-    left_output = _run_path(symbol, left_inputs, macro_context or {}, runtime_state, runner)
-    right_output = _run_path(symbol, right_inputs, macro_context or {}, runtime_state, runner)
+    left_output = _run_path(symbol, left_inputs, macro_context or {}, runtime_state, runner, analysis_time)
+    right_output = _run_path(
+        symbol,
+        right_inputs,
+        macro_context or {},
+        runtime_state if other_runtime_state is None else other_runtime_state,
+        runner,
+        analysis_time,
+    )
     left_stages = stage_hashes(left_output)
     right_stages = stage_hashes(right_output)
+    runtime_inputs_equal = left_output["runtime_state_input_hash"] == right_output["runtime_state_input_hash"]
     stage_diffs = {
         stage: {
             path_a_name: left_stages.get(stage),
@@ -109,7 +119,20 @@ def compare_scan_paths(
             path_a_name: left_stages,
             path_b_name: right_stages,
         },
-        "first_divergent_stage": next(iter(stage_diffs), None),
+        "runtime_inputs_equal": runtime_inputs_equal,
+        "runtime_state_input_hashes": {
+            path_a_name: left_output["runtime_state_input_hash"],
+            path_b_name: right_output["runtime_state_input_hash"],
+        },
+        "runtime_state_output_hashes": {
+            path_a_name: left_output["runtime_state_output_hash"],
+            path_b_name: right_output["runtime_state_output_hash"],
+        },
+        "runtime_state_changed": {
+            path_a_name: left_output["runtime_state_input_hash"] != left_output["runtime_state_output_hash"],
+            path_b_name: right_output["runtime_state_input_hash"] != right_output["runtime_state_output_hash"],
+        },
+        "first_divergent_stage": "runtime_state_input" if not runtime_inputs_equal else next(iter(stage_diffs), None),
         "stage_diffs": stage_diffs,
         "final_equal": final_equal,
         "final": {
@@ -134,34 +157,57 @@ def stable_candidate_order(candidates: list[Any]) -> list[Any]:
     return sorted(candidates, key=lambda item: _candidate_tie_key(item))
 
 
-def _run_path(symbol, candles_by_timeframe, macro_context, runtime_state, runner):
+def _run_path(symbol, candles_by_timeframe, macro_context, runtime_state, runner, analysis_time):
+    runtime_before, runtime_before_hash = _runtime_snapshot_and_hash(runtime_state)
     if runner is not None:
-        score, analysis = runner(symbol, candles_by_timeframe, macro_context)
-        return {"score": score, "analysis": analysis}
+        score, analysis = _call_runner(runner, symbol, candles_by_timeframe, macro_context, analysis_time)
+        return {
+            "score": score or {},
+            "analysis": analysis or {},
+            "runtime_state_before": runtime_before,
+            "runtime_state_after": runtime_before,
+            "runtime_state_input_hash": runtime_before_hash,
+            "runtime_state_output_hash": runtime_before_hash,
+        }
 
     import analyzer
 
-    previous_runtime = copy.deepcopy(getattr(analyzer, "_SCENARIO_RUNTIME_STATE", {}))
-    previous_transition = copy.deepcopy(getattr(analyzer, "_SCENARIO_TRANSITION_STATE", {}))
-    try:
-        analyzer._SCENARIO_RUNTIME_STATE.clear()
-        analyzer._SCENARIO_TRANSITION_STATE.clear()
-        if runtime_state:
-            analyzer._SCENARIO_RUNTIME_STATE.update(copy.deepcopy(runtime_state.get("scenario_runtime", {})))
-            analyzer._SCENARIO_TRANSITION_STATE.update(copy.deepcopy(runtime_state.get("scenario_transitions", {})))
+    with analyzer.scenario_runtime_state(runtime_before, persist=False):
         score, analysis = analyzer.analyze_symbol_snapshot(
             symbol,
             candles_by_timeframe.get("4h").copy(deep=True),
             candles_by_timeframe.get("1h").copy(deep=True),
             candles_by_timeframe.get("15m").copy(deep=True),
             dict(macro_context or {}),
+            analysis_time=analysis_time,
         )
-        return {"score": score or {}, "analysis": analysis or {}}
-    finally:
-        analyzer._SCENARIO_RUNTIME_STATE.clear()
-        analyzer._SCENARIO_RUNTIME_STATE.update(previous_runtime)
-        analyzer._SCENARIO_TRANSITION_STATE.clear()
-        analyzer._SCENARIO_TRANSITION_STATE.update(previous_transition)
+        runtime_after = analyzer.export_scenario_runtime_state()
+        runtime_after_hash = analyzer.scenario_runtime_state_hash(runtime_after)
+    return {
+        "score": score or {},
+        "analysis": analysis or {},
+        "runtime_state_before": runtime_before,
+        "runtime_state_after": runtime_after,
+        "runtime_state_input_hash": runtime_before_hash,
+        "runtime_state_output_hash": runtime_after_hash,
+    }
+
+
+def _runtime_snapshot_and_hash(runtime_state):
+    import analyzer
+
+    snapshot = copy.deepcopy(runtime_state) if runtime_state is not None else analyzer._empty_scenario_runtime_state()
+    return snapshot, analyzer.scenario_runtime_state_hash(snapshot)
+
+
+def _call_runner(runner, symbol, candles_by_timeframe, macro_context, analysis_time):
+    try:
+        parameters = inspect.signature(runner).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "analysis_time" in parameters:
+        return runner(symbol, candles_by_timeframe, macro_context, analysis_time=analysis_time)
+    return runner(symbol, candles_by_timeframe, macro_context)
 
 
 def _prepare_candles(candles_by_timeframe, analysis_time, apply_closed_candle_filter):

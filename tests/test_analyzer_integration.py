@@ -13,6 +13,12 @@ from core.structure import MarketStructure
 
 
 class AnalyzerIntegrationTest(unittest.TestCase):
+    def setUp(self):
+        analyzer.reset_scenario_runtime_state()
+
+    def tearDown(self):
+        analyzer.reset_scenario_runtime_state()
+
     def _df(self, periods=140, freq="15min"):
         index = pd.date_range("2026-01-01", periods=periods, freq=freq)
         base = pd.Series(range(periods), index=index).astype(float)
@@ -31,6 +37,77 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         highs = df.iloc[[20, 60, 100]][["high"]]
         lows = df.iloc[[10, 50, 90]][["low"]]
         return highs, lows
+
+    def test_runtime_state_export_is_isolated_json_snapshot(self):
+        analyzer._SCENARIO_RUNTIME_STATE[("SOL", "CAND-1")] = {
+            "runtime_update_count": 1,
+            "first_index": pd.Timestamp("2026-01-01 10:00:00"),
+        }
+        analyzer._SCENARIO_TRANSITION_STATE[("SOL", "CAND-1")] = "waiting_for_confirmation"
+
+        snapshot = analyzer.export_scenario_runtime_state()
+        snapshot["scenario_runtime_state"][0]["state"]["runtime_update_count"] = 99
+
+        self.assertEqual(analyzer._SCENARIO_RUNTIME_STATE[("SOL", "CAND-1")]["runtime_update_count"], 1)
+        text = analyzer.json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        self.assertIn("scenario_runtime_state", text)
+
+    def test_runtime_state_import_is_isolated_and_replaceable(self):
+        snapshot = {
+            "schema_version": 1,
+            "scenario_runtime_state": [
+                {
+                    "symbol": "SOL",
+                    "candidate_id": "CAND-1",
+                    "state": {"runtime_update_count": 3, "first_index": "2026-01-01T07:00:00Z"},
+                }
+            ],
+            "scenario_transition_state": [
+                {"symbol": "SOL", "candidate_id": "CAND-1", "state": "early_trigger_confirmed"}
+            ],
+        }
+
+        analyzer.import_scenario_runtime_state(snapshot)
+        snapshot["scenario_runtime_state"][0]["state"]["runtime_update_count"] = 99
+
+        self.assertEqual(analyzer._SCENARIO_RUNTIME_STATE[("SOL", "CAND-1")]["runtime_update_count"], 3)
+        self.assertEqual(analyzer._SCENARIO_TRANSITION_STATE[("SOL", "CAND-1")], "early_trigger_confirmed")
+
+    def test_runtime_state_roundtrip_preserves_hash(self):
+        analyzer._SCENARIO_RUNTIME_STATE[("INJ", "CAND-1")] = {"runtime_update_count": 2}
+        analyzer._SCENARIO_TRANSITION_STATE[("INJ", "CAND-1")] = "waiting_for_confirmation"
+        snapshot = analyzer.export_scenario_runtime_state()
+        expected_hash = analyzer.scenario_runtime_state_hash(snapshot)
+
+        analyzer.reset_scenario_runtime_state()
+        analyzer.import_scenario_runtime_state(snapshot)
+
+        self.assertEqual(analyzer.scenario_runtime_state_hash(), expected_hash)
+
+    def test_runtime_state_context_restores_globals_on_exception(self):
+        original = {
+            "schema_version": 1,
+            "scenario_runtime_state": [
+                {"symbol": "BTC", "candidate_id": "BASE", "state": {"runtime_update_count": 7}}
+            ],
+            "scenario_transition_state": [],
+        }
+        isolated = {
+            "schema_version": 1,
+            "scenario_runtime_state": [
+                {"symbol": "BTC", "candidate_id": "TEMP", "state": {"runtime_update_count": 1}}
+            ],
+            "scenario_transition_state": [],
+        }
+        analyzer.import_scenario_runtime_state(original)
+        expected = analyzer.export_scenario_runtime_state()
+
+        with self.assertRaises(RuntimeError):
+            with analyzer.scenario_runtime_state(isolated, persist=False):
+                analyzer._SCENARIO_RUNTIME_STATE[("BTC", "TEMP")]["runtime_update_count"] = 2
+                raise RuntimeError("boom")
+
+        self.assertEqual(analyzer.export_scenario_runtime_state(), expected)
 
     def test_neutral_htf_builds_shadow_candidate_without_a_plus(self):
         liquidity_map = {
@@ -350,6 +427,50 @@ class AnalyzerIntegrationTest(unittest.TestCase):
 
         self.assertEqual(score_result["total_score"], 0)
         self.assertEqual(analysis_data["direction"], "NEUTRAL")
+
+    def test_analyze_symbol_snapshot_does_not_mutate_input_dataframes(self):
+        liquidity_map = {
+            "nearest_buy_side": None,
+            "nearest_sell_side": None,
+            "strongest_buy_side": None,
+            "strongest_sell_side": None,
+        }
+        df_4h = self._df(freq="4h")
+        df_1h = self._df(freq="1h")
+        df_15m = self._df(freq="15min")
+        original_4h = df_4h.copy(deep=True)
+        original_1h = df_1h.copy(deep=True)
+        original_15m = df_15m.copy(deep=True)
+
+        def run_once():
+            with patch("analyzer.fetch_candles", side_effect=AssertionError("snapshot must not fetch")), \
+                patch("analyzer.calculate_ema", side_effect=lambda df, period: pd.Series(100.0, index=df.index)), \
+                patch("analyzer.calculate_adx", side_effect=lambda df, period: pd.DataFrame({"adx": 25.0}, index=df.index)), \
+                patch("analyzer.calculate_atr", side_effect=lambda df, period: pd.Series(1.0, index=df.index)), \
+                patch("analyzer.calculate_rvol", side_effect=lambda df, period: pd.Series(1.0, index=df.index)), \
+                patch("analyzer.find_swings", side_effect=lambda df, left_bars=2, right_bars=2: self._swings(df)), \
+                patch("analyzer.build_liquidity_map", return_value=liquidity_map), \
+                patch(
+                    "analyzer.evaluate_market_structure",
+                    return_value=MarketStructure(trend="neutral", confidence=20, reason="test neutral"),
+                ):
+                return analyzer.analyze_symbol_snapshot(
+                    "BTC",
+                    df_4h,
+                    df_1h,
+                    df_15m,
+                    {},
+                    analysis_time=pd.Timestamp("2026-01-01 12:00:00+03:00"),
+                )
+
+        first_score, first_analysis = run_once()
+        second_score, second_analysis = run_once()
+
+        pd.testing.assert_frame_equal(df_4h, original_4h)
+        pd.testing.assert_frame_equal(df_1h, original_1h)
+        pd.testing.assert_frame_equal(df_15m, original_15m)
+        self.assertEqual(first_score, second_score)
+        self.assertEqual(first_analysis["htf_context"], second_analysis["htf_context"])
 
     def test_prepare_calculates_rvol_on_direct_1h_candles(self):
         rvol_time_steps = []

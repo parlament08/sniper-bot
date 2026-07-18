@@ -6,9 +6,16 @@ import pandas as pd
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
 
 from diagnostics.scan_path_compare import compare_scan_paths, stable_candidate_order
+import analyzer
 
 
 class ScanPathCompareTest(unittest.TestCase):
+    def setUp(self):
+        analyzer.reset_scenario_runtime_state()
+
+    def tearDown(self):
+        analyzer.reset_scenario_runtime_state()
+
     def _candles(self, periods=120, start="2026-01-01 00:00:00", freq="15min"):
         index = pd.date_range(start, periods=periods, freq=freq)
         base = pd.Series(range(periods), index=index).astype(float)
@@ -35,7 +42,7 @@ class ScanPathCompareTest(unittest.TestCase):
             ).dropna(),
         }
 
-    def _runner(self, symbol, candles_by_timeframe, macro_context):
+    def _runner(self, symbol, candles_by_timeframe, macro_context, analysis_time=None):
         selected_id = "CAND-" + str(len(candles_by_timeframe["15m"]))
         score = {
             "total_score": len(candles_by_timeframe["15m"]),
@@ -53,6 +60,7 @@ class ScanPathCompareTest(unittest.TestCase):
         }
         analysis = {
             "market_structure": {"trend": "bullish"},
+            "htf_context": {"swing_points": [], "analysis_time": str(analysis_time)},
             "sfp_data": None,
             "risk_plan": {"reason": "entry_model_not_formed"},
             "trigger_scan": {"early_trigger": None, "confirmed_trigger": None},
@@ -60,6 +68,17 @@ class ScanPathCompareTest(unittest.TestCase):
             "active_fvg": None,
         }
         return score, analysis
+
+    def _runtime_snapshot(self, count):
+        return {
+            "schema_version": 1,
+            "scenario_runtime_state": [
+                {"symbol": "SOL", "candidate_id": "CAND-1", "state": {"runtime_update_count": count}}
+            ],
+            "scenario_transition_state": [
+                {"symbol": "SOL", "candidate_id": "CAND-1", "state": "waiting_for_confirmation"}
+            ],
+        }
 
     def test_identical_inputs_have_equal_stage_and_final_hashes(self):
         candles = self._inputs()
@@ -75,6 +94,7 @@ class ScanPathCompareTest(unittest.TestCase):
         self.assertIsNone(result["first_divergent_stage"])
         self.assertEqual(result["stage_diffs"], {})
         self.assertTrue(result["final_equal"])
+        self.assertTrue(result["runtime_inputs_equal"])
 
     def test_open_candle_difference_is_reported_and_closed_filter_restores_match(self):
         live = self._inputs(periods=124)
@@ -130,7 +150,53 @@ class ScanPathCompareTest(unittest.TestCase):
 
         self.assertEqual(first["input_hashes"], second["input_hashes"])
         self.assertEqual(first["stage_hashes"], second["stage_hashes"])
+        self.assertEqual(first["runtime_state_input_hashes"], second["runtime_state_input_hashes"])
         self.assertEqual(first["final"], second["final"])
+
+    def test_different_analysis_time_changes_only_explicit_time_context(self):
+        candles = self._inputs()
+
+        first = compare_scan_paths("SOL", candles, pd.Timestamp("2026-01-02 06:00:00"), runner=self._runner)
+        second = compare_scan_paths("SOL", candles, pd.Timestamp("2026-01-02 07:00:00"), runner=self._runner)
+
+        self.assertEqual(first["input_hashes"], second["input_hashes"])
+        self.assertEqual(first["final"], second["final"])
+        self.assertTrue(first["final_equal"])
+
+    def test_identical_runtime_state_inputs_have_equal_hashes(self):
+        candles = self._inputs()
+        snapshot = self._runtime_snapshot(2)
+
+        result = compare_scan_paths(
+            "SOL",
+            candles,
+            pd.Timestamp("2026-01-02 06:00:00"),
+            runtime_state=snapshot,
+            runner=self._runner,
+        )
+
+        self.assertTrue(result["runtime_inputs_equal"])
+        self.assertEqual(
+            result["runtime_state_input_hashes"]["live"],
+            result["runtime_state_input_hashes"]["replay"],
+        )
+        self.assertIsNone(result["first_divergent_stage"])
+
+    def test_different_runtime_state_input_is_first_divergent_cause(self):
+        candles = self._inputs()
+
+        result = compare_scan_paths(
+            "SOL",
+            candles,
+            pd.Timestamp("2026-01-02 06:00:00"),
+            runtime_state=self._runtime_snapshot(1),
+            other_runtime_state=self._runtime_snapshot(3),
+            runner=self._runner,
+        )
+
+        self.assertTrue(result["inputs_equal"])
+        self.assertFalse(result["runtime_inputs_equal"])
+        self.assertEqual(result["first_divergent_stage"], "runtime_state_input")
 
     def test_stable_candidate_tie_break(self):
         candidates = [

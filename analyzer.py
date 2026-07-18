@@ -8,6 +8,7 @@ import traceback as traceback_module
 import requests
 import pandas as pd
 import google.generativeai as genai
+from contextlib import contextmanager
 from html import escape
 from dotenv import load_dotenv
 
@@ -95,6 +96,127 @@ COINS_LIST = [
 last_alert_time = {coin: 0 for coin in COINS_LIST}
 _SCENARIO_TRANSITION_STATE = {}
 _SCENARIO_RUNTIME_STATE = {}
+
+
+def export_scenario_runtime_state():
+    return {
+        "schema_version": 1,
+        "scenario_runtime_state": [
+            {
+                "symbol": symbol,
+                "candidate_id": candidate_id,
+                "state": _json_state_value(state),
+            }
+            for (symbol, candidate_id), state in sorted(
+                _SCENARIO_RUNTIME_STATE.items(),
+                key=lambda item: (str(item[0][0]), str(item[0][1])),
+            )
+        ],
+        "scenario_transition_state": [
+            {
+                "symbol": symbol,
+                "candidate_id": candidate_id,
+                "state": _json_state_value(state),
+            }
+            for (symbol, candidate_id), state in sorted(
+                _SCENARIO_TRANSITION_STATE.items(),
+                key=lambda item: (str(item[0][0]), str(item[0][1])),
+            )
+        ],
+    }
+
+
+def import_scenario_runtime_state(snapshot, *, replace=True):
+    if not isinstance(snapshot, dict):
+        raise TypeError("runtime state snapshot must be a dict")
+    if snapshot.get("schema_version") != 1:
+        raise ValueError("unsupported runtime state schema_version")
+    runtime_entries = snapshot.get("scenario_runtime_state", [])
+    transition_entries = snapshot.get("scenario_transition_state", [])
+    if not isinstance(runtime_entries, list) or not isinstance(transition_entries, list):
+        raise TypeError("runtime state containers must be lists")
+    if replace:
+        reset_scenario_runtime_state()
+    for entry in runtime_entries:
+        symbol, candidate_id, state = _runtime_state_entry(entry)
+        _SCENARIO_RUNTIME_STATE[(symbol, candidate_id)] = state
+    for entry in transition_entries:
+        symbol, candidate_id, state = _runtime_state_entry(entry)
+        _SCENARIO_TRANSITION_STATE[(symbol, candidate_id)] = state
+
+
+def reset_scenario_runtime_state():
+    _SCENARIO_RUNTIME_STATE.clear()
+    _SCENARIO_TRANSITION_STATE.clear()
+
+
+def scenario_runtime_state_hash(snapshot=None):
+    payload = snapshot if snapshot is not None else export_scenario_runtime_state()
+    text = json.dumps(_json_state_value(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+@contextmanager
+def scenario_runtime_state(snapshot=None, *, persist=False):
+    previous = export_scenario_runtime_state()
+    try:
+        import_scenario_runtime_state(snapshot or _empty_scenario_runtime_state(), replace=True)
+        yield
+    finally:
+        if not persist:
+            import_scenario_runtime_state(previous, replace=True)
+
+
+def _empty_scenario_runtime_state():
+    return {"schema_version": 1, "scenario_runtime_state": [], "scenario_transition_state": []}
+
+
+def _runtime_state_entry(entry):
+    if not isinstance(entry, dict):
+        raise TypeError("runtime state entry must be a dict")
+    symbol = entry.get("symbol")
+    candidate_id = entry.get("candidate_id")
+    if symbol is None or candidate_id is None:
+        raise ValueError("runtime state entry requires symbol and candidate_id")
+    return str(symbol), str(candidate_id), _restore_state_value(entry.get("state"))
+
+
+def _json_state_value(value):
+    if isinstance(value, dict):
+        return {str(key): _json_state_value(val) for key, val in sorted(value.items(), key=lambda item: str(item[0]))}
+    if isinstance(value, (list, tuple)):
+        return [_json_state_value(item) for item in value]
+    if isinstance(value, pd.Timestamp):
+        ts = value.tz_localize(DEFAULT_TIMEZONE) if value.tzinfo is None else value
+        ts = ts.tz_convert("UTC")
+        return ts.isoformat().replace("+00:00", "Z")
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    if hasattr(value, "isoformat") and not isinstance(value, str):
+        try:
+            ts = pd.Timestamp(value)
+            ts = ts.tz_localize(DEFAULT_TIMEZONE) if ts.tzinfo is None else ts
+            return ts.tz_convert("UTC").isoformat().replace("+00:00", "Z")
+        except Exception:
+            pass
+    return value
+
+
+def _restore_state_value(value):
+    if isinstance(value, dict):
+        return {str(key): _restore_state_value(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_restore_state_value(item) for item in value]
+    if isinstance(value, str):
+        try:
+            if "T" in value and (value.endswith("Z") or "+" in value):
+                return pd.Timestamp(value)
+        except Exception:
+            return value
+    return value
 
 def send_telegram_alert(text, *, run_id=None, message_type="UNKNOWN", delivery_context=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -936,9 +1058,10 @@ def _build_scenario_transition_records(run_id, timestamp, symbol, scenario_scan,
     return records
 
 
-def _apply_runtime_update_counts(symbol, scenario_scan):
+def _apply_runtime_update_counts(symbol, scenario_scan, analysis_time=None):
     if scenario_scan is None:
         return scenario_scan
+    analysis_time = _normalize_analysis_time(analysis_time)
     candidates = []
     for item in [
         getattr(scenario_scan, "selected_scenario", None),
@@ -1000,6 +1123,13 @@ def _market_age_bars_between(first_index, last_index):
         last_ts = pd.Timestamp(last_index)
     except Exception:
         return 0
+    if first_ts.tzinfo is not None and last_ts.tzinfo is None:
+        first_ts = first_ts.tz_convert(None)
+    elif first_ts.tzinfo is None and last_ts.tzinfo is not None:
+        last_ts = last_ts.tz_convert(None)
+    elif first_ts.tzinfo is not None and last_ts.tzinfo is not None:
+        first_ts = first_ts.tz_convert("UTC")
+        last_ts = last_ts.tz_convert("UTC")
     if last_ts < first_ts:
         return 0
     return max(0, int((last_ts - first_ts) / pd.Timedelta(minutes=15)))
@@ -2268,6 +2398,7 @@ def _build_htf_context_explain(
     swing_lows_4h,
     recent_structure_events,
     market_data_timestamps,
+    analysis_time=None,
 ):
     config = MarketStructureConfig()
     recent_highs = swing_highs_4h.sort_index().tail(config.swing_lookback) if swing_highs_4h is not None else None
@@ -2310,7 +2441,7 @@ def _build_htf_context_explain(
     neutral_score = len(reason_flags)
 
     last_closed_4h = (market_data_timestamps or {}).get("4h")
-    market_data_age_seconds = _age_seconds(last_closed_4h)
+    market_data_age_seconds = _age_seconds(last_closed_4h, analysis_time=analysis_time)
 
     return {
         "direction": getattr(market_structure, "trend", None),
@@ -2932,7 +3063,16 @@ def _build_trigger_diagnostics(score_result, analysis_data, session):
     return diagnostics
 
 
-def _age_seconds(timestamp):
+def _normalize_analysis_time(analysis_time=None):
+    if analysis_time is None:
+        return pd.Timestamp.now(tz=DEFAULT_TIMEZONE)
+    ts = pd.Timestamp(analysis_time)
+    if ts.tzinfo is None:
+        return ts.tz_localize(DEFAULT_TIMEZONE)
+    return ts.tz_convert(DEFAULT_TIMEZONE)
+
+
+def _age_seconds(timestamp, analysis_time=None):
     if timestamp is None:
         return None
     try:
@@ -2941,7 +3081,8 @@ def _age_seconds(timestamp):
             ts = ts.tz_localize(DEFAULT_TIMEZONE)
         else:
             ts = ts.tz_convert(DEFAULT_TIMEZONE)
-        return round((pd.Timestamp.now(tz=DEFAULT_TIMEZONE) - ts).total_seconds(), 4)
+        as_of = _normalize_analysis_time(analysis_time)
+        return round((as_of - ts).total_seconds(), 4)
     except Exception:
         return None
 
@@ -3126,18 +3267,51 @@ def _state_machine_diagnostic(
     return f"{result.state.value} C{int(result.confidence)} ({completed}/8, next: {missing_next})", result
 
 
-def prepare_and_analyze(coin, macro_context):
+def prepare_and_analyze(coin, macro_context, analysis_time=None, runtime_state=None, persist_runtime_state=True):
     df_4h = fetch_candles(coin, '4h', limit=300)
     df_1h = fetch_candles(coin, '1h', limit=300)
     df_15m = fetch_candles(coin, '15m', limit=300)
 
-    return analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context)
+    return analyze_symbol_snapshot(
+        coin,
+        df_4h,
+        df_1h,
+        df_15m,
+        macro_context,
+        analysis_time=analysis_time,
+        runtime_state=runtime_state,
+        persist_runtime_state=persist_runtime_state,
+    )
 
 
-def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
+def analyze_symbol_snapshot(
+    coin,
+    df_4h,
+    df_1h,
+    df_15m,
+    macro_context,
+    analysis_time=None,
+    runtime_state=None,
+    persist_runtime_state=True,
+):
+    if runtime_state is not None or not persist_runtime_state:
+        with scenario_runtime_state(runtime_state, persist=persist_runtime_state):
+            return analyze_symbol_snapshot(
+                coin,
+                df_4h,
+                df_1h,
+                df_15m,
+                macro_context,
+                analysis_time=analysis_time,
+            )
     if df_4h is None or df_1h is None or df_15m is None or len(df_4h) < 100 or len(df_1h) < 100 or len(df_15m) < 100:
         logger.warning(f"Недостаточно данных для {coin}.")
         return None, None
+
+    analysis_time = _normalize_analysis_time(analysis_time)
+    df_4h = df_4h.copy(deep=True)
+    df_1h = df_1h.copy(deep=True)
+    df_15m = df_15m.copy(deep=True)
 
     numeric_cols = ['open', 'high', 'low', 'close', 'volume']
     for col in numeric_cols:
@@ -3313,6 +3487,7 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         swing_lows_4h=swing_lows_4h,
         recent_structure_events=recent_4h_structure_events,
         market_data_timestamps=market_data_timestamps,
+        analysis_time=analysis_time,
     )
     low_adx_override_direction = None
     if market_structure.trend == 'neutral' and market_structure.reason == 'ADX below neutral threshold':
@@ -3436,6 +3611,7 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
             'current_price': current_price,
             'atr': float(last_closed_15m.get('atr', 0.0)),
             'shadow_candidate': shadow_candidate,
+            'analysis_time': analysis_time,
         }
         
     # Находим самый последний тест FVG в окне памяти
@@ -3709,7 +3885,7 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
                 risk_plan=risk_plan,
             )
         risk_plan = _risk_plan_for_selected_candidate(risk_plan, scenario_scan.selected_scenario, direction)
-    scenario_scan = _apply_runtime_update_counts(coin, scenario_scan)
+    scenario_scan = _apply_runtime_update_counts(coin, scenario_scan, analysis_time=analysis_time)
     if risk_plan:
         final_score_result['breakdown']['risk_plan'] = _format_risk_plan(risk_plan)
         final_score_result.setdefault('diagnostics', {})['risk_plan_valid'] = risk_plan.valid
@@ -3801,6 +3977,7 @@ def analyze_symbol_snapshot(coin, df_4h, df_1h, df_15m, macro_context):
         "scan_interval": scan_interval_minutes,
         "current_price": current_price,
         "atr": float(last_closed_15m.get('atr', 0.0)),
+        "analysis_time": analysis_time,
     }
     analysis_data["shadow_candidate"] = _build_shadow_candidate(
         symbol=coin,
@@ -3862,10 +4039,11 @@ def _normalize_final_decision(decision):
         return "Watchlist"
     return "Ignore"
 
-def market_scan(report_mode="HUNT"):
+def market_scan(report_mode="HUNT", analysis_time=None):
+    decision_time = _normalize_analysis_time(analysis_time)
     started_at_ts = time.time()
     started_at = pd.Timestamp.now(tz=DEFAULT_TIMEZONE).isoformat()
-    session = evaluate_session()
+    session = evaluate_session(now=decision_time)
     current_time_str = session.local_time
     in_kz = session.in_kill_zone
     session_status = (
@@ -3889,7 +4067,7 @@ def market_scan(report_mode="HUNT"):
 
     for coin in COINS_LIST:
         try:
-            score_result, analysis_data = prepare_and_analyze(coin, macro)
+            score_result, analysis_data = prepare_and_analyze(coin, macro, analysis_time=decision_time)
             if not score_result or not analysis_data:
                 dashboard_lines.append(f"• <b>{coin}</b>: Н/Д (ошибка данных)")
                 error = _analysis_error(coin, "prepare_and_analyze", "NoAnalysisData", run_id)

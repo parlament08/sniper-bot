@@ -8,7 +8,7 @@ stores candidate progression without sending Telegram alerts.
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Iterable, List, Optional
 
 import pandas as pd
 
@@ -64,10 +64,20 @@ def _selected_candidate_snapshot(analysis_data: dict) -> dict:
     return snapshot.get("selected_scenario") or {}
 
 
-def _step_snapshot(symbol: str, candle_time, score_result: dict, analysis_data: dict) -> dict:
+def _step_snapshot(
+    symbol: str,
+    candle_time,
+    score_result: dict,
+    analysis_data: dict,
+    *,
+    runtime_state_before: dict,
+    runtime_state_after: dict,
+) -> dict:
     selected = _selected_candidate_snapshot(analysis_data)
     diagnostics = score_result.get("diagnostics", {})
     risk_plan = analysis_data.get("risk_plan")
+    runtime_input_hash = analyzer.scenario_runtime_state_hash(runtime_state_before)
+    runtime_output_hash = analyzer.scenario_runtime_state_hash(runtime_state_after)
     return {
         "symbol": symbol,
         "candle_time": str(candle_time),
@@ -78,9 +88,14 @@ def _step_snapshot(symbol: str, candle_time, score_result: dict, analysis_data: 
         "candidate_id": selected.get("candidate_id"),
         "candidate_status": selected.get("status"),
         "early_trigger_index": (selected.get("trigger_scan") or {}).get("early_trigger_index"),
+        "runtime_update_count": selected.get("runtime_update_count"),
+        "market_age_bars": selected.get("market_age_bars"),
         "trigger_confirmed": diagnostics.get("trigger_confirmed"),
         "risk_plan_status": risk_plan.get("risk_plan_status") if risk_plan else None,
         "a_plus_eligible": diagnostics.get("a_plus_delivery_allowed", False),
+        "runtime_state_input_hash": runtime_input_hash,
+        "runtime_state_output_hash": runtime_output_hash,
+        "runtime_state_changed": runtime_input_hash != runtime_output_hash,
     }
 
 
@@ -91,40 +106,67 @@ def replay_symbol(
     *,
     data_dir: Optional[Path] = None,
     macro_context: Optional[dict] = None,
+    runtime_state: Optional[dict] = None,
+    persist_runtime_state: bool = False,
+    runtime_mode: str = "sequential",
 ) -> dict:
+    if runtime_mode not in {"stateless", "snapshot", "sequential"}:
+        raise ValueError("runtime_mode must be one of: stateless, snapshot, sequential")
     full_15m = load_candles(symbol, "15m", data_dir=data_dir)
     replay_15m = filter_window(full_15m, start, end)
     if replay_15m.empty:
         raise RuntimeError(f"No 15m replay candles for {symbol} in {start}..{end}")
 
     run_id = f"offline-replay-{symbol}-{start.date()}-{end.date()}"
-    analyzer._SCENARIO_TRANSITION_STATE.clear()
     steps: List[dict] = []
     transitions: List[dict] = []
+    initial_state = runtime_state or analyzer._empty_scenario_runtime_state()
+    sequential_state = initial_state
 
     for candle_time in replay_15m.index:
         prefix_15m = full_15m[full_15m.index <= candle_time].copy()
         prefix_1h = resample_ohlcv(prefix_15m, "1h")
         prefix_4h = resample_ohlcv(prefix_15m, "4h")
-        score_result, analysis_data = analyzer.analyze_symbol_snapshot(
-            symbol,
-            prefix_4h,
-            prefix_1h,
-            prefix_15m,
-            macro_context or {},
-        )
-        steps.append(_step_snapshot(symbol, candle_time, score_result or {}, analysis_data or {}))
-        transitions.extend(
-            analyzer._build_scenario_transition_records(
-                run_id,
-                pd.Timestamp(candle_time).isoformat(),
+        if runtime_mode == "stateless":
+            runtime_before = analyzer._empty_scenario_runtime_state()
+        elif runtime_mode == "snapshot":
+            runtime_before = initial_state
+        else:
+            runtime_before = sequential_state
+
+        with analyzer.scenario_runtime_state(runtime_before, persist=persist_runtime_state):
+            score_result, analysis_data = analyzer.analyze_symbol_snapshot(
                 symbol,
-                (analysis_data or {}).get("scenario_scan"),
-                detected_at=pd.Timestamp(candle_time).isoformat(),
+                prefix_4h,
+                prefix_1h,
+                prefix_15m,
+                macro_context or {},
+                analysis_time=candle_time,
+            )
+            transitions.extend(
+                analyzer._build_scenario_transition_records(
+                    run_id,
+                    pd.Timestamp(candle_time).isoformat(),
+                    symbol,
+                    (analysis_data or {}).get("scenario_scan"),
+                    detected_at=pd.Timestamp(candle_time).isoformat(),
+                )
+            )
+            runtime_after = analyzer.export_scenario_runtime_state()
+        steps.append(
+            _step_snapshot(
+                symbol,
+                candle_time,
+                score_result or {},
+                analysis_data or {},
+                runtime_state_before=runtime_before,
+                runtime_state_after=runtime_after,
             )
         )
+        if runtime_mode == "sequential":
+            sequential_state = runtime_after
 
-    analyzer._SCENARIO_TRANSITION_STATE.clear()
+    final_state = sequential_state if runtime_mode == "sequential" else runtime_after
     return {
         **analyzer._build_metadata(),
         "record_type": "offline_replay",
@@ -132,6 +174,9 @@ def replay_symbol(
         "symbol": symbol,
         "from": start.isoformat(),
         "to": end.isoformat(),
+        "runtime_mode": runtime_mode,
+        "runtime_state_input_hash": analyzer.scenario_runtime_state_hash(initial_state),
+        "runtime_state_output_hash": analyzer.scenario_runtime_state_hash(final_state),
         "future_candles_used": False,
         "telegram_sent": False,
         "steps": steps,
@@ -146,13 +191,14 @@ def replay_universe(
     end: pd.Timestamp,
     *,
     data_dir: Optional[Path] = None,
+    runtime_mode: str = "sequential",
 ) -> dict:
     symbols = list(symbols)
     results = []
     errors = []
     for symbol in symbols:
         try:
-            results.append(replay_symbol(symbol, start, end, data_dir=data_dir))
+            results.append(replay_symbol(symbol, start, end, data_dir=data_dir, runtime_mode=runtime_mode))
         except Exception as exc:
             errors.append(analyzer._analysis_error(symbol, "offline_replay", exc, "offline-replay"))
     return {
@@ -160,6 +206,7 @@ def replay_universe(
         "record_type": "offline_replay_universe",
         "from": start.isoformat(),
         "to": end.isoformat(),
+        "runtime_mode": runtime_mode,
         "symbols_total": len(symbols),
         "symbols_success": len(results),
         "symbols_failed": len(errors),
@@ -201,6 +248,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, help="Directory with SYMBOL_15m.csv files")
     parser.add_argument("--output", type=Path, help="Where to write replay JSON")
     parser.add_argument("--diff", type=Path, help="Compare output with a previous replay JSON")
+    parser.add_argument(
+        "--runtime-mode",
+        choices=("stateless", "snapshot", "sequential"),
+        default="sequential",
+        help="Runtime state handling mode",
+    )
+    parser.add_argument("--runtime-state", type=Path, help="JSON snapshot exported by analyzer runtime state API")
     return parser.parse_args()
 
 
@@ -208,10 +262,18 @@ def main() -> None:
     args = parse_args()
     start = pd.Timestamp(args.start)
     end = pd.Timestamp(args.end)
+    runtime_state = json.loads(args.runtime_state.read_text(encoding="utf-8")) if args.runtime_state else None
     if args.universe:
-        payload = replay_universe(analyzer.COINS_LIST, start, end, data_dir=args.data_dir)
+        payload = replay_universe(analyzer.COINS_LIST, start, end, data_dir=args.data_dir, runtime_mode=args.runtime_mode)
     else:
-        payload = replay_symbol(args.symbol, start, end, data_dir=args.data_dir)
+        payload = replay_symbol(
+            args.symbol,
+            start,
+            end,
+            data_dir=args.data_dir,
+            runtime_state=runtime_state,
+            runtime_mode=args.runtime_mode,
+        )
     if args.diff:
         previous = json.loads(args.diff.read_text(encoding="utf-8"))
         payload["diff"] = diff_replay_results(previous, payload)
