@@ -99,6 +99,7 @@ COINS_LIST = [
 last_alert_time = {coin: 0 for coin in COINS_LIST}
 _SCENARIO_TRANSITION_STATE = {}
 _SCENARIO_RUNTIME_STATE = {}
+EARLY_TRIGGER_WINDOW_EXPIRED_REASON = "early_trigger_window_expired"
 
 
 def export_scenario_runtime_state():
@@ -1384,7 +1385,7 @@ def _build_scenario_transition_records(run_id, timestamp, symbol, scenario_scan,
 def _apply_runtime_update_counts(symbol, scenario_scan, analysis_time=None):
     if scenario_scan is None:
         return scenario_scan
-    analysis_time = _normalize_analysis_time(analysis_time)
+    analysis_index = _normalize_lifetime_candle_index(analysis_time) if analysis_time is not None else None
     candidates = []
     for item in [
         getattr(scenario_scan, "selected_scenario", None),
@@ -1403,37 +1404,220 @@ def _apply_runtime_update_counts(symbol, scenario_scan, analysis_time=None):
         seen.add(candidate_id)
         cache_key = (symbol, candidate_id)
         lifecycle = _SCENARIO_RUNTIME_STATE.get(cache_key)
+        candidate_anchor_index = _candidate_lifetime_anchor_index(candidate)
+        candidate_last_index = _candidate_lifetime_last_index(candidate, analysis_index)
         if lifecycle is None:
             runtime_update_count = int(getattr(candidate, "runtime_update_count", 0) or 0)
             first_index = (
                 getattr(candidate, "anchor_first_touch_index", None)
                 or getattr(candidate, "candidate_created_at", None)
-                or getattr(candidate, "anchor_index", None)
+                or candidate_anchor_index
             )
         else:
-            runtime_update_count = int(lifecycle.get("runtime_update_count", 0) or 0) + 1
-            first_index = lifecycle.get("first_index") or getattr(candidate, "anchor_index", None)
-        last_index = getattr(candidate, "last_event_index", None) or getattr(candidate, "anchor_last_touch_index", None) or getattr(candidate, "anchor_index", None)
+            previous_scan_index = lifecycle.get("last_scan_index")
+            scan_index_changed = (
+                candidate_last_index is not None
+                and _event_sort_key(candidate_last_index) != _event_sort_key(previous_scan_index)
+            )
+            runtime_update_count = int(lifecycle.get("runtime_update_count", 0) or 0) + (1 if scan_index_changed else 0)
+            first_index = lifecycle.get("first_index") or candidate_anchor_index
+        last_index = candidate_last_index
         market_age_bars = max(
             int(getattr(candidate, "market_age_bars", 0) or 0),
+            int(lifecycle.get("market_age_bars", 0) or 0) if lifecycle else 0,
             _market_age_bars_between(first_index, last_index),
         )
+        max_wait_bars = _candidate_max_wait_bars(candidate)
+        expiration_reason = lifecycle.get("expiration_reason") if lifecycle else None
+        candidate_expired = bool(lifecycle.get("candidate_expired")) if lifecycle else False
+        if candidate_expired and expiration_reason:
+            _expire_scenario_candidate(candidate, expiration_reason)
+        if _candidate_should_expire_waiting_for_early_trigger(candidate, market_age_bars, max_wait_bars):
+            candidate_expired = True
+            expiration_reason = EARLY_TRIGGER_WINDOW_EXPIRED_REASON
+            _expire_scenario_candidate(candidate, expiration_reason)
         _SCENARIO_RUNTIME_STATE[cache_key] = {
             "runtime_update_count": runtime_update_count,
             "first_index": first_index,
             "last_index": last_index,
+            "last_scan_index": last_index,
+            "market_age_bars": market_age_bars,
+            "max_wait_bars": max_wait_bars,
+            "candidate_expired": candidate_expired,
+            "expiration_reason": expiration_reason,
         }
         candidate.runtime_update_count = runtime_update_count
         candidate.market_age_bars = market_age_bars
         candidate.age_bars = market_age_bars
         if isinstance(getattr(candidate, "trigger_scan", None), dict):
+            anchor_time = _candidate_lifetime_anchor_index(candidate)
             candidate.trigger_scan["runtime_update_count"] = runtime_update_count
             candidate.trigger_scan["market_age_bars"] = market_age_bars
             candidate.trigger_scan["age_bars"] = market_age_bars
+            candidate.trigger_scan["candidate_anchor_time"] = str(anchor_time) if anchor_time is not None else None
+            candidate.trigger_scan["candidate_anchor_index"] = str(anchor_time) if anchor_time is not None else None
+            candidate.trigger_scan["analysis_time"] = str(last_index) if last_index is not None else None
+            candidate.trigger_scan["bars_waiting"] = market_age_bars
+            candidate.trigger_scan["max_wait_bars"] = max_wait_bars
+            candidate.trigger_scan["bars_remaining"] = max(max_wait_bars - market_age_bars, 0)
+            candidate.trigger_scan["scans_waiting"] = runtime_update_count
+            candidate.trigger_scan["candidate_expired"] = candidate_expired
+            candidate.trigger_scan["expiration_reason"] = expiration_reason
+            if candidate_expired:
+                candidate.trigger_scan["rejected_reason"] = expiration_reason
+                candidate.trigger_scan["waiting_for"] = None
+                candidate.trigger_scan["early_trigger_confirmed"] = False
+                candidate.trigger_scan["trigger_confirmed"] = False
+                candidate.trigger_scan["selected_trigger"] = None
+                candidate.trigger_scan["confirmed_trigger"] = None
+                candidate.trigger_scan["early_trigger"] = None
+    _refresh_scenario_selection_after_lifetime(scenario_scan)
     for cache_key in list(_SCENARIO_RUNTIME_STATE.keys()):
         if cache_key[0] == symbol and cache_key[1] not in seen:
             del _SCENARIO_RUNTIME_STATE[cache_key]
     return scenario_scan
+
+
+def _candidate_lifetime_anchor_index(candidate):
+    trigger_scan = getattr(candidate, "trigger_scan", None)
+    if isinstance(trigger_scan, dict):
+        for key in ("sfp_index", "anchor_index", "candidate_anchor_index"):
+            if trigger_scan.get(key) is not None:
+                return trigger_scan.get(key)
+    return getattr(candidate, "anchor_index", None)
+
+
+def _normalize_lifetime_candle_index(value):
+    if value is None:
+        return None
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        return value
+    if ts.tzinfo is not None:
+        return ts.tz_convert(None)
+    return ts
+
+
+def _candidate_lifetime_last_index(candidate, analysis_index):
+    if analysis_index is not None:
+        return analysis_index
+    return (
+        getattr(candidate, "last_event_index", None)
+        or getattr(candidate, "anchor_last_touch_index", None)
+        or _candidate_lifetime_anchor_index(candidate)
+    )
+
+
+def _candidate_max_wait_bars(candidate):
+    trigger_scan = getattr(candidate, "trigger_scan", None)
+    if isinstance(trigger_scan, dict) and trigger_scan.get("max_wait_bars") is not None:
+        try:
+            return int(trigger_scan.get("max_wait_bars"))
+        except (TypeError, ValueError):
+            pass
+    return int(MAX_TRIGGER_BARS_AFTER_SFP)
+
+
+def _candidate_has_early_or_confirmed_trigger(candidate):
+    trigger_scan = getattr(candidate, "trigger_scan", None)
+    if isinstance(trigger_scan, dict):
+        if trigger_scan.get("early_trigger_confirmed") or trigger_scan.get("trigger_confirmed"):
+            return True
+        if trigger_scan.get("early_trigger") or trigger_scan.get("confirmed_trigger"):
+            return True
+    for event in getattr(candidate, "events_used", None) or []:
+        event_type = _scenario_event_field(event, "event_type")
+        if event_type in {"EARLY_TRIGGER_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED", "CHOCH_CONFIRMED", "BOS_CONFIRMED"}:
+            return True
+    return False
+
+
+def _candidate_should_expire_waiting_for_early_trigger(candidate, market_age_bars, max_wait_bars):
+    if getattr(candidate, "status", None) == "invalidated":
+        return False
+    if _candidate_has_early_or_confirmed_trigger(candidate):
+        return False
+    next_step = getattr(candidate, "next_expected_step", None)
+    waiting_for = getattr(candidate, "waiting_for", None)
+    trigger_scan = getattr(candidate, "trigger_scan", None)
+    scan_waiting_for = trigger_scan.get("waiting_for") if isinstance(trigger_scan, dict) else None
+    is_waiting_early = (
+        next_step == "EARLY_TRIGGER_CONFIRMED"
+        or waiting_for in {"bullish CHOCH/BOS after SFP", "bearish CHOCH/BOS after SFP"}
+        or scan_waiting_for in {"bullish CHOCH/BOS after SFP", "bearish CHOCH/BOS after SFP"}
+        or (isinstance(trigger_scan, dict) and str(trigger_scan.get("rejected_reason") or "").startswith("no_") and "trigger_after_sfp" in str(trigger_scan.get("rejected_reason")))
+    )
+    return bool(is_waiting_early and int(market_age_bars or 0) > int(max_wait_bars))
+
+
+def _expire_scenario_candidate(candidate, reason):
+    if getattr(candidate, "status", None) == "invalidated" and getattr(candidate, "invalidated_reason", None) == reason:
+        return
+    previous_stage = getattr(candidate, "current_step", None)
+    candidate.status = "invalidated"
+    candidate.signal_allowed = False
+    candidate.scenario_valid = False
+    candidate.invalidated_reason = reason
+    candidate.last_invalidated_component = "early_trigger"
+    candidate.candidate_invalidated = True
+    candidate.waiting_for = None
+    observation = {
+        "event_type": "candidate_expired",
+        "previous_stage": previous_stage,
+        "new_stage": "INVALIDATED",
+        "reason": reason,
+    }
+    pending = list(getattr(candidate, "pending_observations", None) or [])
+    if observation not in pending:
+        pending.append(observation)
+    candidate.pending_observations = pending
+    diagnostics = list(getattr(candidate, "event_diagnostics", None) or [])
+    if not any(item.get("reason") == reason for item in diagnostics if isinstance(item, dict)):
+        diagnostics.append({
+            "event_type": "candidate_expired",
+            "failed_conditions": [reason],
+            "reason": reason,
+        })
+    candidate.event_diagnostics = diagnostics
+
+
+def _refresh_scenario_selection_after_lifetime(scenario_scan):
+    selected = getattr(scenario_scan, "selected_scenario", None)
+    if selected is not None and getattr(selected, "status", None) != "invalidated":
+        return
+    candidates = []
+    for item in [
+        *(getattr(scenario_scan, "top_candidates", None) or []),
+        *(getattr(scenario_scan, "long_candidates", None) or []),
+        *(getattr(scenario_scan, "short_candidates", None) or []),
+    ]:
+        if item is not None and getattr(item, "status", None) != "invalidated":
+            candidates.append(item)
+    seen = set()
+    unique = []
+    for candidate in candidates:
+        candidate_id = getattr(candidate, "candidate_id", None)
+        if candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        unique.append(candidate)
+    if unique:
+        replacement = max(unique, key=lambda item: (getattr(item, "selection_eligible", False), getattr(item, "quality_score", 0), -int(getattr(item, "rank", 999) or 999)))
+        scenario_scan.selected_scenario = replacement
+        scenario_scan.selected_scenario_id = getattr(replacement, "candidate_id", None)
+        scenario_scan.selected_direction = getattr(replacement, "direction", None)
+        scenario_scan.signal_allowed = bool(getattr(replacement, "signal_allowed", False))
+        scenario_scan.scenario_valid = bool(getattr(replacement, "scenario_valid", False))
+        scenario_scan.reason = getattr(replacement, "invalidated_reason", None) or getattr(replacement, "waiting_for", None) or scenario_scan.reason
+        return
+    scenario_scan.selected_scenario = None
+    scenario_scan.selected_scenario_id = None
+    scenario_scan.selected_direction = None
+    scenario_scan.signal_allowed = False
+    scenario_scan.scenario_valid = False
+    if selected is not None and getattr(selected, "invalidated_reason", None):
+        scenario_scan.reason = getattr(selected, "invalidated_reason")
 
 
 def _market_age_bars_between(first_index, last_index):
@@ -4151,6 +4335,7 @@ def analyze_symbol_snapshot(
         premium_discount=premium_discount_data,
         risk_plan=None,
     )
+    scenario_scan = _apply_runtime_update_counts(coin, scenario_scan, analysis_time=last_closed_15m.name)
     selected_scenario = scenario_scan.selected_scenario
     risk_plan = _build_candidate_risk_plan(
         selected_scenario=selected_scenario,
@@ -4253,7 +4438,7 @@ def analyze_symbol_snapshot(
                 risk_plan=risk_plan,
             )
         risk_plan = _risk_plan_for_selected_candidate(risk_plan, scenario_scan.selected_scenario, direction)
-    scenario_scan = _apply_runtime_update_counts(coin, scenario_scan, analysis_time=analysis_time)
+    scenario_scan = _apply_runtime_update_counts(coin, scenario_scan, analysis_time=last_closed_15m.name)
     if risk_plan:
         final_score_result['breakdown']['risk_plan'] = _format_risk_plan(risk_plan)
         final_score_result.setdefault('diagnostics', {})['risk_plan_valid'] = risk_plan.valid

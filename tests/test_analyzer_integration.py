@@ -1278,6 +1278,132 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertEqual(reentry_candidate.market_age_bars, 0)
         analyzer._SCENARIO_RUNTIME_STATE.clear()
 
+    def _early_wait_candidate(self, candidate_id="SCENARIO_LONG_SFP_CONFIRMED_2026-07-18T133000_none", direction="LONG", anchor="2026-07-18 13:30:00"):
+        return ScenarioScanResult(
+            direction=direction,
+            status="building",
+            current_step="liquidity_sweep_confirmed",
+            next_expected_step="EARLY_TRIGGER_CONFIRMED",
+            signal_allowed=False,
+            scenario_valid=True,
+            completion_ratio=0.3,
+            completed_steps=3,
+            total_steps=10,
+            quality_score=75,
+            candidate_id=candidate_id,
+            anchor_type="SFP_CONFIRMED",
+            anchor_index=pd.Timestamp(anchor),
+            last_event_index=pd.Timestamp(anchor),
+            waiting_for=f"{'bullish' if direction == 'LONG' else 'bearish'} CHOCH/BOS after SFP",
+            trigger_scan={
+                "candidate_id": candidate_id,
+                "sfp_index": str(pd.Timestamp(anchor)),
+                "anchor_index": str(pd.Timestamp(anchor)),
+                "rejected_reason": "no_bullish_trigger_after_sfp_or_poi" if direction == "LONG" else "no_bearish_trigger_after_sfp_or_poi",
+                "waiting_for": f"{'bullish' if direction == 'LONG' else 'bearish'} CHOCH/BOS after SFP",
+                "early_trigger_confirmed": False,
+                "trigger_confirmed": False,
+            },
+        )
+
+    def _scan_with_candidate(self, candidate):
+        return ScenarioScannerOutput(
+            best_long_scenario=candidate if candidate.direction == "LONG" else None,
+            best_short_scenario=candidate if candidate.direction == "SHORT" else None,
+            selected_scenario=candidate,
+            selected_direction=candidate.direction,
+            signal_allowed=False,
+            scenario_valid=True,
+            reason="waiting_for_early_trigger",
+            top_candidates=[candidate],
+            long_candidates=[candidate] if candidate.direction == "LONG" else [],
+            short_candidates=[candidate] if candidate.direction == "SHORT" else [],
+            selected_scenario_id=candidate.candidate_id,
+        )
+
+    def test_bars_waiting_from_candle_timestamps_and_boundaries(self):
+        expectations = [(0, "building"), (1, "building"), (23, "building"), (24, "building"), (25, "invalidated")]
+        for bars, status in expectations:
+            analyzer.reset_scenario_runtime_state()
+            candidate = self._early_wait_candidate(candidate_id=f"CAND-{bars}")
+            scan = self._scan_with_candidate(candidate)
+            analyzer._apply_runtime_update_counts("LDO", scan, analysis_time=pd.Timestamp("2026-07-18 13:30:00") + pd.Timedelta(minutes=15 * bars))
+            self.assertEqual(candidate.market_age_bars, bars)
+            self.assertEqual(candidate.trigger_scan["bars_waiting"], bars)
+            self.assertEqual(candidate.status, status)
+        self.assertEqual(candidate.invalidated_reason, analyzer.EARLY_TRIGGER_WINDOW_EXPIRED_REASON)
+
+    def test_same_candle_repeated_scan_does_not_increase_bar_age_or_scan_count(self):
+        candidate = self._early_wait_candidate(candidate_id="SAME-CANDLE")
+        scan = self._scan_with_candidate(candidate)
+        analysis_time = pd.Timestamp("2026-07-18 14:00:00")
+        analyzer._apply_runtime_update_counts("LDO", scan, analysis_time=analysis_time)
+        analyzer._apply_runtime_update_counts("LDO", scan, analysis_time=analysis_time)
+        self.assertEqual(candidate.market_age_bars, 2)
+        self.assertEqual(candidate.runtime_update_count, 0)
+
+    def test_runtime_roundtrip_preserves_age_and_expiration_status(self):
+        candidate = self._early_wait_candidate(candidate_id="ROUNDTRIP")
+        scan = self._scan_with_candidate(candidate)
+        analyzer._apply_runtime_update_counts("LDO", scan, analysis_time="2026-07-18 20:00:00")
+        self.assertEqual(candidate.status, "invalidated")
+        snapshot = analyzer.export_scenario_runtime_state()
+
+        analyzer.reset_scenario_runtime_state()
+        analyzer.import_scenario_runtime_state(snapshot)
+        restored = self._early_wait_candidate(candidate_id="ROUNDTRIP")
+        restored_scan = self._scan_with_candidate(restored)
+        analyzer._apply_runtime_update_counts("LDO", restored_scan, analysis_time="2026-07-18 13:45:00")
+        self.assertEqual(restored.status, "invalidated")
+        self.assertEqual(restored.invalidated_reason, analyzer.EARLY_TRIGGER_WINDOW_EXPIRED_REASON)
+        self.assertEqual(restored.market_age_bars, 26)
+
+    def test_late_trigger_rejected_after_window_boundary(self):
+        sfp = {"index": pd.Timestamp("2026-07-18 13:30:00")}
+        on_time = {"type": "bullish_early_choch", "index": pd.Timestamp("2026-07-18 19:30:00"), "quality_score": 80, "body_ratio": 0.7, "displacement_ratio": 1.0, "close_position": 0.8, "micro_break_confirmed": True}
+        late = dict(on_time, index=pd.Timestamp("2026-07-18 19:45:00"))
+        accepted = analyzer.scan_post_anchor_trigger("LONG", sfp=sfp, trigger_candidates=[on_time], min_early_trigger_quality=55)
+        rejected = analyzer.scan_post_anchor_trigger("LONG", sfp=sfp, trigger_candidates=[late], min_early_trigger_quality=55)
+        self.assertTrue(accepted.early_trigger_confirmed)
+        self.assertFalse(rejected.early_trigger_confirmed)
+        self.assertEqual(rejected.rejected_reason, "no_bullish_trigger_after_sfp_or_poi")
+
+    def test_expired_candidate_terminal_and_stage_aware_reason(self):
+        candidate = self._early_wait_candidate(candidate_id="EXPIRE")
+        scan = self._scan_with_candidate(candidate)
+        analyzer._apply_runtime_update_counts("AAVE", scan, analysis_time="2026-07-18 20:00:00")
+        self.assertIsNone(scan.selected_scenario)
+        self.assertEqual(scan.reason, analyzer.EARLY_TRIGGER_WINDOW_EXPIRED_REASON)
+        self.assertEqual(candidate.status, "invalidated")
+        self.assertEqual(candidate.trigger_scan["rejected_reason"], analyzer.EARLY_TRIGGER_WINDOW_EXPIRED_REASON)
+        self.assertIn("candidate_expired", [item["event_type"] for item in candidate.pending_observations])
+
+    def test_expired_candidate_stays_expired_and_new_sfp_is_fresh(self):
+        old = self._early_wait_candidate(candidate_id="OLD", anchor="2026-07-18 13:30:00")
+        old_scan = self._scan_with_candidate(old)
+        analyzer._apply_runtime_update_counts("LDO", old_scan, analysis_time="2026-07-18 20:00:00")
+        self.assertEqual(old.status, "invalidated")
+
+        new = self._early_wait_candidate(candidate_id="NEW", anchor="2026-07-18 20:15:00")
+        new_scan = self._scan_with_candidate(new)
+        analyzer._apply_runtime_update_counts("LDO", new_scan, analysis_time="2026-07-18 20:15:00")
+        self.assertEqual(new.status, "building")
+        self.assertEqual(new.market_age_bars, 0)
+        self.assertEqual(new.runtime_update_count, 0)
+
+    def test_fresh_aave_wld_like_candidates_keep_trigger_decision_inside_window(self):
+        for symbol, direction, reason in [
+            ("AAVE", "SHORT", "no_bearish_trigger_after_sfp_or_poi"),
+            ("WLD", "SHORT", "no_bearish_trigger_after_sfp_or_poi"),
+        ]:
+            candidate = self._early_wait_candidate(candidate_id=f"{symbol}-FRESH", direction=direction, anchor="2026-07-19 01:15:00")
+            before_reason = candidate.trigger_scan["rejected_reason"] = reason
+            scan = self._scan_with_candidate(candidate)
+            analyzer._apply_runtime_update_counts(symbol, scan, analysis_time="2026-07-19 02:15:00")
+            self.assertEqual(candidate.status, "building")
+            self.assertEqual(candidate.trigger_scan["rejected_reason"], before_reason)
+            self.assertFalse(candidate.trigger_scan["early_trigger_confirmed"])
+
     def test_format_scenario_scan_humanizes_waiting_and_no_valid_reasons(self):
         waiting_scan = {
             "reason": "waiting_for_liquidity_sweep",
