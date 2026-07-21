@@ -2,6 +2,7 @@ import unittest
 
 import pandas as pd
 
+from core.structure import BOSResult
 from core.trigger_scanner import find_confirmed_trigger_after_early, scan_post_anchor_trigger
 
 
@@ -226,6 +227,29 @@ class TriggerScannerTest(unittest.TestCase):
         self.assertEqual(result.early_trigger["index"], 106)
         self.assertEqual(result.confirmed_trigger["index"], 112)
         self.assertEqual(result.selected_trigger["type"], "bearish_bos")
+
+    def test_confirmed_dataclass_trigger_after_early_does_not_use_membership_protocol(self):
+        result = scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": 100},
+            trigger_candidates=[
+                self._early("bullish_early_choch", index=106),
+                BOSResult(
+                    detected=True,
+                    quality_score=88,
+                    displacement_ratio=1.2,
+                    body_ratio=0.7,
+                    volume_confirmed=True,
+                    close_confirmed=True,
+                    type="bullish_bos",
+                    index=112,
+                ),
+            ],
+        )
+
+        self.assertTrue(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger["type"], "bullish_bos")
+        self.assertTrue(result.confirmed_trigger["detected"])
 
     def test_confirmed_trigger_after_early_quality_below_min_has_debug(self):
         result = scan_post_anchor_trigger(

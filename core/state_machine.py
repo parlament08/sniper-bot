@@ -177,8 +177,22 @@ class SniperStateMachine:
 
         if event.value in self.completed_steps:
             return
+        if event in self._FLOW and self._FLOW.index(event) < self._next_index:
+            return
 
         expected = self._FLOW[self._next_index]
+        if expected == SniperEvent.LIQUIDITY_SWEEP_CONFIRMED and event in (
+            SniperEvent.CHOCH_CONFIRMED,
+            SniperEvent.BOS_CONFIRMED,
+        ):
+            return
+        if expected == SniperEvent.CHOCH_CONFIRMED and event == SniperEvent.BOS_CONFIRMED:
+            self.completed_steps.append(event.value)
+            self._next_index = self._FLOW.index(SniperEvent.BOS_CONFIRMED) + 1
+            self._last_step_bar = current_bar
+            self.state = self._STATE_BY_NEXT_EVENT[self._FLOW[self._next_index]]
+            return
+
         if event != expected:
             self._invalidate(f"Unexpected {event.value} while waiting for {expected.value}")
             return

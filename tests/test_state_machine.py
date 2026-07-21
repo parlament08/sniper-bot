@@ -97,7 +97,7 @@ class SniperStateMachineTest(unittest.TestCase):
         self.assertFalse(result.signal_allowed)
         self.assertIn('waiting for choch_confirmed', result.invalidation_reason)
 
-    def test_bos_before_sweep_invalidates(self):
+    def test_bos_before_sweep_waits_for_sweep_without_invalidating(self):
         machine = SniperStateMachine(direction='bullish')
 
         result = machine.update(events=[
@@ -106,8 +106,28 @@ class SniperStateMachineTest(unittest.TestCase):
             SniperEvent.BOS_CONFIRMED,
         ])
 
-        self.assertEqual(result.state, SniperState.INVALIDATED)
-        self.assertIn('waiting for liquidity_sweep_confirmed', result.invalidation_reason)
+        self.assertEqual(result.state, SniperState.WAITING_FOR_LIQUIDITY_SWEEP)
+        self.assertIsNone(result.invalidation_reason)
+        self.assertIn(SniperEvent.LIQUIDITY_SWEEP_CONFIRMED.value, result.missing_steps)
+
+    def test_direct_bos_after_liquidity_sweep_advances_without_separate_choch(self):
+        machine = SniperStateMachine(direction='bullish')
+
+        result = machine.update(events=[
+            SniperEvent.HTF_CONTEXT_CONFIRMED,
+            SniperEvent.POI_TOUCHED,
+            SniperEvent.LIQUIDITY_SWEEP_CONFIRMED,
+            SniperEvent.BOS_CONFIRMED,
+            SniperEvent.FVG_CREATED,
+            SniperEvent.FVG_RETESTED,
+            SniperEvent.DISPLACEMENT_CONFIRMED,
+        ])
+
+        self.assertEqual(result.state, SniperState.SIGNAL_READY)
+        self.assertTrue(result.signal_allowed)
+        self.assertIn(SniperEvent.BOS_CONFIRMED.value, result.completed_steps)
+        self.assertNotIn(SniperEvent.CHOCH_CONFIRMED.value, result.completed_steps)
+        self.assertEqual(result.missing_steps, [])
 
     def test_retest_before_fvg_invalidates(self):
         machine = SniperStateMachine(direction='bearish')

@@ -63,6 +63,13 @@ SCENARIO_RESEARCH_TRACE_MAX_CANDLES = int(os.environ.get("SCENARIO_RESEARCH_TRAC
 APP_VERSION = os.environ.get("APP_VERSION", "v1.0.0-rc2")
 GIT_COMMIT = os.environ.get("GIT_COMMIT")
 BUILD_TIME = os.environ.get("BUILD_TIME") or pd.Timestamp.now(tz=DEFAULT_TIMEZONE).isoformat()
+CODE_HASH_FILES = (
+    "analyzer.py",
+    "core/state_machine.py",
+    "core/scenario_scanner.py",
+    "core/trigger_scanner.py",
+    "core/risk_plan.py",
+)
 A_PLUS_DELIVERY_THRESHOLD = int(os.environ.get("A_PLUS_DELIVERY_THRESHOLD", "85"))
 MIN_SCENARIO_FVG_QUALITY = 70
 MAX_SCENARIO_FVG_AGE = 64
@@ -998,11 +1005,31 @@ def _config_hash():
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
+def _code_hash():
+    override = os.environ.get("CODE_HASH")
+    if override:
+        return override
+    root = os.path.dirname(os.path.abspath(__file__))
+    digest = hashlib.sha256()
+    for relative_path in CODE_HASH_FILES:
+        path = os.path.join(root, relative_path)
+        try:
+            with open(path, "rb") as fh:
+                digest.update(relative_path.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(fh.read())
+                digest.update(b"\0")
+        except OSError:
+            return None
+    return digest.hexdigest()[:16]
+
+
 def _build_metadata():
     return {
         "app_version": APP_VERSION,
         "git_commit": _git_commit_short(),
         "config_hash": _config_hash(),
+        "code_hash": _code_hash(),
         "build_time": BUILD_TIME,
     }
 
@@ -2082,8 +2109,6 @@ def _select_candidate_scenario_fvg(direction, fvg_test_data, fvg_data, expected_
     for fvg in _directional_fvgs(direction, fvg_data):
         if not fvg.get('scenario_valid', _scenario_fvg_reject_reason(fvg) is None):
             continue
-        if not (fvg.get('tested', False) or bool(fvg_test_data)):
-            continue
         source_candidate_id = fvg.get('source_candidate_id') or fvg.get('candidate_id')
         if expected_candidate_id is not None and source_candidate_id is not None and str(source_candidate_id) != str(expected_candidate_id):
             continue
@@ -2095,7 +2120,7 @@ def _select_candidate_scenario_fvg(direction, fvg_test_data, fvg_data, expected_
 
 def _fvg_for_state_machine(direction, fvg_test_data, fvg_data, current_price, expected_candidate_id=None):
     state_direction = _direction_to_state_direction(direction)
-    if state_direction is None or not fvg_test_data:
+    if state_direction is None:
         return None
 
     fvg = _select_candidate_scenario_fvg(direction, fvg_test_data, fvg_data, expected_candidate_id)
@@ -2104,7 +2129,7 @@ def _fvg_for_state_machine(direction, fvg_test_data, fvg_data, current_price, ex
             'detected': True,
             'direction': state_direction,
             'type': fvg.get('type'),
-            'tested': True,
+            'tested': bool(fvg.get('tested', False) or fvg_test_data),
             'invalidated': False,
             'scenario_valid': True,
             'quality_score': fvg.get('quality_score'),
@@ -2856,13 +2881,11 @@ def _ensure_risk_source_candidate(risk_plan, candidate_id):
 
 
 def _candidate_confirmed_trigger(selected_scenario):
-    event = _candidate_event(selected_scenario, "CONFIRMED_TRIGGER_CONFIRMED")
-    return payload_to_dict(getattr(event, "payload", None)) if event is not None else None
+    return _scenario_event_payload_by_type(selected_scenario, "CONFIRMED_TRIGGER_CONFIRMED")
 
 
 def _candidate_sfp(selected_scenario):
-    event = _candidate_event(selected_scenario, "SFP_CONFIRMED")
-    return payload_to_dict(getattr(event, "payload", None)) if event is not None else None
+    return _scenario_event_payload_by_type(selected_scenario, "SFP_CONFIRMED")
 
 
 def _candidate_event(selected_scenario, event_type):
@@ -3267,6 +3290,7 @@ def _scenario_event_payload_by_type(selected_scenario, wanted):
     payload = payload_to_dict(getattr(event, "payload", None))
     payload.setdefault("index", getattr(event, "index", None))
     payload.setdefault("quality_score", getattr(event, "quality_score", None))
+    payload.setdefault("direction", _direction_to_state_direction(getattr(event, "direction", None)))
     return payload
 
 
@@ -3637,8 +3661,13 @@ def _scenario_events_for_state_machine(
     if pd_valid:
         events.append((-0.5, SniperEvent.POI_TOUCHED))
 
-    if sfp_data and state_direction in str(sfp_data.get('type', '')):
-        events.append((_event_sort_key(sfp_data.get('index')), SniperEvent.LIQUIDITY_SWEEP_CONFIRMED))
+    if sfp_data:
+        raw_sfp_direction = sfp_data.get('direction')
+        normalized_sfp_direction = raw_sfp_direction if raw_sfp_direction in ('bullish', 'bearish') else _direction_to_state_direction(raw_sfp_direction)
+        sfp_direction = _event_direction(sfp_data) or normalized_sfp_direction
+        sfp_type = str(sfp_data.get('type', ''))
+        if sfp_direction == state_direction or state_direction in sfp_type:
+            events.append((_event_sort_key(sfp_data.get('index')), SniperEvent.LIQUIDITY_SWEEP_CONFIRMED))
 
     for structure in (context_structure, trigger_structure):
         if not structure or state_direction not in str(structure.get('type', '')):
@@ -4355,12 +4384,13 @@ def analyze_symbol_snapshot(
         direction,
     )
     if selected_scenario is not None:
+        candidate_sfp_data = _candidate_sfp(selected_scenario) or sfp_data_in_window
         state_machine_status, state_machine_result = _state_machine_diagnostic(
             direction,
             market_structure,
             premium_discount_data,
             liquidity_map,
-            sfp_data_in_window,
+            candidate_sfp_data,
             context_break_1h,
             _candidate_confirmed_trigger(selected_scenario) or scenario_trigger_15m,
             candidate_fvg_test_data,
@@ -4380,7 +4410,7 @@ def analyze_symbol_snapshot(
             direction,
             market_structure,
             premium_discount_data,
-            sfp_data_in_window,
+            _candidate_sfp(selected_scenario) or sfp_data_in_window,
             _candidate_scoped_trigger_scan(scenario_scan, direction),
             context_break_1h,
             candidate_fvg_data,
@@ -4408,7 +4438,7 @@ def analyze_symbol_snapshot(
                 liquidity_map=liquidity_map,
                 fvg_data=all_fvgs,
                 selected_fvg_test_data=selected_fvg_test_data,
-                sfp_data=sfp_data_in_window,
+                sfp_data=_candidate_sfp(final_selected_scenario) or sfp_data_in_window,
                 structure_data=context_break_1h,
             )
             risk_plan = _risk_plan_for_selected_candidate(risk_plan, final_selected_scenario, direction)
@@ -4422,7 +4452,7 @@ def analyze_symbol_snapshot(
                 direction,
                 market_structure,
                 premium_discount_data,
-                sfp_data_in_window,
+                _candidate_sfp(final_selected_scenario) or sfp_data_in_window,
                 _candidate_scoped_trigger_scan(scenario_scan, direction),
                 context_break_1h,
                 candidate_fvg_data,

@@ -915,7 +915,7 @@ def _confirmed_trigger_rejected_reason(
         return "quality_below_min"
     if bool(trigger.get("absorption_warning")):
         return "absorption_warning"
-    if "detected" in trigger and not bool(trigger.get("detected")):
+    if not bool(trigger.get("detected", True)):
         return "quality_below_min"
     return None
 
@@ -1105,7 +1105,7 @@ def _has_early_confirmation(trigger):
 def _mark_trigger_stage(trigger, stage):
     if not trigger:
         return None
-    data = dict(trigger)
+    data = trigger.to_dict() if hasattr(trigger, "to_dict") else dict(trigger)
     data["trigger_stage"] = stage
     data["is_early"] = stage == "early"
     data["is_confirmed"] = stage == "confirmed"

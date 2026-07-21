@@ -199,21 +199,37 @@ def scenario_scan(raw: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def first_candidate_list_id(scan: dict[str, Any]) -> Optional[str]:
+    for key in ("top_candidates", "long_candidates", "short_candidates"):
+        candidates = scan.get(key)
+        if not isinstance(candidates, list):
+            continue
+        for candidate in candidates:
+            if isinstance(candidate, dict) and candidate.get("candidate_id"):
+                return str(candidate["candidate_id"])
+    return None
+
+
 def candidate_id(raw: dict[str, Any]) -> Optional[str]:
     selected = selected_scenario(raw) or {}
+    scan = scenario_scan(raw)
     value = first_present(
-        {"selected": selected, "raw": raw},
+        {"selected": selected, "scan": scan, "raw": raw},
         [
             "selected.candidate_id",
             "selected.trigger_scan.candidate_id",
+            "scan.selected_scenario_id",
             "raw.features.scenario_scan.selected_scenario_id",
             "raw.diagnostics.scenario_scan.selected_scenario_id",
+            "raw.scenario_scan.selected_scenario_id",
             "raw.features.trigger_scan.candidate_id",
             "raw.diagnostics.trigger_scan.candidate_id",
             "raw.candidate_id",
         ],
     )
-    return str(value) if value else None
+    if value:
+        return str(value)
+    return first_candidate_list_id(scan)
 
 
 def candidate_direction(raw: dict[str, Any]) -> Optional[str]:

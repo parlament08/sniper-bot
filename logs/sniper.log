@@ -627,3 +627,136 @@
 [2026-07-16 12:43:56,126] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
 [2026-07-16 12:43:56,211] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
 [2026-07-16 12:43:56,455] WARNING [sniper_bot.send_telegram_blocks:150] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-19 10:32:49,693] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-19 10:32:49,777] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:32:49,948] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:32:50,135] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:32:50,310] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:32:50,469] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:32:50,561] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:32:50,688] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:32:50,839] WARNING [sniper_bot._risk_plan_for_selected_candidate:2631] Risk plan provenance mismatch: selected_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_NEW risk_source_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_OLD
+[2026-07-19 10:32:50,893] WARNING [sniper_bot.send_telegram_blocks:284] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-19 10:40:52,030] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-19 10:40:52,068] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:40:52,251] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:40:52,460] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:40:52,676] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:40:52,848] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:40:52,950] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:40:53,095] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:40:53,274] WARNING [sniper_bot._risk_plan_for_selected_candidate:2802] Risk plan provenance mismatch: selected_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_NEW risk_source_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_OLD
+[2026-07-19 10:40:53,365] WARNING [sniper_bot.send_telegram_blocks:285] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-19 10:41:08,265] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-19 10:41:08,299] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:08,484] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:08,678] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:08,862] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:09,026] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:09,119] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:09,247] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:09,405] WARNING [sniper_bot._risk_plan_for_selected_candidate:2814] Risk plan provenance mismatch: selected_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_NEW risk_source_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_OLD
+[2026-07-19 10:41:09,472] WARNING [sniper_bot.send_telegram_blocks:285] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-19 10:41:22,484] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-19 10:41:22,514] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:22,681] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:22,865] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:23,044] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:23,210] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:23,302] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:23,426] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:23,582] WARNING [sniper_bot._risk_plan_for_selected_candidate:2815] Risk plan provenance mismatch: selected_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_NEW risk_source_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_OLD
+[2026-07-19 10:41:23,639] WARNING [sniper_bot.send_telegram_blocks:285] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-19 10:41:28,154] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-19 10:41:28,233] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:28,400] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:28,583] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:28,763] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:28,925] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:29,020] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:29,147] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:29,299] WARNING [sniper_bot._risk_plan_for_selected_candidate:2815] Risk plan provenance mismatch: selected_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_NEW risk_source_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_OLD
+[2026-07-19 10:41:29,354] WARNING [sniper_bot.send_telegram_blocks:285] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-19 10:41:54,819] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-19 10:41:59,251] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-19 10:41:59,337] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:59,504] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:59,686] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:41:59,864] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:42:00,033] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:42:00,128] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:42:00,253] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-19 10:42:00,405] WARNING [sniper_bot._risk_plan_for_selected_candidate:2815] Risk plan provenance mismatch: selected_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_NEW risk_source_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_OLD
+[2026-07-19 10:42:00,460] WARNING [sniper_bot.send_telegram_blocks:285] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-20 23:10:42,588] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-20 23:10:42,637] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:42,802] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:42,982] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:43,168] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:43,361] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:43,452] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:43,580] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:43,732] WARNING [sniper_bot._risk_plan_for_selected_candidate:2815] Risk plan provenance mismatch: selected_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_NEW risk_source_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_OLD
+[2026-07-20 23:10:43,842] WARNING [sniper_bot.send_telegram_blocks:285] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-20 23:10:54,359] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-20 23:10:54,444] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:54,608] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:54,788] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:54,972] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:55,129] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:55,218] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:55,341] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:10:55,496] WARNING [sniper_bot._risk_plan_for_selected_candidate:2815] Risk plan provenance mismatch: selected_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_NEW risk_source_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_OLD
+[2026-07-20 23:10:55,546] WARNING [sniper_bot.send_telegram_blocks:285] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-20 23:28:58,543] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-20 23:28:58,575] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:28:58,752] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:28:58,929] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:28:59,135] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:28:59,294] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:28:59,382] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:28:59,504] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:28:59,653] WARNING [sniper_bot._risk_plan_for_selected_candidate:2815] Risk plan provenance mismatch: selected_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_NEW risk_source_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_OLD
+[2026-07-20 23:28:59,705] WARNING [sniper_bot.send_telegram_blocks:285] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-20 23:29:03,991] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-20 23:29:04,074] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:04,234] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:04,415] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:04,588] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:04,745] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:04,834] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:04,959] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:05,110] WARNING [sniper_bot._risk_plan_for_selected_candidate:2815] Risk plan provenance mismatch: selected_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_NEW risk_source_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_OLD
+[2026-07-20 23:29:05,162] WARNING [sniper_bot.send_telegram_blocks:285] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-20 23:29:53,524] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-20 23:29:53,545] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:53,708] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:53,892] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:54,069] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:54,225] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:54,316] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:54,438] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:29:54,589] WARNING [sniper_bot._risk_plan_for_selected_candidate:2815] Risk plan provenance mismatch: selected_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_NEW risk_source_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_OLD
+[2026-07-20 23:29:54,640] WARNING [sniper_bot.send_telegram_blocks:285] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-20 23:30:16,471] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-20 23:30:16,496] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:16,671] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:16,874] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:17,070] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:17,240] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:17,336] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:17,480] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:17,648] WARNING [sniper_bot._risk_plan_for_selected_candidate:2815] Risk plan provenance mismatch: selected_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_NEW risk_source_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_OLD
+[2026-07-20 23:30:17,711] WARNING [sniper_bot.send_telegram_blocks:285] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-20 23:30:22,127] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-20 23:30:22,234] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:22,406] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:22,596] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:22,781] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:22,955] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:23,054] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:23,185] WARNING [sniper_bot.evaluate_trend:148] Недостаточно данных для оценки тренда.
+[2026-07-20 23:30:23,342] WARNING [sniper_bot._risk_plan_for_selected_candidate:2815] Risk plan provenance mismatch: selected_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_NEW risk_source_candidate_id=SCENARIO_LONG_PD_LOCATION_VALID_OLD
+[2026-07-20 23:30:23,400] WARNING [sniper_bot.send_telegram_blocks:285] Dashboard block exceeds Telegram safe length; splitting it by lines.
+[2026-07-21 11:40:13,477] WARNING [sniper_bot.<module>:79] GIT_COMMIT is not configured
+[2026-07-21 11:49:51,809] WARNING [sniper_bot.<module>:86] GIT_COMMIT is not configured

@@ -911,7 +911,12 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertEqual(metadata["app_version"], analyzer.APP_VERSION)
         self.assertIn("git_commit", metadata)
         self.assertRegex(metadata["config_hash"], r"^[0-9a-f]{16}$")
+        self.assertRegex(metadata["code_hash"], r"^[0-9a-f]{16}$")
         self.assertTrue(metadata["build_time"])
+
+    def test_code_hash_can_be_overridden_for_deploy_fingerprint(self):
+        with patch.dict(os.environ, {"CODE_HASH": "deploy-build-123"}):
+            self.assertEqual(analyzer._code_hash(), "deploy-build-123")
 
     def test_analysis_error_includes_exception_traceback(self):
         try:
@@ -1936,6 +1941,136 @@ class AnalyzerIntegrationTest(unittest.TestCase):
 
         self.assertTrue(result.signal_allowed)
         self.assertIn("signal_ready", status)
+
+    def test_state_machine_diagnostic_allows_direct_bos_without_context_choch(self):
+        market_structure = MarketStructure(trend="bullish", confidence=80, reason="test")
+        pd_result = {
+            "valid_for_buy": True,
+            "valid_for_sell": False,
+            "zone": "discount",
+        }
+
+        status, result = analyzer._state_machine_diagnostic(
+            "LONG",
+            market_structure,
+            pd_result,
+            liquidity_map=None,
+            sfp_data={"type": "bullish_sfp", "index": 2, "detected": True, "swept": True},
+            context_structure=None,
+            trigger_structure={"type": "bullish_bos", "index": 4, "quality_score": 95},
+            fvg_test_data={"index": 6, "displacement_index": 7},
+            fvg_data=[{
+                "type": "bullish",
+                "end_index": 5,
+                "tested": True,
+                "invalidated": False,
+                "quality_score": 90,
+                "age_bars": 2,
+                "retest_count": 1,
+            }],
+            current_price=100.0,
+            current_bar=7,
+        )
+
+        self.assertTrue(result.signal_allowed)
+        self.assertIn("signal_ready", status)
+        self.assertNotIn("Unexpected bos_confirmed", status)
+
+    def test_state_machine_diagnostic_advances_on_created_fvg_without_retest(self):
+        market_structure = MarketStructure(trend="bullish", confidence=80, reason="test")
+        pd_result = {
+            "valid_for_buy": True,
+            "valid_for_sell": False,
+            "zone": "discount",
+        }
+
+        status, result = analyzer._state_machine_diagnostic(
+            "LONG",
+            market_structure,
+            pd_result,
+            liquidity_map=None,
+            sfp_data={"type": "bullish_sfp", "index": 2, "detected": True, "swept": True},
+            context_structure={"type": "bullish_choch", "index": 3, "quality_score": 90},
+            trigger_structure={"type": "bullish_bos", "index": 4, "quality_score": 95, "event_id": "bos-A"},
+            fvg_test_data=None,
+            fvg_data=[{
+                "type": "bullish",
+                "end_index": 5,
+                "tested": False,
+                "invalidated": False,
+                "quality_score": 90,
+                "age_bars": 2,
+                "retest_count": 0,
+                "source_candidate_id": "CAND-A",
+                "source_confirmed_trigger_id": "bos-A",
+            }],
+            current_price=100.0,
+            current_bar=7,
+            expected_candidate_id="CAND-A",
+        )
+
+        self.assertFalse(result.signal_allowed)
+        self.assertIn("waiting_for_fvg_retest", status)
+        self.assertIn("next: fvg_retested", status)
+        self.assertIn("fvg_created", result.completed_steps)
+
+    def test_state_machine_diagnostic_uses_selected_candidate_sfp_when_global_sfp_is_missing(self):
+        market_structure = MarketStructure(trend="bearish", confidence=80, reason="test")
+        pd_result = {
+            "valid_for_buy": False,
+            "valid_for_sell": True,
+            "zone": "premium",
+        }
+        selected = ScenarioScanResult(
+            direction="SHORT",
+            status="waiting_for_confirmation",
+            current_step="confirmed_trigger_confirmed",
+            next_expected_step="FVG_CREATED",
+            signal_allowed=False,
+            scenario_valid=True,
+            completion_ratio=0.5,
+            completed_steps=4,
+            total_steps=8,
+            quality_score=80,
+            candidate_id="SCENARIO_SHORT_SFP_CONFIRMED_2026-07-19T220000_none",
+            events_used=[
+                ScenarioEvent(
+                    "SFP_CONFIRMED",
+                    "SHORT",
+                    "2026-07-19 22:00:00",
+                    payload={"detected": True, "swept": True},
+                ),
+                ScenarioEvent(
+                    "BOS_CONFIRMED",
+                    "SHORT",
+                    "2026-07-19 23:00:00",
+                    payload={"type": "bearish_bos", "quality_score": 95},
+                ),
+            ],
+        )
+
+        candidate_sfp = analyzer._candidate_sfp(selected)
+        status, result = analyzer._state_machine_diagnostic(
+            "SHORT",
+            market_structure,
+            pd_result,
+            liquidity_map=None,
+            sfp_data=candidate_sfp,
+            context_structure=None,
+            trigger_structure=analyzer._candidate_confirmed_trigger(selected),
+            fvg_test_data=None,
+            fvg_data=None,
+            current_price=100.0,
+            current_bar=7,
+            expected_candidate_id=selected.candidate_id,
+        )
+
+        self.assertEqual(candidate_sfp["index"], "2026-07-19 22:00:00")
+        self.assertEqual(candidate_sfp["direction"], "bearish")
+        self.assertFalse(result.signal_allowed)
+        self.assertIn("waiting_for_fvg", status)
+        self.assertNotIn("Unexpected bos_confirmed", status)
+        self.assertNotIn("waiting for liquidity_sweep_confirmed", status)
 
     def test_state_machine_ignores_old_low_quality_fvg_as_scenario_event(self):
         market_structure = MarketStructure(trend="bullish", confidence=80, reason="test")

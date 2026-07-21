@@ -3,10 +3,33 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from research.analyze_scan_history import analyze, main, resolve_input_files
+from research.analyze_scan_history import analyze, candidate_id, main, resolve_input_files
 
 
 class ScanHistoryAnalyticsTest(unittest.TestCase):
+    def test_candidate_id_reads_top_level_scenario_scan_id(self):
+        raw = {
+            "scenario_scan": {
+                "selected_scenario_id": "CAND-TOP",
+                "selected_scenario": None,
+            },
+        }
+
+        self.assertEqual(candidate_id(raw), "CAND-TOP")
+
+    def test_candidate_id_falls_back_to_candidate_lists(self):
+        raw = {
+            "features": {
+                "scenario_scan": {
+                    "selected_scenario_id": None,
+                    "selected_scenario": None,
+                    "top_candidates": [{"candidate_id": "CAND-LIST"}],
+                },
+            },
+        }
+
+        self.assertEqual(candidate_id(raw), "CAND-LIST")
+
     def test_analyze_scan_history_outputs_core_tables_and_malformed_lines(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             journal = Path(tmpdir) / "scans_2026-07-17.jsonl"
