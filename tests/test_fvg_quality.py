@@ -2,7 +2,7 @@ import unittest
 
 import pandas as pd
 
-from core.structure import FVGResult, find_fvg
+from core.structure import FVGConfig, FVGResult, find_fvg
 
 
 class FVGQualityTest(unittest.TestCase):
@@ -75,6 +75,25 @@ class FVGQualityTest(unittest.TestCase):
         self.assertEqual(fvg.overlap_percent, 100)
         self.assertGreater(fvg.quality_score, 0)
         self.assertTrue(bool(fvg))
+
+    def test_wick_violation_penalty_is_softened(self):
+        df = self._df([
+            {'open': 12.2, 'high': 12.4, 'low': 9.8, 'close': 10.5, 'volume': 150, 'atr': 2.0, 'rvol': 1.2},
+        ])
+
+        softened = self._first_bullish_fvg(df)
+        legacy = find_fvg(
+            df,
+            atr_series=df['atr'],
+            rvol_series=df['rvol'],
+            min_size_atr_ratio=0.5,
+            config=FVGConfig(wick_violation_penalty=25),
+        )
+        legacy_fvg = next(fvg for fvg in legacy if fvg['type'] == 'bullish' and fvg['end_index'] == 2)
+
+        self.assertTrue(softened.wick_violated)
+        self.assertFalse(softened.close_invalidated)
+        self.assertEqual(softened.quality_score - legacy_fvg.quality_score, 13)
 
     def test_close_through_fvg_invalidates_with_min_quality(self):
         df = self._df([

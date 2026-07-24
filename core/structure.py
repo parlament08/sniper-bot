@@ -78,7 +78,7 @@ class FVGConfig:
     age_score_weight: int = 10
     overlap_score_weight: int = 15
     retest_score_weight: int = 10
-    wick_violation_penalty: int = 25
+    wick_violation_penalty: int = 12
 
 
 @dataclass(frozen=True)
@@ -113,6 +113,10 @@ class BOSResult:
     close_position: float = 0.0
     absorption_warning: bool = False
     absorption_score: float = 0.0
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: Optional[float] = None
 
     def __bool__(self) -> bool:
         return self.detected
@@ -151,6 +155,10 @@ class CHoCHResult:
     swing_sequence: Tuple[str, ...] = ()
     absorption_warning: bool = False
     absorption_score: float = 0.0
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: Optional[float] = None
 
     @property
     def detected(self) -> bool:
@@ -205,6 +213,10 @@ class SFPResult:
     level_swept: bool = False
     absorption_warning: bool = False
     absorption_score: float = 0.0
+    open: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    close: Optional[float] = None
 
     def __bool__(self) -> bool:
         return self.detected
@@ -788,6 +800,10 @@ def _build_choch_result(
         swing_sequence=sequence_labels,
         absorption_warning=base_result.absorption_warning,
         absorption_score=base_result.absorption_score,
+        open=base_result.open,
+        high=base_result.high,
+        low=base_result.low,
+        close=base_result.close,
     )
 
 
@@ -1071,6 +1087,10 @@ def _build_sfp_result(
         level_swept=level_swept,
         absorption_warning=displacement.absorption_warning,
         absorption_score=displacement.absorption_score,
+        open=round(candle_open, 8),
+        high=round(candle_high, 8),
+        low=round(candle_low, 8),
+        close=round(candle_close, 8),
     )
 
 
@@ -1179,6 +1199,10 @@ def _build_bos_result(
         close_position=round(close_position, 4),
         absorption_warning=displacement.absorption_warning,
         absorption_score=displacement.absorption_score,
+        open=round(candle_open, 8),
+        high=round(candle_high, 8),
+        low=round(candle_low, 8),
+        close=round(candle_close, 8),
     )
 
 

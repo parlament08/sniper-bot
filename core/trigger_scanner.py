@@ -12,6 +12,11 @@ CONFIRMED_LONG_TRIGGER_TYPES = {"bullish_bos", "bullish_choch"}
 CONFIRMED_SHORT_TRIGGER_TYPES = {"bearish_bos", "bearish_choch"}
 EARLY_LONG_TRIGGER_TYPES = {"bullish_early_choch", "bullish_mss", "bullish_micro_break", "bullish_reclaim"}
 EARLY_SHORT_TRIGGER_TYPES = {"bearish_early_choch", "bearish_mss", "bearish_micro_break", "bearish_rejection"}
+OPPOSITE_STRUCTURE_INVALIDATION_QUALITY = 85
+POST_EARLY_CONFIRMED_BOS_CONFIG = BOSConfig(
+    min_body_ratio=0.45,
+    min_displacement_atr=0.5,
+)
 
 
 @dataclass
@@ -72,7 +77,7 @@ def scan_post_anchor_trigger(
     atr_series: Optional[pd.Series] = None,
     rvol_series: Optional[pd.Series] = None,
     config: Optional[object] = None,
-    max_bars_after_sfp: int = 24,
+    max_bars_after_sfp: int = 48,
     max_bars_after_poi: int = 24,
     min_trigger_quality: int = 70,
     min_early_trigger_quality: int = 55,
@@ -175,6 +180,7 @@ def scan_post_anchor_trigger(
         max_bars,
         min_trigger_quality,
         selected_candidate_id=scoped_candidate_id,
+        invalidation_level=_trigger_invalidation_level(sfp),
         df_15m_closed=df_15m_closed,
         swing_points=swing_points,
     )
@@ -188,6 +194,7 @@ def scan_post_anchor_trigger(
             max_bars,
             min_trigger_quality,
             selected_candidate_id=scoped_candidate_id,
+            invalidation_level=_trigger_invalidation_level(sfp),
         ) is None
     ]
     trigger_after_candidates = _after(valid_confirmed_candidates, confirmed_anchor_index)
@@ -559,7 +566,7 @@ def _generate_confirmed_trigger_candidates_after_early(
         return []
 
     swing_highs, swing_lows = _resolve_swing_points(df, swing_points)
-    bos_config = config if isinstance(config, BOSConfig) else BOSConfig()
+    bos_config = config if isinstance(config, BOSConfig) else POST_EARLY_CONFIRMED_BOS_CONFIG
     direction = "bullish" if expected_direction == "LONG" else "bearish"
     candidates = []
 
@@ -713,6 +720,7 @@ def _confirmed_trigger_debug(
     min_trigger_quality,
     *,
     selected_candidate_id=None,
+    invalidation_level=None,
     df_15m_closed=None,
     swing_points=None,
 ):
@@ -742,6 +750,7 @@ def _confirmed_trigger_debug(
             max_bars,
             min_trigger_quality,
             selected_candidate_id=selected_candidate_id,
+            invalidation_level=invalidation_level,
         )
         if reason == "before_early_trigger":
             historical_rejected.append(_candidate_debug_snapshot(candidate, reason))
@@ -784,6 +793,7 @@ def _confirmed_trigger_debug(
         "search_window_start": _string_index(early_index),
         "search_window_end": _string_index(_window_end_index(early_index, max_bars)),
         "expected_direction": expected_direction,
+        "invalidation_level": _round_optional(invalidation_level),
         **context,
         "candidate_bos_count": bos_count,
         "candidate_choch_count": choch_count,
@@ -814,6 +824,10 @@ def _candidate_debug_snapshot(candidate, reason):
         "close_position": candidate.get("close_position"),
         "displacement_ratio": candidate.get("displacement_ratio"),
         "rvol": candidate.get("rvol"),
+        "open": candidate.get("open"),
+        "high": candidate.get("high"),
+        "low": candidate.get("low"),
+        "close": candidate.get("close"),
     }
 
 
@@ -892,13 +906,19 @@ def _confirmed_trigger_rejected_reason(
     min_trigger_quality,
     *,
     selected_candidate_id=None,
+    invalidation_level=None,
 ):
     if not trigger:
         return "no_confirmed_trigger"
     if not early_trigger:
         return None
     if not _trigger_matches_direction(expected_direction, trigger):
-        return "opposite_structure_invalidated_candidate"
+        if (
+            _trigger_quality(trigger) >= max(min_trigger_quality, OPPOSITE_STRUCTURE_INVALIDATION_QUALITY)
+            and _opposite_trigger_breaks_invalidation_level(expected_direction, trigger, invalidation_level)
+        ):
+            return "opposite_structure_invalidated_candidate"
+        return "opposite_structure_warning"
     trigger_index = _event_index(trigger)
     early_index = _event_index(early_trigger)
     if trigger_index is None:
@@ -918,6 +938,30 @@ def _confirmed_trigger_rejected_reason(
     if not bool(trigger.get("detected", True)):
         return "quality_below_min"
     return None
+
+
+def _trigger_invalidation_level(sfp):
+    if not sfp:
+        return None
+    return sfp.get("invalidation_level") or sfp.get("stop_loss") or sfp.get("level")
+
+
+def _opposite_trigger_breaks_invalidation_level(expected_direction, trigger, invalidation_level) -> bool:
+    if invalidation_level is None:
+        return False
+    close_price = trigger.get("close")
+    if close_price is None:
+        return False
+    try:
+        close_price = float(close_price)
+        invalidation_level = float(invalidation_level)
+    except (TypeError, ValueError):
+        return False
+    if expected_direction == "LONG":
+        return close_price < invalidation_level
+    if expected_direction == "SHORT":
+        return close_price > invalidation_level
+    return False
 
 
 def _confirmed_trigger_search_context(df_15m_closed, expected_direction, early_trigger, max_bars, swing_points):

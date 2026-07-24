@@ -433,14 +433,52 @@ class ScenarioScannerTest(unittest.TestCase):
         self.assertFalse(scenario.trigger_scan["candidate_invalidated"])
         self.assertEqual(scenario.waiting_for, "confirmed bullish BOS after early CHOCH")
 
-    def test_opposite_confirmed_bos_after_early_invalidates_candidate(self):
+    def test_opposite_confirmed_bos_inside_protective_extreme_is_warning_only(self):
         output = scan_scenarios(
             events=[
                 event("HTF_CONTEXT_CONFIRMED", index=1),
                 event("POI_TOUCHED", index=2),
-                event("SFP_CONFIRMED", index=3),
+                event("SFP_CONFIRMED", index=3, payload={"invalidation_level": 9.5}),
                 event("EARLY_TRIGGER_CONFIRMED", index=4, quality=88),
-                event("CONFIRMED_TRIGGER_CONFIRMED", direction="bearish", index=5, quality=92, payload={"type": "bearish_bos"}),
+                event(
+                    "CONFIRMED_TRIGGER_CONFIRMED",
+                    direction="bearish",
+                    index=5,
+                    quality=92,
+                    payload={"type": "bearish_bos", "close": 9.8},
+                ),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+            premium_discount={"valid_for_buy": True},
+        )
+
+        scenario = output.selected_scenario
+        self.assertEqual(scenario.status, "waiting_for_confirmation")
+        self.assertEqual(scenario.current_step, "early_trigger_confirmed")
+        self.assertEqual(scenario.next_expected_step, "CONFIRMED_TRIGGER_CONFIRMED")
+        self.assertTrue(scenario.trigger_scan["opposite_trigger_detected"])
+        self.assertFalse(scenario.trigger_scan["candidate_invalidated"])
+        self.assertEqual(
+            scenario.trigger_scan["confirmed_trigger_debug"]["rejected_candidates"][0]["rejected_reason"],
+            "opposite_structure_warning",
+        )
+        self.assertTrue(output.selected_scenario.selection_eligible)
+
+    def test_opposite_confirmed_bos_after_early_invalidates_candidate_when_protective_extreme_breaks(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", index=1),
+                event("POI_TOUCHED", index=2),
+                event("SFP_CONFIRMED", index=3, payload={"invalidation_level": 9.5}),
+                event("EARLY_TRIGGER_CONFIRMED", index=4, quality=88),
+                event(
+                    "CONFIRMED_TRIGGER_CONFIRMED",
+                    direction="bearish",
+                    index=5,
+                    quality=92,
+                    payload={"type": "bearish_bos", "close": 9.4},
+                ),
             ],
             expected_direction="LONG",
             htf_structure={"trend": "bullish"},
@@ -656,8 +694,8 @@ class ScenarioScannerTest(unittest.TestCase):
             events=[
                 event("HTF_CONTEXT_CONFIRMED", index=1),
                 event("POI_TOUCHED", index=2),
-                event("SFP_CONFIRMED", index=3),
-                event("BOS_CONFIRMED", direction="bearish", index=4),
+                event("SFP_CONFIRMED", index=3, payload={"invalidation_level": 9.5}),
+                event("BOS_CONFIRMED", direction="bearish", index=4, payload={"type": "bearish_bos", "close": 9.4}),
             ],
             expected_direction="LONG",
             htf_structure={"trend": "bullish"},
@@ -710,9 +748,9 @@ class ScenarioScannerTest(unittest.TestCase):
         output = scan_scenarios(
             events=[
                 event("HTF_CONTEXT_CONFIRMED", index=1),
-                event("SFP_CONFIRMED", index=3),
+                event("SFP_CONFIRMED", index=3, payload={"invalidation_level": 9.5}),
                 event("EARLY_TRIGGER_CONFIRMED", index=4, quality=88),
-                event("BOS_CONFIRMED", direction="bearish", index=5, quality=95, payload={"type": "bearish_bos"}),
+                event("BOS_CONFIRMED", direction="bearish", index=5, quality=95, payload={"type": "bearish_bos", "close": 9.4}),
                 event("SFP_CONFIRMED", index=10, quality=82),
             ],
             expected_direction="LONG",
@@ -730,14 +768,14 @@ class ScenarioScannerTest(unittest.TestCase):
         output = scan_scenarios(
             events=[
                 event("HTF_CONTEXT_CONFIRMED", index=1),
-                event("SFP_CONFIRMED", index=2),
+                event("SFP_CONFIRMED", index=2, payload={"invalidation_level": 9.5}),
                 event("EARLY_TRIGGER_CONFIRMED", index=3, quality=88),
                 event("BOS_CONFIRMED", index=4, quality=90),
                 event("FVG_CREATED", index=5),
                 event("FVG_RETESTED", index=6),
                 event("DISPLACEMENT_CONFIRMED", index=7),
                 event("RISK_VALID", direction=None, index=8),
-                event("BOS_CONFIRMED", direction="bearish", index=9, quality=95, payload={"type": "bearish_bos"}),
+                event("BOS_CONFIRMED", direction="bearish", index=9, quality=95, payload={"type": "bearish_bos", "close": 9.4}),
             ],
             expected_direction="LONG",
             htf_structure={"trend": "bullish"},
@@ -764,6 +802,25 @@ class ScenarioScannerTest(unittest.TestCase):
         self.assertFalse(output.scenario_valid)
         self.assertFalse(output.signal_allowed)
         self.assertEqual(output.reason, "htf_neutral_no_scenario")
+
+    def test_htf_neutral_allows_pd_sfp_ltf_trigger_to_continue(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", direction="neutral", index=1),
+                event("PD_LOCATION_VALID", index=2),
+                event("SFP_CONFIRMED", index=3),
+                event("BOS_CONFIRMED", index=4, payload={"type": "bullish_bos"}),
+            ],
+            expected_direction="LONG",
+            htf_structure={"trend": "neutral", "reason": "ADX below neutral threshold"},
+            premium_discount={"valid_for_buy": True},
+        )
+
+        self.assertIsNotNone(output.selected_scenario)
+        self.assertEqual(output.selected_scenario.current_step, "confirmed_trigger_confirmed")
+        self.assertEqual(output.selected_scenario.next_expected_step, "FVG_CREATED")
+        self.assertEqual(output.reason, "waiting_for_bullish_fvg_after_confirmed_bos")
+        self.assertFalse(output.signal_allowed)
 
     def test_risk_invalid_blocks_complete_sequence(self):
         output = scan_scenarios(
@@ -921,10 +978,35 @@ class ScenarioScannerTest(unittest.TestCase):
             htf_structure={"trend": "bullish"},
         )
 
-        self.assertIsNone(output.best_short_scenario)
-        self.assertEqual(output.short_candidates, [])
+        self.assertIsNotNone(output.best_short_scenario)
+        self.assertEqual(len(output.short_candidates), 1)
+        self.assertEqual(output.short_candidates[0].status, "invalidated")
+        self.assertEqual(output.short_candidates[0].invalidated_reason, "htf_direction_conflict")
         self.assertEqual(output.direction_block_reasons["SHORT"], "htf_direction_conflict")
         self.assertEqual(output.reason, "htf_direction_conflict")
+
+    def test_high_quality_countertrend_override_allows_ltf_candidate(self):
+        output = scan_scenarios(
+            events=[
+                event("HTF_CONTEXT_CONFIRMED", direction="bullish", index=0),
+                event("SFP_CONFIRMED", direction="bearish", index=1, quality=92),
+                event("BOS_CONFIRMED", direction="bearish", index=2, quality=100, payload={"type": "bearish_bos"}),
+                event("FVG_CREATED", direction="bearish", index=3),
+                event("FVG_RETESTED", direction="bearish", index=4),
+                event("DISPLACEMENT_CONFIRMED", direction="bearish", index=5),
+                event("RISK_VALID", direction=None, index=6),
+            ],
+            expected_direction="SHORT",
+            htf_structure={"trend": "bullish"},
+        )
+
+        scenario = output.selected_scenario
+        self.assertIsNotNone(scenario)
+        self.assertEqual(scenario.direction, "SHORT")
+        self.assertEqual(scenario.status, "complete")
+        self.assertTrue(output.signal_allowed)
+        self.assertEqual(output.direction_block_reasons["SHORT"], "htf_direction_conflict")
+        self.assertTrue(scenario.trigger_scan["countertrend_override"]["applied"])
 
     def test_pd_direction_conflict_does_not_create_anchorless_candidate(self):
         output = scan_scenarios(

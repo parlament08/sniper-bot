@@ -2,7 +2,7 @@ import unittest
 
 import pandas as pd
 
-from core.structure import BOSResult
+from core.structure import BOSConfig, BOSResult
 from core.trigger_scanner import find_confirmed_trigger_after_early, scan_post_anchor_trigger
 
 
@@ -339,6 +339,36 @@ class TriggerScannerTest(unittest.TestCase):
         self.assertTrue(result.confirmed_trigger_debug["generator_called"])
         self.assertEqual(result.confirmed_trigger_debug["checked_candles"][-1]["candidate_created"], True)
 
+    def test_post_early_confirmed_bos_uses_relaxed_displacement_threshold(self):
+        df = self._df([
+            {"index": 100, "open": 10.0, "high": 10.2, "low": 9.8, "close": 10.0, "atr": 1.0, "rvol": 1.0},
+            {"index": 110, "open": 10.0, "high": 10.4, "low": 9.9, "close": 10.3, "atr": 1.0, "rvol": 1.4},
+            {"index": 115, "open": 10.2, "high": 10.5, "low": 10.0, "close": 10.2, "atr": 1.0, "rvol": 1.0},
+            {"index": 120, "open": 10.45, "high": 11.0, "low": 10.3, "close": 11.0, "atr": 1.0, "rvol": 2.0},
+        ])
+
+        result = scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": 100},
+            trigger_candidates=[self._early("bullish_early_choch", index=110, quality=88)],
+            df_15m_closed=df,
+            swing_points=self._swings(highs=[{"index": 115, "high": 10.5}]),
+        )
+        strict_candidate = find_confirmed_trigger_after_early(
+            df,
+            "LONG",
+            110,
+            100,
+            self._swings(highs=[{"index": 115, "high": 10.5}]),
+            atr_series=None,
+            config=BOSConfig(),
+        )
+
+        self.assertTrue(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger["index"], 120)
+        self.assertEqual(result.confirmed_trigger["displacement_ratio"], 0.55)
+        self.assertIsNone(strict_candidate)
+
     def test_confirmed_bearish_bos_generated_after_early_trigger(self):
         df = self._df([
             {"index": 100, "open": 10.0, "high": 10.2, "low": 9.8, "close": 10.0, "atr": 1.0, "rvol": 1.0},
@@ -597,8 +627,94 @@ class TriggerScannerTest(unittest.TestCase):
         self.assertEqual(diagnostics["rejected"]["weak_displacement"], 1)
         self.assertEqual(result.confirmed_trigger_debug["final_reason"], "quality_below_min")
 
-    def test_candidate_scoped_opposite_bos_invalidates_confirmed_scan(self):
+    def test_candidate_scoped_strong_opposite_bos_invalidates_confirmed_scan(self):
         candidate_id = "SCENARIO_LONG_OPPOSITE_BOS"
+        early = self._early("bullish_early_choch", index=110, quality=88)
+        early["candidate_id"] = candidate_id
+
+        result = scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": 100, "level": 9.5},
+            trigger_candidates=[
+                early,
+                {"candidate_id": candidate_id, "type": "bearish_bos", "index": 120, "quality_score": 85, "close": 9.4},
+            ],
+            selected_candidate_id=candidate_id,
+        )
+
+        self.assertFalse(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger_debug["rejected_candidates"][0]["rejected_reason"], "opposite_structure_invalidated_candidate")
+        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "opposite_structure_invalidated_candidate")
+
+    def test_strong_opposite_bos_without_physical_level_break_is_warning(self):
+        candidate_id = "SCENARIO_LONG_OPPOSITE_BOS_NO_LEVEL_BREAK"
+        early = self._early("bullish_early_choch", index=110, quality=88)
+        early["candidate_id"] = candidate_id
+
+        result = scan_post_anchor_trigger(
+            expected_direction="LONG",
+            sfp={"type": "bullish_sfp", "index": 100, "level": 9.5},
+            trigger_candidates=[
+                early,
+                {"candidate_id": candidate_id, "type": "bearish_bos", "index": 120, "quality_score": 95, "close": 9.6},
+            ],
+            selected_candidate_id=candidate_id,
+        )
+
+        self.assertFalse(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger_debug["invalidation_level"], 9.5)
+        self.assertEqual(result.confirmed_trigger_debug["rejected_candidates"][0]["rejected_reason"], "opposite_structure_warning")
+        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "no_candle_closed_beyond_break_level")
+
+    def test_pullback_opposite_bos_is_warning_below_invalidation_threshold(self):
+        candidate_id = "SCENARIO_SHORT_PULLBACK_OPPOSITE_BOS"
+        early = self._early("bearish_early_choch", index=110, quality=99)
+        early["candidate_id"] = candidate_id
+
+        result = scan_post_anchor_trigger(
+            expected_direction="SHORT",
+            sfp={"type": "bearish_sfp", "index": 100},
+            trigger_candidates=[
+                early,
+                {"candidate_id": candidate_id, "type": "bullish_choch", "index": 120, "quality_score": 78},
+            ],
+            selected_candidate_id=candidate_id,
+        )
+
+        self.assertFalse(result.trigger_confirmed)
+        self.assertEqual(result.confirmed_trigger_debug["rejected_candidates"][0]["rejected_reason"], "opposite_structure_warning")
+        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "no_candle_closed_beyond_break_level")
+
+    def test_strong_short_pullback_opposite_choch_needs_sfp_level_break_to_invalidate(self):
+        candidate_id = "SCENARIO_SHORT_STRONG_PULLBACK_OPPOSITE_CHOCH"
+        early = self._early("bearish_early_choch", index=110, quality=99)
+        early["candidate_id"] = candidate_id
+
+        warning = scan_post_anchor_trigger(
+            expected_direction="SHORT",
+            sfp={"type": "bearish_sfp", "index": 100, "level": 12.0},
+            trigger_candidates=[
+                early,
+                {"candidate_id": candidate_id, "type": "bullish_choch", "index": 120, "quality_score": 90, "close": 11.95},
+            ],
+            selected_candidate_id=candidate_id,
+        )
+        invalidated = scan_post_anchor_trigger(
+            expected_direction="SHORT",
+            sfp={"type": "bearish_sfp", "index": 100, "level": 12.0},
+            trigger_candidates=[
+                early,
+                {"candidate_id": candidate_id, "type": "bullish_choch", "index": 120, "quality_score": 90, "close": 12.05},
+            ],
+            selected_candidate_id=candidate_id,
+        )
+
+        self.assertEqual(warning.confirmed_trigger_debug["rejected_candidates"][0]["rejected_reason"], "opposite_structure_warning")
+        self.assertEqual(invalidated.confirmed_trigger_debug["rejected_candidates"][0]["rejected_reason"], "opposite_structure_invalidated_candidate")
+        self.assertEqual(invalidated.confirmed_trigger_debug["final_reason"], "opposite_structure_invalidated_candidate")
+
+    def test_weak_opposite_bos_is_warning_not_confirmed_scan_invalidation(self):
+        candidate_id = "SCENARIO_LONG_WEAK_OPPOSITE_BOS"
         early = self._early("bullish_early_choch", index=110, quality=88)
         early["candidate_id"] = candidate_id
 
@@ -607,14 +723,14 @@ class TriggerScannerTest(unittest.TestCase):
             sfp={"type": "bullish_sfp", "index": 100},
             trigger_candidates=[
                 early,
-                {"candidate_id": candidate_id, "type": "bearish_bos", "index": 120, "quality_score": 90},
+                {"candidate_id": candidate_id, "type": "bearish_bos", "index": 120, "quality_score": 62},
             ],
             selected_candidate_id=candidate_id,
         )
 
         self.assertFalse(result.trigger_confirmed)
-        self.assertEqual(result.confirmed_trigger_debug["rejected_candidates"][0]["rejected_reason"], "opposite_structure_invalidated_candidate")
-        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "opposite_structure_invalidated_candidate")
+        self.assertEqual(result.confirmed_trigger_debug["rejected_candidates"][0]["rejected_reason"], "opposite_structure_warning")
+        self.assertEqual(result.confirmed_trigger_debug["final_reason"], "no_candle_closed_beyond_break_level")
 
     def test_old_bos_before_new_early_choch_is_historical_only(self):
         candidate_id = "SCENARIO_LONG_OLD_BOS"

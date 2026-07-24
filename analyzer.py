@@ -35,7 +35,12 @@ from core.premium_discount import evaluate_premium_discount
 from core.risk import calculate_setup_score, format_setup_direction, resolve_session_decision, select_best_setup
 from core.risk_plan import RiskPlan, RiskPlanConfig, build_risk_plan
 from core.session import DEFAULT_TIMEZONE, evaluate_session, next_quarter_close
-from core.scenario_scanner import ScenarioEvent, scan_scenarios
+from core.scenario_scanner import (
+    COUNTERTREND_OVERRIDE_MIN_SFP_QUALITY,
+    COUNTERTREND_OVERRIDE_MIN_TRIGGER_QUALITY,
+    ScenarioEvent,
+    scan_scenarios,
+)
 from core.state_machine import SniperEvent, SniperStateMachine
 from core.trigger_scanner import scan_post_anchor_trigger
 
@@ -70,8 +75,8 @@ CODE_HASH_FILES = (
     "core/trigger_scanner.py",
     "core/risk_plan.py",
 )
-A_PLUS_DELIVERY_THRESHOLD = int(os.environ.get("A_PLUS_DELIVERY_THRESHOLD", "85"))
-MIN_SCENARIO_FVG_QUALITY = 70
+A_PLUS_DELIVERY_THRESHOLD = int(os.environ.get("A_PLUS_DELIVERY_THRESHOLD", "75"))
+MIN_SCENARIO_FVG_QUALITY = 60
 MAX_SCENARIO_FVG_AGE = 64
 MAX_SCENARIO_FVG_RETESTS = 3
 MIN_TRIGGER_QUALITY = 70
@@ -80,8 +85,16 @@ MIN_EARLY_TRIGGER_BODY_RATIO = 0.45
 MIN_EARLY_TRIGGER_DISPLACEMENT_ATR = 0.5
 MIN_EARLY_TRIGGER_RVOL = 1.2
 TRIGGER_LINK_WINDOW_BARS = 5
-MAX_TRIGGER_BARS_AFTER_SFP = 24
-MAX_TRIGGER_BARS_AFTER_POI = 24
+MAX_TRIGGER_BARS_AFTER_SFP = int(os.environ.get("MAX_TRIGGER_BARS_AFTER_SFP", "48"))
+MAX_TRIGGER_BARS_AFTER_POI = int(os.environ.get("MAX_TRIGGER_BARS_AFTER_POI", "24"))
+MAX_BARS_AFTER_EARLY_TRIGGER = int(os.environ.get("MAX_BARS_AFTER_EARLY_TRIGGER", "24"))
+MAX_BARS_AFTER_CONFIRMED_TRIGGER = int(os.environ.get("MAX_BARS_AFTER_CONFIRMED_TRIGGER", "12"))
+MAX_BARS_AFTER_FVG_CREATED = int(os.environ.get("MAX_BARS_AFTER_FVG_CREATED", "20"))
+MAX_SCENARIO_AGE_BARS = int(os.environ.get(
+    "MAX_SCENARIO_AGE_BARS",
+    os.environ.get("MAX_SCENARIO_TOTAL_WAIT_BARS", "96"),
+))
+MAX_SCENARIO_TOTAL_WAIT_BARS = MAX_SCENARIO_AGE_BARS
 if not GIT_COMMIT or GIT_COMMIT == "unknown":
     logger.warning("GIT_COMMIT is not configured")
 
@@ -107,6 +120,15 @@ last_alert_time = {coin: 0 for coin in COINS_LIST}
 _SCENARIO_TRANSITION_STATE = {}
 _SCENARIO_RUNTIME_STATE = {}
 EARLY_TRIGGER_WINDOW_EXPIRED_REASON = "early_trigger_window_expired"
+CONFIRMED_TRIGGER_WINDOW_EXPIRED_REASON = "confirmed_trigger_window_expired"
+FVG_CREATION_WINDOW_EXPIRED_REASON = "fvg_creation_window_expired"
+FVG_RETEST_WINDOW_EXPIRED_REASON = "fvg_retest_window_expired"
+SCENARIO_TOTAL_WINDOW_EXPIRED_REASON = "scenario_total_window_expired"
+SCENARIO_RATCHET_EVENT_TYPES = {
+    "FVG_CREATED",
+    "FVG_RETESTED",
+    "DISPLACEMENT_CONFIRMED",
+}
 
 
 def export_scenario_runtime_state():
@@ -547,6 +569,10 @@ def _event_snapshot(event):
         'type': event.get('type'),
         'index': str(event.get('index')) if event.get('index') is not None else None,
         'level': event.get('level'),
+        'open': event.get('open'),
+        'high': event.get('high'),
+        'low': event.get('low'),
+        'close': event.get('close'),
         'quality_score': event.get('quality_score'),
         'confidence': event.get('confidence'),
         'displacement_ratio': event.get('displacement_ratio'),
@@ -997,6 +1023,10 @@ def _config_hash():
         "trigger_link_window_bars": TRIGGER_LINK_WINDOW_BARS,
         "max_trigger_bars_after_sfp": MAX_TRIGGER_BARS_AFTER_SFP,
         "max_trigger_bars_after_poi": MAX_TRIGGER_BARS_AFTER_POI,
+        "max_bars_after_early_trigger": MAX_BARS_AFTER_EARLY_TRIGGER,
+        "max_bars_after_confirmed_trigger": MAX_BARS_AFTER_CONFIRMED_TRIGGER,
+        "max_bars_after_fvg_created": MAX_BARS_AFTER_FVG_CREATED,
+        "max_scenario_age_bars": MAX_SCENARIO_AGE_BARS,
         "telegram_report_detail": TELEGRAM_REPORT_DETAIL,
         "send_diagnostic_outside_kz": SEND_DIAGNOSTIC_OUTSIDE_KZ,
         "send_a_plus_outside_kz": SEND_A_PLUS_OUTSIDE_KZ,
@@ -1358,6 +1388,72 @@ def _scenario_event_payload(event):
     return payload if isinstance(payload, dict) else {}
 
 
+def _scenario_event_snapshot(event):
+    if event is None:
+        return None
+    return {
+        "event_type": _scenario_event_field(event, "event_type", None),
+        "direction": _scenario_event_field(event, "direction", None),
+        "index": _scenario_event_field(event, "index", None),
+        "quality_score": _scenario_event_field(event, "quality_score", None),
+        "source": _scenario_event_field(event, "source", None),
+        "payload": _scenario_event_payload(event),
+    }
+
+
+def _scenario_event_from_snapshot(snapshot):
+    if not isinstance(snapshot, dict) or not snapshot.get("event_type"):
+        return None
+    return _scenario_event(
+        snapshot.get("event_type"),
+        snapshot.get("direction"),
+        snapshot.get("index"),
+        snapshot.get("quality_score"),
+        snapshot.get("source"),
+        payload_to_dict(snapshot.get("payload")),
+    )
+
+
+def _scenario_event_dedupe_key(event):
+    payload = _scenario_event_payload(event)
+    return (
+        _scenario_event_field(event, "event_type", None),
+        _scenario_event_field(event, "direction", None),
+        str(_scenario_event_field(event, "index", None)),
+        str(payload.get("source_candidate_id") or payload.get("candidate_id") or ""),
+        str(payload.get("source_confirmed_trigger_id") or ""),
+    )
+
+
+def _ratcheted_candidate_events(candidate):
+    events = []
+    for event in getattr(candidate, "events_used", None) or []:
+        if _scenario_event_field(event, "event_type") not in SCENARIO_RATCHET_EVENT_TYPES:
+            continue
+        snapshot = _scenario_event_snapshot(event)
+        if snapshot:
+            events.append(snapshot)
+    return events
+
+
+def _merge_ratcheted_scenario_events(symbol, events):
+    merged = list(events or [])
+    seen = {_scenario_event_dedupe_key(event) for event in merged}
+    for (state_symbol, _), lifecycle in sorted(_SCENARIO_RUNTIME_STATE.items(), key=lambda item: str(item[0][1])):
+        if state_symbol != symbol or lifecycle.get("candidate_expired"):
+            continue
+        for snapshot in lifecycle.get("ratcheted_events") or []:
+            event = _scenario_event_from_snapshot(snapshot)
+            if event is None:
+                continue
+            key = _scenario_event_dedupe_key(event)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(event)
+    return merged
+
+
 def _build_scenario_transition_records(run_id, timestamp, symbol, scenario_scan, *, detected_at=None):
     if scenario_scan is None:
         return []
@@ -1454,15 +1550,32 @@ def _apply_runtime_update_counts(symbol, scenario_scan, analysis_time=None):
             int(lifecycle.get("market_age_bars", 0) or 0) if lifecycle else 0,
             _market_age_bars_between(first_index, last_index),
         )
-        max_wait_bars = _candidate_max_wait_bars(candidate)
+        phase_timeout = _candidate_phase_timeout(candidate, first_index, last_index)
+        max_wait_bars = phase_timeout["max_wait_bars"]
         expiration_reason = lifecycle.get("expiration_reason") if lifecycle else None
         candidate_expired = bool(lifecycle.get("candidate_expired")) if lifecycle else False
+        ratcheted_events = [] if getattr(candidate, "status", None) == "invalidated" else (
+            list(lifecycle.get("ratcheted_events") or []) if lifecycle else []
+        )
+        seen_ratcheted = set()
+        merged_ratcheted_events = []
+        for snapshot in ratcheted_events + _ratcheted_candidate_events(candidate):
+            event = _scenario_event_from_snapshot(snapshot)
+            if event is None:
+                continue
+            key = _scenario_event_dedupe_key(event)
+            if key in seen_ratcheted:
+                continue
+            seen_ratcheted.add(key)
+            merged_ratcheted_events.append(_scenario_event_snapshot(event))
+        ratcheted_events = merged_ratcheted_events
         if candidate_expired and expiration_reason:
             _expire_scenario_candidate(candidate, expiration_reason)
-        if _candidate_should_expire_waiting_for_early_trigger(candidate, market_age_bars, max_wait_bars):
+        if _candidate_should_expire_by_phase_timeout(candidate, phase_timeout):
             candidate_expired = True
-            expiration_reason = EARLY_TRIGGER_WINDOW_EXPIRED_REASON
+            expiration_reason = phase_timeout["expiration_reason"]
             _expire_scenario_candidate(candidate, expiration_reason)
+            ratcheted_events = []
         _SCENARIO_RUNTIME_STATE[cache_key] = {
             "runtime_update_count": runtime_update_count,
             "first_index": first_index,
@@ -1470,8 +1583,13 @@ def _apply_runtime_update_counts(symbol, scenario_scan, analysis_time=None):
             "last_scan_index": last_index,
             "market_age_bars": market_age_bars,
             "max_wait_bars": max_wait_bars,
+            "phase_name": phase_timeout["phase_name"],
+            "phase_anchor_index": phase_timeout["phase_anchor_index"],
+            "phase_age_bars": phase_timeout["phase_age_bars"],
+            "absolute_max_wait_bars": phase_timeout["absolute_max_wait_bars"],
             "candidate_expired": candidate_expired,
             "expiration_reason": expiration_reason,
+            "ratcheted_events": ratcheted_events,
         }
         candidate.runtime_update_count = runtime_update_count
         candidate.market_age_bars = market_age_bars
@@ -1487,17 +1605,25 @@ def _apply_runtime_update_counts(symbol, scenario_scan, analysis_time=None):
             candidate.trigger_scan["bars_waiting"] = market_age_bars
             candidate.trigger_scan["max_wait_bars"] = max_wait_bars
             candidate.trigger_scan["bars_remaining"] = max(max_wait_bars - market_age_bars, 0)
+            candidate.trigger_scan["phase_name"] = phase_timeout["phase_name"]
+            candidate.trigger_scan["phase_anchor_index"] = str(phase_timeout["phase_anchor_index"]) if phase_timeout["phase_anchor_index"] is not None else None
+            candidate.trigger_scan["phase_age_bars"] = phase_timeout["phase_age_bars"]
+            candidate.trigger_scan["phase_max_wait_bars"] = phase_timeout["max_wait_bars"]
+            candidate.trigger_scan["phase_bars_remaining"] = max(max_wait_bars - phase_timeout["phase_age_bars"], 0)
+            candidate.trigger_scan["absolute_max_wait_bars"] = phase_timeout["absolute_max_wait_bars"]
+            candidate.trigger_scan["absolute_bars_remaining"] = max(phase_timeout["absolute_max_wait_bars"] - market_age_bars, 0)
             candidate.trigger_scan["scans_waiting"] = runtime_update_count
             candidate.trigger_scan["candidate_expired"] = candidate_expired
             candidate.trigger_scan["expiration_reason"] = expiration_reason
             if candidate_expired:
                 candidate.trigger_scan["rejected_reason"] = expiration_reason
                 candidate.trigger_scan["waiting_for"] = None
-                candidate.trigger_scan["early_trigger_confirmed"] = False
-                candidate.trigger_scan["trigger_confirmed"] = False
-                candidate.trigger_scan["selected_trigger"] = None
-                candidate.trigger_scan["confirmed_trigger"] = None
-                candidate.trigger_scan["early_trigger"] = None
+                if expiration_reason == EARLY_TRIGGER_WINDOW_EXPIRED_REASON:
+                    candidate.trigger_scan["early_trigger_confirmed"] = False
+                    candidate.trigger_scan["trigger_confirmed"] = False
+                    candidate.trigger_scan["selected_trigger"] = None
+                    candidate.trigger_scan["confirmed_trigger"] = None
+                    candidate.trigger_scan["early_trigger"] = None
     _refresh_scenario_selection_after_lifetime(scenario_scan)
     for cache_key in list(_SCENARIO_RUNTIME_STATE.keys()):
         if cache_key[0] == symbol and cache_key[1] not in seen:
@@ -1546,6 +1672,92 @@ def _candidate_max_wait_bars(candidate):
     return int(MAX_TRIGGER_BARS_AFTER_SFP)
 
 
+def _candidate_phase_timeout(candidate, first_index, last_index):
+    phase = _candidate_timeout_phase(candidate)
+    absolute_max = int(MAX_SCENARIO_AGE_BARS)
+    absolute_age = _market_age_bars_between(first_index, last_index)
+    if phase is None:
+        return {
+            "phase_name": None,
+            "phase_anchor_index": first_index,
+            "phase_age_bars": absolute_age,
+            "max_wait_bars": _candidate_max_wait_bars(candidate),
+            "absolute_max_wait_bars": absolute_max,
+            "expiration_reason": SCENARIO_TOTAL_WINDOW_EXPIRED_REASON if absolute_age > absolute_max else None,
+        }
+
+    phase_anchor_index = _candidate_event_index(candidate, phase["anchor_event_types"]) or first_index
+    phase_age = _market_age_bars_between(phase_anchor_index, last_index)
+    expiration_reason = None
+    if absolute_age > absolute_max:
+        expiration_reason = SCENARIO_TOTAL_WINDOW_EXPIRED_REASON
+    elif phase_age > phase["max_wait_bars"]:
+        expiration_reason = phase["expiration_reason"]
+    return {
+        "phase_name": phase["phase_name"],
+        "phase_anchor_index": phase_anchor_index,
+        "phase_age_bars": phase_age,
+        "max_wait_bars": int(phase["max_wait_bars"]),
+        "absolute_max_wait_bars": absolute_max,
+        "expiration_reason": expiration_reason,
+    }
+
+
+def _candidate_timeout_phase(candidate):
+    if getattr(candidate, "status", None) == "invalidated":
+        return None
+    next_step = getattr(candidate, "next_expected_step", None)
+    if next_step == "EARLY_TRIGGER_CONFIRMED":
+        return {
+            "phase_name": "sfp_to_early_trigger",
+            "anchor_event_types": {"SFP_CONFIRMED", "LIQUIDITY_SWEEP_CONFIRMED"},
+            "max_wait_bars": _candidate_max_wait_bars(candidate),
+            "expiration_reason": EARLY_TRIGGER_WINDOW_EXPIRED_REASON,
+        }
+    if next_step == "CONFIRMED_TRIGGER_CONFIRMED":
+        return {
+            "phase_name": "early_trigger_to_confirmed_trigger",
+            "anchor_event_types": {"EARLY_TRIGGER_CONFIRMED"},
+            "max_wait_bars": MAX_BARS_AFTER_EARLY_TRIGGER,
+            "expiration_reason": CONFIRMED_TRIGGER_WINDOW_EXPIRED_REASON,
+        }
+    if next_step == "FVG_CREATED":
+        return {
+            "phase_name": "confirmed_trigger_to_fvg_created",
+            "anchor_event_types": {"CONFIRMED_TRIGGER_CONFIRMED", "BOS_CONFIRMED", "CHOCH_CONFIRMED"},
+            "max_wait_bars": MAX_BARS_AFTER_CONFIRMED_TRIGGER,
+            "expiration_reason": FVG_CREATION_WINDOW_EXPIRED_REASON,
+        }
+    if next_step == "FVG_RETESTED":
+        return {
+            "phase_name": "fvg_created_to_retest",
+            "anchor_event_types": {"FVG_CREATED"},
+            "max_wait_bars": MAX_BARS_AFTER_FVG_CREATED,
+            "expiration_reason": FVG_RETEST_WINDOW_EXPIRED_REASON,
+        }
+    return None
+
+
+def _candidate_event_index(candidate, event_types):
+    for event in reversed(getattr(candidate, "events_used", None) or []):
+        if _scenario_event_field(event, "event_type") in event_types:
+            return _scenario_event_field(event, "index", None)
+    trigger_scan = getattr(candidate, "trigger_scan", None)
+    if isinstance(trigger_scan, dict):
+        if {"SFP_CONFIRMED", "LIQUIDITY_SWEEP_CONFIRMED"} & set(event_types):
+            return trigger_scan.get("sfp_index") or trigger_scan.get("anchor_index")
+        if "EARLY_TRIGGER_CONFIRMED" in event_types:
+            early = trigger_scan.get("early_trigger") if isinstance(trigger_scan.get("early_trigger"), dict) else {}
+            return early.get("index")
+        if {"CONFIRMED_TRIGGER_CONFIRMED", "BOS_CONFIRMED", "CHOCH_CONFIRMED"} & set(event_types):
+            confirmed = trigger_scan.get("confirmed_trigger") if isinstance(trigger_scan.get("confirmed_trigger"), dict) else {}
+            return confirmed.get("index") or trigger_scan.get("trigger_index")
+        if "FVG_CREATED" in event_types:
+            fvg = trigger_scan.get("fvg_created") if isinstance(trigger_scan.get("fvg_created"), dict) else {}
+            return fvg.get("index") or fvg.get("created_index")
+    return None
+
+
 def _candidate_has_early_or_confirmed_trigger(candidate):
     trigger_scan = getattr(candidate, "trigger_scan", None)
     if isinstance(trigger_scan, dict):
@@ -1558,6 +1770,12 @@ def _candidate_has_early_or_confirmed_trigger(candidate):
         if event_type in {"EARLY_TRIGGER_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED", "CHOCH_CONFIRMED", "BOS_CONFIRMED"}:
             return True
     return False
+
+
+def _candidate_should_expire_by_phase_timeout(candidate, phase_timeout):
+    if getattr(candidate, "status", None) == "invalidated":
+        return False
+    return bool((phase_timeout or {}).get("expiration_reason"))
 
 
 def _candidate_should_expire_waiting_for_early_trigger(candidate, market_age_bars, max_wait_bars):
@@ -1586,7 +1804,7 @@ def _expire_scenario_candidate(candidate, reason):
     candidate.signal_allowed = False
     candidate.scenario_valid = False
     candidate.invalidated_reason = reason
-    candidate.last_invalidated_component = "early_trigger"
+    candidate.last_invalidated_component = _expiration_component(reason)
     candidate.candidate_invalidated = True
     candidate.waiting_for = None
     observation = {
@@ -1607,6 +1825,16 @@ def _expire_scenario_candidate(candidate, reason):
             "reason": reason,
         })
     candidate.event_diagnostics = diagnostics
+
+
+def _expiration_component(reason):
+    return {
+        EARLY_TRIGGER_WINDOW_EXPIRED_REASON: "early_trigger",
+        CONFIRMED_TRIGGER_WINDOW_EXPIRED_REASON: "confirmed_trigger",
+        FVG_CREATION_WINDOW_EXPIRED_REASON: "fvg_created",
+        FVG_RETEST_WINDOW_EXPIRED_REASON: "fvg_retested",
+        SCENARIO_TOTAL_WINDOW_EXPIRED_REASON: "scenario_total_window",
+    }.get(reason, "scenario_timeout")
 
 
 def _refresh_scenario_selection_after_lifetime(scenario_scan):
@@ -3179,6 +3407,15 @@ def _build_shadow_candidate(
     has_trigger = bool(trigger_event)
     preliminary_risk_valid = rr is not None and rr >= RiskPlanConfig().min_rr_for_watchlist
     confirmed_trigger = bool(trigger_event and float(trigger_event.get("quality_score") or 0.0) >= MIN_TRIGGER_QUALITY)
+    sfp_quality = _safe_float((sfp_data or {}).get("quality_score"))
+    trigger_quality = _safe_float((trigger_event or {}).get("quality_score"))
+    countertrend_override = (
+        not htf_supportive
+        and sfp_quality is not None
+        and trigger_quality is not None
+        and sfp_quality >= COUNTERTREND_OVERRIDE_MIN_SFP_QUALITY
+        and trigger_quality >= COUNTERTREND_OVERRIDE_MIN_TRIGGER_QUALITY
+    )
     tier = "C"
     rejection_reasons = []
     if target is None:
@@ -3195,11 +3432,11 @@ def _build_shadow_candidate(
         rejection_reasons.append("preliminary_risk_invalid")
     if (has_sweep or has_poi) and has_trigger and preliminary_risk_valid:
         tier = "B"
-    if not htf_supportive:
+    if not htf_supportive and not countertrend_override:
         rejection_reasons.append("htf_not_directionally_supportive")
     if not confirmed_trigger:
         rejection_reasons.append("confirmed_trigger_missing")
-    if tier == "B" and htf_supportive and confirmed_trigger and rr is not None and rr >= RiskPlanConfig().min_rr_for_a_plus:
+    if tier == "B" and (htf_supportive or countertrend_override) and confirmed_trigger and rr is not None and rr >= RiskPlanConfig().min_rr_for_a_plus:
         tier = "A"
 
     anchor_type = str(anchor.get("type") or "structure")
@@ -3213,6 +3450,16 @@ def _build_shadow_candidate(
         "shadow_created_at": str(created_at) if created_at is not None else None,
         "shadow_rejection_reasons": sorted(set(rejection_reasons)),
         "htf_context_class": "directional" if htf_direction in ("bullish", "bearish") else "neutral",
+        "countertrend_override": {
+            "applied": countertrend_override,
+            "reason": "high_quality_ltf_sfp_and_trigger" if countertrend_override else None,
+            "htf_direction": htf_direction,
+            "scenario_direction": direction,
+            "sfp_quality": sfp_quality,
+            "required_sfp_quality": COUNTERTREND_OVERRIDE_MIN_SFP_QUALITY,
+            "trigger_quality": trigger_quality,
+            "required_trigger_quality": COUNTERTREND_OVERRIDE_MIN_TRIGGER_QUALITY,
+        },
         "entry": entry,
         "stop_loss": stop,
         "target_1": target,
@@ -4357,6 +4604,7 @@ def analyze_symbol_snapshot(
         None,
         last_closed_15m,
     )
+    scenario_events = _merge_ratcheted_scenario_events(coin, scenario_events)
     scenario_scan = scan_scenarios(
         events=scenario_events,
         expected_direction=direction,
@@ -4418,6 +4666,7 @@ def analyze_symbol_snapshot(
             risk_plan,
             last_closed_15m,
         )
+        scenario_events = _merge_ratcheted_scenario_events(coin, scenario_events)
         scenario_scan = scan_scenarios(
             events=scenario_events,
             expected_direction=direction,
@@ -4460,6 +4709,7 @@ def analyze_symbol_snapshot(
                 risk_plan,
                 last_closed_15m,
             )
+            scenario_events = _merge_ratcheted_scenario_events(coin, scenario_events)
             scenario_scan = scan_scenarios(
                 events=scenario_events,
                 expected_direction=direction,

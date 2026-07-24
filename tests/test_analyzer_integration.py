@@ -8,7 +8,7 @@ os.environ.setdefault("GEMINI_API_KEY", "test-key")
 
 import analyzer
 from core.risk_plan import RiskPlan
-from core.scenario_scanner import ScenarioEvent, ScenarioScanResult, ScenarioScannerOutput
+from core.scenario_scanner import ScenarioEvent, ScenarioScanResult, ScenarioScannerOutput, scan_scenarios
 from core.structure import MarketStructure
 
 
@@ -143,6 +143,45 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertEqual(shadow["shadow_direction"], "LONG")
         self.assertEqual(shadow["htf_context_class"], "neutral")
         self.assertIn("htf_not_directionally_supportive", shadow["shadow_rejection_reasons"])
+
+    def test_shadow_countertrend_override_can_promote_a_tier_candidate(self):
+        liquidity_map = {
+            "nearest_buy_side": {"price": 104.0},
+            "nearest_sell_side": {"price": 98.0},
+        }
+        trigger = {
+            "type": "bullish_bos",
+            "index": pd.Timestamp("2026-01-01 10:00:00"),
+            "level": 101.0,
+            "quality_score": 95,
+        }
+        shadow = analyzer._build_shadow_candidate(
+            symbol="LTC",
+            htf_context={"direction": "bearish"},
+            market_structure=MarketStructure(trend="bearish", confidence=80, reason="EMA99 down"),
+            context_break_1h=None,
+            trigger_break_15m=trigger,
+            long_trigger_candidate=trigger,
+            short_trigger_candidate=None,
+            sfp_data={
+                "type": "bullish_sfp",
+                "index": pd.Timestamp("2026-01-01 09:30:00"),
+                "level": 100.0,
+                "quality_score": 90,
+            },
+            premium_discount_data=None,
+            liquidity_map=liquidity_map,
+            current_price=102.0,
+            atr=2.0,
+            risk_plan=None,
+            scenario_scan=None,
+            created_at="2026-01-01 10:15:00",
+        )
+
+        self.assertIsNotNone(shadow)
+        self.assertEqual(shadow["shadow_tier"], "A")
+        self.assertTrue(shadow["countertrend_override"]["applied"])
+        self.assertNotIn("htf_not_directionally_supportive", shadow["shadow_rejection_reasons"])
 
     def test_shadow_candidate_id_is_stable_across_repeated_scan_timestamp(self):
         liquidity_map = {"nearest_buy_side": {"price": 110.0}, "nearest_sell_side": {"price": 96.0}}
@@ -757,6 +796,45 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertIn("fvg_retested", gate["failed_gates"])
         self.assertFalse(score_result["diagnostics"]["a_plus_delivery_allowed"])
 
+    def test_a_plus_delivery_gate_uses_configured_delivery_threshold(self):
+        analysis_data = {
+            "scenario_scan": {
+                "selected_scenario": {
+                    "scenario_valid": True,
+                    "signal_allowed": True,
+                    "risk_valid": True,
+                    "events_used": [
+                        {"event_type": "FVG_CREATED"},
+                        {"event_type": "FVG_RETESTED"},
+                        {"event_type": "DISPLACEMENT_CONFIRMED"},
+                    ],
+                }
+            }
+        }
+        diagnostics = {
+            "scenario_scan_valid": True,
+            "scenario_scan_signal_allowed": True,
+            "trigger_confirmed": True,
+            "scenario_risk_valid": True,
+        }
+
+        with patch.object(analyzer, "A_PLUS_DELIVERY_THRESHOLD", 75):
+            passing = analyzer._a_plus_delivery_gate(
+                {"total_score": 75, "diagnostics": dict(diagnostics)},
+                analysis_data,
+                in_kill_zone=True,
+            )
+            failing = analyzer._a_plus_delivery_gate(
+                {"total_score": 74, "diagnostics": dict(diagnostics)},
+                analysis_data,
+                in_kill_zone=True,
+            )
+
+        self.assertTrue(passing["allowed"])
+        self.assertEqual(passing["threshold"], 75)
+        self.assertFalse(failing["allowed"])
+        self.assertIn("score_threshold", failing["failed_gates"])
+
     def test_a_plus_delivery_gate_can_bypass_kill_zone_only_for_complete_setup(self):
         score_result = {
             "total_score": 90,
@@ -1093,7 +1171,56 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertEqual(len(third), 1)
         self.assertEqual(third[0]["from_state"], "WAITING_FOR_CONFIRMED_TRIGGER_CONFIRMED")
         self.assertEqual(third[0]["to_state"], "WAITING_FOR_FVG_CREATED")
-        analyzer._SCENARIO_TRANSITION_STATE.clear()
+
+    def test_runtime_state_ratchets_fvg_created_across_scans(self):
+        candidate_id = "SCENARIO_LONG_SFP_CONFIRMED_2_none"
+        base_events = [
+            ScenarioEvent("HTF_CONTEXT_CONFIRMED", "bullish", -2),
+            ScenarioEvent("SFP_CONFIRMED", "bullish", 2),
+            ScenarioEvent("EARLY_TRIGGER_CONFIRMED", "bullish", 3),
+            ScenarioEvent(
+                "BOS_CONFIRMED",
+                "bullish",
+                4,
+                quality_score=95,
+                payload={"type": "bullish_bos", "event_id": "bos-A"},
+            ),
+        ]
+        first_events = base_events + [
+            ScenarioEvent(
+                "FVG_CREATED",
+                "bullish",
+                5,
+                quality_score=90,
+                source="fvg",
+                payload={
+                    "source_candidate_id": candidate_id,
+                    "source_confirmed_trigger_id": "bos-A",
+                    "created_index": 5,
+                    "end_index": 5,
+                },
+            )
+        ]
+
+        first_scan = scan_scenarios(
+            events=first_events,
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+        )
+        self.assertEqual(first_scan.selected_scenario.candidate_id, candidate_id)
+        self.assertEqual(first_scan.selected_scenario.current_step, "fvg_created")
+
+        analyzer._apply_runtime_update_counts("RUNE", first_scan, analysis_time=6)
+        second_events = analyzer._merge_ratcheted_scenario_events("RUNE", base_events)
+        second_scan = scan_scenarios(
+            events=second_events,
+            expected_direction="LONG",
+            htf_structure={"trend": "bullish"},
+        )
+
+        self.assertEqual(second_scan.selected_scenario.candidate_id, candidate_id)
+        self.assertEqual(second_scan.selected_scenario.current_step, "fvg_created")
+        self.assertEqual(second_scan.selected_scenario.next_expected_step, "FVG_RETESTED")
 
     def test_scenario_transition_invalidation_contains_component_and_reason(self):
         analyzer._SCENARIO_TRANSITION_STATE.clear()
@@ -1327,7 +1454,7 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         )
 
     def test_bars_waiting_from_candle_timestamps_and_boundaries(self):
-        expectations = [(0, "building"), (1, "building"), (23, "building"), (24, "building"), (25, "invalidated")]
+        expectations = [(0, "building"), (1, "building"), (47, "building"), (48, "building"), (49, "invalidated")]
         for bars, status in expectations:
             analyzer.reset_scenario_runtime_state()
             candidate = self._early_wait_candidate(candidate_id=f"CAND-{bars}")
@@ -1337,6 +1464,170 @@ class AnalyzerIntegrationTest(unittest.TestCase):
             self.assertEqual(candidate.trigger_scan["bars_waiting"], bars)
             self.assertEqual(candidate.status, status)
         self.assertEqual(candidate.invalidated_reason, analyzer.EARLY_TRIGGER_WINDOW_EXPIRED_REASON)
+
+    def test_phase_timer_resets_after_early_trigger(self):
+        anchor = pd.Timestamp("2026-07-18 13:30:00")
+        early = anchor + pd.Timedelta(minutes=15 * 40)
+        candidate = ScenarioScanResult(
+            direction="LONG",
+            status="waiting_for_confirmation",
+            current_step="early_trigger_confirmed",
+            next_expected_step="CONFIRMED_TRIGGER_CONFIRMED",
+            signal_allowed=False,
+            scenario_valid=False,
+            completion_ratio=0.4,
+            completed_steps=4,
+            total_steps=10,
+            quality_score=80,
+            candidate_id="PHASE-RESET",
+            anchor_type="SFP_CONFIRMED",
+            anchor_index=anchor,
+            last_event_index=early,
+            waiting_for="confirmed bullish BOS after early CHOCH",
+            events_used=[
+                ScenarioEvent("SFP_CONFIRMED", "bullish", anchor, quality_score=90),
+                ScenarioEvent("EARLY_TRIGGER_CONFIRMED", "bullish", early, quality_score=80),
+            ],
+            trigger_scan={
+                "candidate_id": "PHASE-RESET",
+                "sfp_index": str(anchor),
+                "early_trigger": {"index": str(early), "quality_score": 80},
+                "early_trigger_confirmed": True,
+                "trigger_confirmed": False,
+            },
+        )
+        scan = self._scan_with_candidate(candidate)
+
+        analyzer._apply_runtime_update_counts("ADA", scan, analysis_time=early + pd.Timedelta(minutes=15 * 23))
+
+        self.assertEqual(candidate.status, "waiting_for_confirmation")
+        self.assertEqual(candidate.market_age_bars, 63)
+        self.assertEqual(candidate.trigger_scan["phase_name"], "early_trigger_to_confirmed_trigger")
+        self.assertEqual(candidate.trigger_scan["phase_age_bars"], 23)
+        self.assertEqual(candidate.trigger_scan["phase_max_wait_bars"], 24)
+        self.assertEqual(candidate.trigger_scan["absolute_max_wait_bars"], 96)
+
+    def test_confirmed_trigger_to_fvg_created_window_expires_without_clearing_trigger(self):
+        anchor = pd.Timestamp("2026-07-18 13:30:00")
+        early = anchor + pd.Timedelta(minutes=15 * 4)
+        confirmed = anchor + pd.Timedelta(minutes=15 * 5)
+        candidate = ScenarioScanResult(
+            direction="LONG",
+            status="waiting_for_confirmation",
+            current_step="confirmed_trigger_confirmed",
+            next_expected_step="FVG_CREATED",
+            signal_allowed=False,
+            scenario_valid=False,
+            completion_ratio=0.5,
+            completed_steps=5,
+            total_steps=10,
+            quality_score=86,
+            candidate_id="FVG-CREATE-EXPIRE",
+            anchor_type="SFP_CONFIRMED",
+            anchor_index=anchor,
+            last_event_index=confirmed,
+            waiting_for="bullish FVG after confirmed BOS",
+            events_used=[
+                ScenarioEvent("SFP_CONFIRMED", "bullish", anchor, quality_score=92),
+                ScenarioEvent("EARLY_TRIGGER_CONFIRMED", "bullish", early, quality_score=84),
+                ScenarioEvent("CONFIRMED_TRIGGER_CONFIRMED", "bullish", confirmed, quality_score=90),
+            ],
+            trigger_scan={
+                "candidate_id": "FVG-CREATE-EXPIRE",
+                "sfp_index": str(anchor),
+                "trigger_index": str(confirmed),
+                "early_trigger": {"index": str(early), "quality_score": 84},
+                "confirmed_trigger": {"index": str(confirmed), "quality_score": 90},
+                "early_trigger_confirmed": True,
+                "trigger_confirmed": True,
+            },
+        )
+        scan = self._scan_with_candidate(candidate)
+
+        analyzer._apply_runtime_update_counts("ADA", scan, analysis_time=confirmed + pd.Timedelta(minutes=15 * 13))
+
+        self.assertEqual(candidate.status, "invalidated")
+        self.assertEqual(candidate.invalidated_reason, analyzer.FVG_CREATION_WINDOW_EXPIRED_REASON)
+        self.assertEqual(candidate.last_invalidated_component, "fvg_created")
+        self.assertEqual(candidate.trigger_scan["phase_name"], "confirmed_trigger_to_fvg_created")
+        self.assertEqual(candidate.trigger_scan["phase_age_bars"], 13)
+        self.assertEqual(candidate.trigger_scan["phase_max_wait_bars"], 12)
+        self.assertTrue(candidate.trigger_scan["early_trigger_confirmed"])
+        self.assertTrue(candidate.trigger_scan["trigger_confirmed"])
+        self.assertIsNotNone(candidate.trigger_scan["confirmed_trigger"])
+
+    def test_fvg_retest_window_anchors_to_fvg_creation_candle(self):
+        anchor = pd.Timestamp("2026-07-18 13:30:00")
+        early = anchor + pd.Timedelta(minutes=15 * 1)
+        confirmed = anchor + pd.Timedelta(minutes=15 * 2)
+        fvg_created = anchor + pd.Timedelta(minutes=15 * 5)
+
+        def make_candidate(candidate_id):
+            return ScenarioScanResult(
+                direction="LONG",
+                status="waiting_for_confirmation",
+                current_step="fvg_created",
+                next_expected_step="FVG_RETESTED",
+                signal_allowed=False,
+                scenario_valid=False,
+                completion_ratio=0.6,
+                completed_steps=6,
+                total_steps=10,
+                quality_score=88,
+                candidate_id=candidate_id,
+                anchor_type="SFP_CONFIRMED",
+                anchor_index=anchor,
+                last_event_index=fvg_created,
+                waiting_for="bullish FVG retest",
+                events_used=[
+                    ScenarioEvent("SFP_CONFIRMED", "bullish", anchor, quality_score=92),
+                    ScenarioEvent("EARLY_TRIGGER_CONFIRMED", "bullish", early, quality_score=84),
+                    ScenarioEvent("CONFIRMED_TRIGGER_CONFIRMED", "bullish", confirmed, quality_score=90),
+                    ScenarioEvent(
+                        "FVG_CREATED",
+                        "bullish",
+                        fvg_created,
+                        quality_score=82,
+                        payload={"created_index": fvg_created, "end_index": fvg_created},
+                    ),
+                ],
+                trigger_scan={
+                    "candidate_id": candidate_id,
+                    "sfp_index": str(anchor),
+                    "trigger_index": str(confirmed),
+                    "early_trigger": {"index": str(early), "quality_score": 84},
+                    "confirmed_trigger": {"index": str(confirmed), "quality_score": 90},
+                    "fvg_created": {"index": str(fvg_created), "created_index": str(fvg_created), "quality_score": 82},
+                    "early_trigger_confirmed": True,
+                    "trigger_confirmed": True,
+                },
+            )
+
+        alive = make_candidate("FVG-RETEST-ALIVE")
+        analyzer._apply_runtime_update_counts(
+            "ADA",
+            self._scan_with_candidate(alive),
+            analysis_time=fvg_created + pd.Timedelta(minutes=15 * 20),
+        )
+
+        self.assertEqual(alive.status, "waiting_for_confirmation")
+        self.assertEqual(alive.market_age_bars, 25)
+        self.assertEqual(alive.trigger_scan["phase_name"], "fvg_created_to_retest")
+        self.assertEqual(alive.trigger_scan["phase_anchor_index"], str(fvg_created))
+        self.assertEqual(alive.trigger_scan["phase_age_bars"], 20)
+        self.assertEqual(alive.trigger_scan["phase_max_wait_bars"], 20)
+
+        expired = make_candidate("FVG-RETEST-EXPIRED")
+        analyzer._apply_runtime_update_counts(
+            "ADA",
+            self._scan_with_candidate(expired),
+            analysis_time=fvg_created + pd.Timedelta(minutes=15 * 21),
+        )
+
+        self.assertEqual(expired.status, "invalidated")
+        self.assertEqual(expired.invalidated_reason, analyzer.FVG_RETEST_WINDOW_EXPIRED_REASON)
+        self.assertEqual(expired.last_invalidated_component, "fvg_retested")
+        self.assertEqual(expired.trigger_scan["phase_age_bars"], 21)
 
     def test_same_candle_repeated_scan_does_not_increase_bar_age_or_scan_count(self):
         candidate = self._early_wait_candidate(candidate_id="SAME-CANDLE")
@@ -1350,7 +1641,7 @@ class AnalyzerIntegrationTest(unittest.TestCase):
     def test_runtime_roundtrip_preserves_age_and_expiration_status(self):
         candidate = self._early_wait_candidate(candidate_id="ROUNDTRIP")
         scan = self._scan_with_candidate(candidate)
-        analyzer._apply_runtime_update_counts("LDO", scan, analysis_time="2026-07-18 20:00:00")
+        analyzer._apply_runtime_update_counts("LDO", scan, analysis_time="2026-07-19 02:00:00")
         self.assertEqual(candidate.status, "invalidated")
         snapshot = analyzer.export_scenario_runtime_state()
 
@@ -1361,12 +1652,12 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         analyzer._apply_runtime_update_counts("LDO", restored_scan, analysis_time="2026-07-18 13:45:00")
         self.assertEqual(restored.status, "invalidated")
         self.assertEqual(restored.invalidated_reason, analyzer.EARLY_TRIGGER_WINDOW_EXPIRED_REASON)
-        self.assertEqual(restored.market_age_bars, 26)
+        self.assertEqual(restored.market_age_bars, 50)
 
     def test_late_trigger_rejected_after_window_boundary(self):
         sfp = {"index": pd.Timestamp("2026-07-18 13:30:00")}
-        on_time = {"type": "bullish_early_choch", "index": pd.Timestamp("2026-07-18 19:30:00"), "quality_score": 80, "body_ratio": 0.7, "displacement_ratio": 1.0, "close_position": 0.8, "micro_break_confirmed": True}
-        late = dict(on_time, index=pd.Timestamp("2026-07-18 19:45:00"))
+        on_time = {"type": "bullish_early_choch", "index": pd.Timestamp("2026-07-19 01:30:00"), "quality_score": 80, "body_ratio": 0.7, "displacement_ratio": 1.0, "close_position": 0.8, "micro_break_confirmed": True}
+        late = dict(on_time, index=pd.Timestamp("2026-07-19 01:45:00"))
         accepted = analyzer.scan_post_anchor_trigger("LONG", sfp=sfp, trigger_candidates=[on_time], min_early_trigger_quality=55)
         rejected = analyzer.scan_post_anchor_trigger("LONG", sfp=sfp, trigger_candidates=[late], min_early_trigger_quality=55)
         self.assertTrue(accepted.early_trigger_confirmed)
@@ -1376,7 +1667,7 @@ class AnalyzerIntegrationTest(unittest.TestCase):
     def test_expired_candidate_terminal_and_stage_aware_reason(self):
         candidate = self._early_wait_candidate(candidate_id="EXPIRE")
         scan = self._scan_with_candidate(candidate)
-        analyzer._apply_runtime_update_counts("AAVE", scan, analysis_time="2026-07-18 20:00:00")
+        analyzer._apply_runtime_update_counts("AAVE", scan, analysis_time="2026-07-19 02:00:00")
         self.assertIsNone(scan.selected_scenario)
         self.assertEqual(scan.reason, analyzer.EARLY_TRIGGER_WINDOW_EXPIRED_REASON)
         self.assertEqual(candidate.status, "invalidated")
@@ -1386,7 +1677,7 @@ class AnalyzerIntegrationTest(unittest.TestCase):
     def test_expired_candidate_stays_expired_and_new_sfp_is_fresh(self):
         old = self._early_wait_candidate(candidate_id="OLD", anchor="2026-07-18 13:30:00")
         old_scan = self._scan_with_candidate(old)
-        analyzer._apply_runtime_update_counts("LDO", old_scan, analysis_time="2026-07-18 20:00:00")
+        analyzer._apply_runtime_update_counts("LDO", old_scan, analysis_time="2026-07-19 02:00:00")
         self.assertEqual(old.status, "invalidated")
 
         new = self._early_wait_candidate(candidate_id="NEW", anchor="2026-07-18 20:15:00")
@@ -2109,6 +2400,33 @@ class AnalyzerIntegrationTest(unittest.TestCase):
         self.assertFalse(result.signal_allowed)
         self.assertIn("waiting_for_fvg", status)
         self.assertNotIn("Unexpected fvg_created", status)
+
+    def test_scenario_fvg_quality_threshold_accepts_sixty(self):
+        rejected, accepted = analyzer._annotate_scenario_fvgs([
+            {
+                "type": "bullish",
+                "end_index": 5,
+                "tested": False,
+                "invalidated": False,
+                "quality_score": 59,
+                "age_bars": 2,
+                "retest_count": 0,
+            },
+            {
+                "type": "bullish",
+                "end_index": 6,
+                "tested": False,
+                "invalidated": False,
+                "quality_score": 60,
+                "age_bars": 2,
+                "retest_count": 0,
+            },
+        ])
+
+        self.assertFalse(rejected["scenario_valid"])
+        self.assertEqual(rejected["scenario_reject_reason"], "fvg_quality_below_min")
+        self.assertTrue(accepted["scenario_valid"])
+        self.assertIsNone(accepted["scenario_reject_reason"])
 
     def test_state_machine_ignores_unrelated_candidate_fvg(self):
         market_structure = MarketStructure(trend="bullish", confidence=80, reason="test")

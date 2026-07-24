@@ -171,6 +171,8 @@ WAITING_TEXT = {
 }
 
 CONFIRMED_TRIGGER_MIN_QUALITY = 70
+COUNTERTREND_OVERRIDE_MIN_SFP_QUALITY = 85
+COUNTERTREND_OVERRIDE_MIN_TRIGGER_QUALITY = 90
 
 
 def scan_scenarios(
@@ -185,21 +187,23 @@ def scan_scenarios(
     normalized_events = sorted([_as_event(event) for event in events or []], key=lambda item: _event_sort_key(item.index))
     htf_trend = _htf_trend(htf_structure, normalized_events)
     if htf_trend == "neutral":
-        return ScenarioScannerOutput(
-            best_long_scenario=None,
-            best_short_scenario=None,
-            selected_scenario=None,
-            selected_direction=None,
-            signal_allowed=False,
-            scenario_valid=False,
-            reason="htf_neutral_no_scenario",
-            long_candidates=[],
-            short_candidates=[],
-            top_candidates=[],
-            candidate_counts=_candidate_counts([], []),
-            direction_block_reasons={},
-        )
-
+        if _neutral_htf_is_tradable(expected_direction, normalized_events, premium_discount):
+            htf_trend = None
+        else:
+            return ScenarioScannerOutput(
+                best_long_scenario=None,
+                best_short_scenario=None,
+                selected_scenario=None,
+                selected_direction=None,
+                signal_allowed=False,
+                scenario_valid=False,
+                reason="htf_neutral_no_scenario",
+                long_candidates=[],
+                short_candidates=[],
+                top_candidates=[],
+                candidate_counts=_candidate_counts([], []),
+                direction_block_reasons={},
+            )
     direction_block_reasons = {
         direction: reason
         for direction, reason in {
@@ -290,8 +294,7 @@ def _scan_direction_candidates(
     risk_plan: Optional[object],
     strict_bos_after_choch: bool,
 ) -> list[ScenarioScanResult]:
-    hard_invalid_reason = _direction_block_reason(direction, htf_trend, premium_discount)
-    if hard_invalid_reason:
+    if premium_discount is not None and not _pd_valid_for_direction(direction, premium_discount):
         return []
 
     anchors = _candidate_anchors(direction, events)
@@ -300,18 +303,19 @@ def _scan_direction_candidates(
 
     candidates = []
     for sequence, anchor in enumerate(anchors, start=1):
-        candidates.append(
-            _scan_direction(
-                direction,
-                _events_for_candidate(direction, events, anchor),
-                htf_trend=htf_trend,
-                premium_discount=None,
-                risk_plan=risk_plan,
-                strict_bos_after_choch=strict_bos_after_choch,
-                anchor_event=anchor,
-                candidate_sequence=sequence,
-            )
+        if _htf_conflicts(direction, htf_trend) and _normalize_event_type(anchor.event_type) not in ("SFP_CONFIRMED", "LIQUIDITY_SWEEP_CONFIRMED"):
+            continue
+        candidate = _scan_direction(
+            direction,
+            _events_for_candidate(direction, events, anchor),
+            htf_trend=htf_trend,
+            premium_discount=None,
+            risk_plan=risk_plan,
+            strict_bos_after_choch=strict_bos_after_choch,
+            anchor_event=anchor,
+            candidate_sequence=sequence,
         )
+        candidates.append(_apply_htf_countertrend_policy(candidate, htf_trend))
     return candidates
 
 
@@ -332,9 +336,6 @@ def _scan_direction(
     anchor_index = anchor_event.index if anchor_event else None
     expected_candidate_id = _candidate_id_for_anchor(direction, anchor_event, candidate_sequence)
 
-    if htf_trend in ("bullish", "bearish") and htf_trend != scenario_side:
-        return _finalize_candidate(_invalid_result(direction, "htf_direction_conflict"), anchor_event, candidate_sequence)
-
     if premium_discount is not None and not _pd_valid_for_direction(direction, premium_discount):
         return _finalize_candidate(_invalid_result(direction, "pd_invalid_for_direction"), anchor_event, candidate_sequence)
 
@@ -343,6 +344,7 @@ def _scan_direction(
     event_diagnostics: list[dict] = []
     completed = 0
     sfp_index = None
+    sfp_invalidation_level = None
     has_early_trigger_event = any(
         _normalize_event_type(event.event_type) == "EARLY_TRIGGER_CONFIRMED"
         and _normalize_side(event.direction) == scenario_side
@@ -542,16 +544,24 @@ def _scan_direction(
             continue
 
         if event_type == "HTF_CONTEXT_CONFIRMED":
-            if side == "neutral":
-                diagnose(event, "scenario_invalidated", "htf_direction_conflict")
-                return finalize_with_diagnostics(_invalid_result(direction, "htf_direction_conflict", used))
-            if side == scenario_side and completed < 1:
+            if side == "neutral" and htf_trend is None:
+                used.append(event)
+                completed = max(completed, 1)
+                accept(event)
+            elif side == "neutral":
+                if completed < 1:
+                    used.append(event)
+                    completed = max(completed, 1)
+                diagnose(event, "event_warning", "htf_direction_conflict")
+            elif side == scenario_side and completed < 1:
                 used.append(event)
                 completed = max(completed, 1)
                 accept(event)
             elif side == opposite_side:
-                diagnose(event, "scenario_invalidated", "htf_direction_conflict")
-                return finalize_with_diagnostics(_invalid_result(direction, "htf_direction_conflict", used))
+                if completed < 1:
+                    used.append(event)
+                    completed = max(completed, 1)
+                diagnose(event, "event_warning", "htf_direction_conflict")
             continue
 
         if completed == 0:
@@ -576,6 +586,7 @@ def _scan_direction(
                 used.append(_with_type(event, "SFP_CONFIRMED"))
                 completed = max(completed, 3)
                 sfp_index = event.index
+                sfp_invalidation_level = _event_invalidation_level(event)
                 accept(event)
             continue
 
@@ -592,14 +603,15 @@ def _scan_direction(
                 continue
             opposite_trigger_event = event
             if _is_confirmed_bos_event(event) and float(event.quality_score or 0.0) >= CONFIRMED_TRIGGER_MIN_QUALITY:
-                diagnose(event, "scenario_invalidated", "opposite_confirmed_bos")
-                return finalize_with_diagnostics(_invalid_result(
-                    direction,
-                    "opposite_confirmed_bos",
-                    used + [event],
-                    opposite_trigger_event=event,
-                    last_invalidated_component="opposite_confirmed_bos",
-                ))
+                if _opposite_trigger_breaks_invalidation_level(direction, event, sfp_invalidation_level):
+                    diagnose(event, "scenario_invalidated", "opposite_confirmed_bos")
+                    return finalize_with_diagnostics(_invalid_result(
+                        direction,
+                        "opposite_confirmed_bos",
+                        used + [event],
+                        opposite_trigger_event=event,
+                        last_invalidated_component="opposite_confirmed_bos",
+                    ))
             rejected_confirmed_candidates.append(_rejected_confirmed_candidate(event, "opposite_structure_warning"))
             continue
 
@@ -1319,6 +1331,30 @@ def _is_confirmed_bos_event(event):
     return "bos" in str(_event_type_from_payload(event)).lower()
 
 
+def _event_invalidation_level(event):
+    payload = payload_to_dict(event.payload)
+    return payload.get("invalidation_level") or payload.get("stop_loss") or payload.get("level")
+
+
+def _opposite_trigger_breaks_invalidation_level(direction, event, invalidation_level) -> bool:
+    if invalidation_level is None:
+        return False
+    payload = payload_to_dict(event.payload)
+    close_price = payload.get("close", payload.get("close_price"))
+    if close_price is None:
+        return False
+    try:
+        close_price = float(close_price)
+        invalidation_level = float(invalidation_level)
+    except (TypeError, ValueError):
+        return False
+    if direction == "LONG":
+        return close_price < invalidation_level
+    if direction == "SHORT":
+        return close_price > invalidation_level
+    return False
+
+
 def _event_candidate_matches(event, expected_candidate_id):
     payload = payload_to_dict(event.payload)
     candidate_id = payload.get("candidate_id")
@@ -1692,6 +1728,76 @@ def _direction_block_reason(direction, htf_trend, premium_discount):
     return None
 
 
+def _apply_htf_countertrend_policy(candidate: ScenarioScanResult, htf_trend):
+    if not _htf_conflicts(candidate.direction, htf_trend):
+        return candidate
+
+    override_applied, details = _countertrend_override_details(candidate, htf_trend)
+    trigger_scan = dict(candidate.trigger_scan or {})
+    trigger_scan["countertrend_override"] = details
+    candidate.trigger_scan = trigger_scan
+    if override_applied or candidate.status == "invalidated":
+        return candidate
+
+    candidate.status = "invalidated"
+    candidate.signal_allowed = False
+    candidate.scenario_valid = False
+    candidate.invalidated_reason = "htf_direction_conflict"
+    candidate.last_invalidated_component = "htf_direction_conflict"
+    candidate.waiting_for = None
+    candidate.missing_steps = []
+    candidate.candidate_invalidated = True
+    candidate.selection_eligible = False
+    candidate.selection_rejected_reason = "candidate_invalidated"
+    candidate.quality_score = _candidate_quality(candidate)
+    candidate.event_diagnostics.append({
+        "event_type": "HTF_COUNTERTREND_POLICY",
+        "direction": _direction_side(candidate.direction),
+        "index": _string_index(candidate.last_event_index),
+        "quality_score": candidate.quality_score,
+        "status": "scenario_invalidated",
+        "reason": "htf_direction_conflict",
+        "current_expected_step": candidate.next_expected_step,
+        "candidate_id": candidate.candidate_id,
+        "source_confirmed_trigger_id": None,
+    })
+    candidate.trigger_scan["rejected_reason"] = "htf_direction_conflict"
+    candidate.trigger_scan["event_diagnostics"] = list(candidate.event_diagnostics)
+    return candidate
+
+
+def _htf_conflicts(direction, htf_trend):
+    return htf_trend in ("bullish", "bearish") and htf_trend != _direction_side(direction)
+
+
+def _countertrend_override_details(candidate: ScenarioScanResult, htf_trend):
+    sfp_quality = _event_quality(candidate.events_used, ("SFP_CONFIRMED", "LIQUIDITY_SWEEP_CONFIRMED"))
+    trigger_quality = _event_quality(candidate.events_used, ("CONFIRMED_TRIGGER_CONFIRMED", "CHOCH_CONFIRMED", "BOS_CONFIRMED"))
+    applied = (
+        sfp_quality is not None
+        and trigger_quality is not None
+        and sfp_quality >= COUNTERTREND_OVERRIDE_MIN_SFP_QUALITY
+        and trigger_quality >= COUNTERTREND_OVERRIDE_MIN_TRIGGER_QUALITY
+    )
+    return applied, {
+        "applied": applied,
+        "reason": "high_quality_ltf_sfp_and_trigger" if applied else "quality_threshold_not_met",
+        "htf_trend": htf_trend,
+        "scenario_direction": _direction_side(candidate.direction),
+        "sfp_quality": sfp_quality,
+        "required_sfp_quality": COUNTERTREND_OVERRIDE_MIN_SFP_QUALITY,
+        "trigger_quality": trigger_quality,
+        "required_trigger_quality": COUNTERTREND_OVERRIDE_MIN_TRIGGER_QUALITY,
+    }
+
+
+def _event_quality(events, event_types):
+    event = _first_used_event(events, event_types)
+    if event is None or event.quality_score is None:
+        return None
+    return float(event.quality_score)
+
+
 def _htf_trend(htf_structure, events):
     trend = _get(htf_structure, "trend")
     if trend in ("bullish", "bearish", "neutral"):
@@ -1700,6 +1806,30 @@ def _htf_trend(htf_structure, events):
         if _normalize_event_type(event.event_type) == "HTF_CONTEXT_CONFIRMED":
             return _normalize_side(event.direction)
     return None
+
+
+def _neutral_htf_is_tradable(expected_direction, events, premium_discount):
+    if expected_direction not in ("LONG", "SHORT"):
+        return False
+    if premium_discount is not None and not _pd_valid_for_direction(expected_direction, premium_discount):
+        return False
+    scenario_side = _direction_side(expected_direction)
+    has_pd = premium_discount is not None or any(
+        _normalize_event_type(event.event_type) in ("PD_LOCATION_VALID", "POI_TOUCHED")
+        and _normalize_side(event.direction) in (None, scenario_side)
+        for event in events
+    )
+    has_sfp = any(
+        _normalize_event_type(event.event_type) in ("SFP_CONFIRMED", "LIQUIDITY_SWEEP_CONFIRMED")
+        and _normalize_side(event.direction) == scenario_side
+        for event in events
+    )
+    has_ltf_trigger = any(
+        _normalize_event_type(event.event_type) in ("EARLY_TRIGGER_CONFIRMED", "CHOCH_CONFIRMED", "BOS_CONFIRMED", "CONFIRMED_TRIGGER_CONFIRMED")
+        and _normalize_side(event.direction) == scenario_side
+        for event in events
+    )
+    return bool(has_pd and has_sfp and has_ltf_trigger)
 
 
 def _as_event(event):
